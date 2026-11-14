@@ -1,0 +1,50 @@
+{
+  "name": "@ocm-fleet/ocm-plugin",
+  "metadata": {
+    "description": "Web console plugin for connecting Open Cluster Management hubs and enrolling their clusters."
+  },
+  "root": "extensions/ocm/client",
+  "sourceRoot": "extensions/ocm/client/src",
+  "projectType": "library",
+  "tags": [
+    "lang:typescript",
+    "scope:ui",
+    "type:lib",
+    "federation:remote",
+    "type:js-project",
+    "test:vitest"
+  ],
+  "targets": {
+    "fmt": {},
+    "verify": {},
+    "fix": {},
+    "fix:lint": {},
+    "refresh:inputs": {},
+    "check": {},
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "rm -rf dist && rspack build",
+        "cwd": "extensions/ocm/client"
+      },
+      "inputs": [
+        "{projectRoot}/src/**/*",
+        "{projectRoot}/rspack.config.*",
+        "{projectRoot}/tsconfig*.json"
+      ],
+      "outputs": ["{projectRoot}/dist"],
+      "dependsOn": ["common:build"]
+    },
+    "lint": {
+      "executor": "@nx/eslint:lint",
+      "options": {
+        "lintFilePatterns": ["{projectRoot}/src/**/*.{ts,tsx}"]
+      }
+    },
+    "test": {},
+    "lint:format": {},
+    "typecheck": {
+      "dependsOn": ["common:build"]
+    }
+  }
+}

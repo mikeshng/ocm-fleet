@@ -122,7 +122,7 @@ How the chosen direction meets a fleet that already exists is a second choice.
 - **Kubernetes tooling does not apply by default.** `kubectl`, RBAC, admission, and watch do not reach the management API. A Kubernetes-facing surface gives them back where they are wanted, at a cost that is counted (K-12).
 - **Slower failover.** A database fails over through external tooling in tens of seconds. etcd re-elects in seconds by itself.
 - **Two systems on the same clusters.** For as long as both are used, a cluster can receive workloads from both. Each workload has one owner, and people have to know which. Section 7.3 describes what was observed.
-- **Something is added to each enrolled cluster.** The direct form adds a service account and a binding. The agent form adds an agent. Neither replaces the klusterlet, which stays for as long as the cluster is registered with a hub.
+- **Something is added to each enrolled cluster.** The direct form adds a service account in a namespace of its own, with its roles and bindings. The agent form adds an agent. Neither replaces the klusterlet, which stays for as long as the cluster is registered with a hub.
 - **A credential and a route per cluster, at first.** In the direct form the management plane holds a credential for every enrolled cluster and has to reach its API. The agent form removes both needs and is not built (EN-3, S-15).
 - **An ecosystem to carry.** Controllers and add-ons written for a hub keep working only where a hub API remains. Moving one is work for its owner.
 - **Maturity.** The resource manager is experimental. Many required capabilities are not implemented; [coverage.md](coverage.md) lists them.

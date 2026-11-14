@@ -1,3 +1,4 @@
+import { extractClusterId, PluginLink } from "@ocm-fleet/common";
 import {
   Alert,
   Bullseye,
@@ -32,12 +33,15 @@ import {
 } from "@patternfly/react-table";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { listDeployments } from "./api";
+import { listDeployments, listTargets, type MgmtTarget } from "./api";
 
-interface TargetInfo {
-  id: string;
-  type: string;
+interface TargetInfo extends MgmtTarget {
   deployments: string[];
+}
+
+function stateColor(state: string): "green" | "orange" | "grey" {
+  if (state === "ready") return "green";
+  return state ? "orange" : "grey";
 }
 
 export default function TargetsPage() {
@@ -51,25 +55,24 @@ export default function TargetsPage() {
     setLoading(true);
     setError(null);
     try {
-      const resp = await listDeployments();
-      const deployments = resp.deployments ?? [];
+      const [targetsResp, deploymentsResp] = await Promise.all([
+        listTargets(),
+        listDeployments(),
+      ]);
 
-      const targetMap = new Map<string, string[]>();
-      targetMap.set("kind-local", []);
-
-      for (const dep of deployments) {
+      const byTarget = new Map<string, string[]>();
+      for (const dep of deploymentsResp.deployments ?? []) {
         for (const tid of dep.resolvedTargetIds ?? []) {
-          const existing = targetMap.get(tid) ?? [];
+          const existing = byTarget.get(tid) ?? [];
           existing.push(dep.name);
-          targetMap.set(tid, existing);
+          byTarget.set(tid, existing);
         }
       }
 
       setTargets(
-        Array.from(targetMap.entries()).map(([id, deps]) => ({
-          id,
-          type: id.startsWith("kind") ? "kind" : "kubernetes",
-          deployments: deps,
+        (targetsResp.targets ?? []).map((t) => ({
+          ...t,
+          deployments: byTarget.get(t.id) ?? [],
         })),
       );
     } catch (err) {
@@ -134,8 +137,8 @@ export default function TargetsPage() {
       {targets.length === 0 ? (
         <EmptyState titleText="No targets found" headingLevel="h2">
           <EmptyStateBody>
-            Targets are registered automatically when the management plane
-            starts.
+            Targets are registered when the management plane starts, when a
+            cluster is created, and when a cluster is enrolled.
           </EmptyStateBody>
           <Button variant="primary" onClick={fetchTargets}>
             Refresh
@@ -188,6 +191,8 @@ export default function TargetsPage() {
                   <Th screenReaderText="Row expansion" />
                   <Th>Target ID</Th>
                   <Th>Type</Th>
+                  <Th>State</Th>
+                  <Th>Cluster</Th>
                   <Th>Deployments</Th>
                 </Tr>
               </Thead>
@@ -209,6 +214,25 @@ export default function TargetsPage() {
                         {t.type}
                       </Label>
                     </Td>
+                    <Td dataLabel="State">
+                      <Label color={stateColor(t.state)} isCompact>
+                        {t.state || "unknown"}
+                      </Label>
+                    </Td>
+                    <Td dataLabel="Cluster">
+                      {t.cluster ? (
+                        <PluginLink
+                          scope="core-plugin"
+                          module="ClustersModule"
+                          to={extractClusterId(t.cluster)}
+                          fallback={extractClusterId(t.cluster)}
+                        >
+                          {extractClusterId(t.cluster)}
+                        </PluginLink>
+                      ) : (
+                        <span className="pf-v6-u-text-color-subtle">—</span>
+                      )}
+                    </Td>
                     <Td dataLabel="Deployments">
                       {t.deployments.length > 0 ? (
                         <LabelGroup>
@@ -225,7 +249,7 @@ export default function TargetsPage() {
                   </Tr>
                   <Tr isExpanded={expandedId === t.id}>
                     <Td />
-                    <Td colSpan={3}>
+                    <Td colSpan={5}>
                       <ExpandableRowContent>
                         <DescriptionList isHorizontal isCompact>
                           <DescriptionListGroup>
@@ -237,14 +261,58 @@ export default function TargetsPage() {
                             </DescriptionListDescription>
                           </DescriptionListGroup>
                           <DescriptionListGroup>
+                            <DescriptionListTerm>Origin</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {t.origin}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          {t.accessForm && (
+                            <DescriptionListGroup>
+                              <DescriptionListTerm>
+                                Access form
+                              </DescriptionListTerm>
+                              <DescriptionListDescription>
+                                {t.accessForm}
+                              </DescriptionListDescription>
+                            </DescriptionListGroup>
+                          )}
+                          {t.deliveryCredential && (
+                            <DescriptionListGroup>
+                              <DescriptionListTerm>
+                                Stored credential delivers
+                              </DescriptionListTerm>
+                              <DescriptionListDescription>
+                                {t.deliveryCredential}
+                              </DescriptionListDescription>
+                            </DescriptionListGroup>
+                          )}
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>Labels</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {Object.keys(t.labels ?? {}).length > 0 ? (
+                                <LabelGroup numLabels={8}>
+                                  {Object.entries(t.labels).map(([k, v]) => (
+                                    <Label key={k} color="grey" isCompact>
+                                      {k}={v}
+                                    </Label>
+                                  ))}
+                                </LabelGroup>
+                              ) : (
+                                <span className="pf-v6-u-text-color-subtle">
+                                  None
+                                </span>
+                              )}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
                             <DescriptionListTerm>
                               Accepted Resource Types
                             </DescriptionListTerm>
                             <DescriptionListDescription>
                               <Label color="grey" isCompact>
-                                {t.id === "kind-local"
-                                  ? "api.kind.cluster"
-                                  : "kubernetes/*"}
+                                {(t.acceptedManifestTypes ?? []).length > 0
+                                  ? t.acceptedManifestTypes.join(", ")
+                                  : "any"}
                               </Label>
                             </DescriptionListDescription>
                           </DescriptionListGroup>

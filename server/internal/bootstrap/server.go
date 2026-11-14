@@ -193,6 +193,7 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		)),
 	)
 	inventoryReporter := application.NewInventoryReporterAdapter(inventoryReportService)
+	inventoryRecords := newDirectInventoryReportBackend(inventoryReportService)
 
 	// --- kubernetes indexing runtime ---
 	//
@@ -318,6 +319,17 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		return fail(err)
 	}
 
+	// Authenticated plain HTTP routes next to the gateway and the dynamic
+	// API: the targets listing, and whatever add-ons mount below. Same
+	// rules as the UI routes and the gRPC interceptor.
+	apiAuthn := &transporthttp.AuthnMiddleware{
+		Methods:  wfs.authMethodSvc,
+		Verifier: oidcDeps.Verifier,
+		Logger:   logger.With("component", "authn-http"),
+	}
+	topMux.Handle("GET "+transporthttp.TargetsPath, apiAuthn.Wrap(
+		transporthttp.NewTargetsHandler(&application.TargetService{Store: p.store}, logger)))
+
 	dynamicHTTPMux := dynamicapi.NewDynamicHTTPMux(topMux, dynamicHTTPConn)
 
 	httpLis, err := net.Listen("tcp", cfg.HTTPAddr)
@@ -359,6 +371,9 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		Vault:             p.vault,
 		DeliveryReporter:  deliveryReporter,
 		InventoryReporter: inventoryReporter,
+		InventoryRecords:  inventoryRecords,
+		TrustBundles:      trustBundleSource(wfs.authMethodSvc),
+		Caller:            callerFromContext,
 		Indexing:          kubeIndexing,
 		AppCtx:            appCtx,
 	}
@@ -389,6 +404,15 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		return fail(err)
 	}
 	srv.addonCloseHooks = addonCloseHooks
+
+	if err := registerAddonHTTPRoutes(topMux, specs, apiAuthn.Wrap); err != nil {
+		return fail(err)
+	}
+	for _, spec := range specs {
+		if spec.TargetAdvisor != nil {
+			deploymentSvc.TargetAdvisors = append(deploymentSvc.TargetAdvisors, spec.TargetAdvisor)
+		}
+	}
 
 	// One-shot startup replay recovers persisted Kubernetes targets; it must
 	// not block listen/readiness. Close joins the replay goroutine before StopAll.

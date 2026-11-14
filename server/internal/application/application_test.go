@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -317,8 +318,79 @@ func TestCreateDeployment_StaticPlacement_UnknownTarget(t *testing.T) {
 			Targets: []domain.TargetID{"t1", "missing"},
 		},
 	})
-	if err != nil && !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound or nil, got: %v", err)
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `"missing"`) {
+		t.Errorf("error %q does not name the unknown target", err)
+	}
+	// Nothing was created: the refusal happens before the workflow starts.
+	if _, err := h.deployments.Get(ctx, "deployments/d1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("Get after refused create: got %v, want ErrNotFound", err)
+	}
+}
+
+// targetAdvisorFunc adapts a function to [application.PlacementTargetAdvisor].
+type targetAdvisorFunc func(domain.TargetID) string
+
+func (f targetAdvisorFunc) ExplainUnknownTarget(_ context.Context, id domain.TargetID) string {
+	return f(id)
+}
+
+func TestCreateDeployment_StaticPlacement_UnknownTarget_UsesAdvisor(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	h.deployments.TargetAdvisors = []application.PlacementTargetAdvisor{
+		targetAdvisorFunc(func(domain.TargetID) string { return "" }),
+		targetAdvisorFunc(func(id domain.TargetID) string { return "it is only observed: " + string(id) }),
+	}
+	_, err := h.deployments.Create(ctx, domain.CreateDeploymentInput{
+		Name: "deployments/d1",
+		ManifestStrategy: domain.ManifestStrategySpec{
+			Type:      domain.ManifestStrategyInline,
+			Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+		},
+		PlacementStrategy: domain.PlacementStrategySpec{
+			Type:    domain.PlacementStrategyStatic,
+			Targets: []domain.TargetID{"observed-one"},
+		},
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "it is only observed: observed-one") {
+		t.Errorf("error %q does not carry the advisor's explanation", err)
+	}
+}
+
+func TestCreateDeployment_StaticPlacement_TargetNotReady(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := h.targets.Register(ctx, domain.NewTargetInfo(
+		"waiting", "test", "waiting", domain.TargetStateInitializing, nil, nil, nil,
+	)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	_, err := h.deployments.Create(ctx, domain.CreateDeploymentInput{
+		Name: "deployments/d1",
+		ManifestStrategy: domain.ManifestStrategySpec{
+			Type:      domain.ManifestStrategyInline,
+			Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+		},
+		PlacementStrategy: domain.PlacementStrategySpec{
+			Type:    domain.PlacementStrategyStatic,
+			Targets: []domain.TargetID{"waiting"},
+		},
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "initializing") {
+		t.Errorf("error %q does not state the target's state", err)
 	}
 }
 

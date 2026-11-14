@@ -15,11 +15,28 @@ type DeploymentService struct {
 	DeleteWF      domain.DeleteDeploymentWorkflow
 	ResumeWF      domain.ResumeDeploymentWorkflow
 	ProvenanceSvc *domain.ProvenanceService
+	// TargetAdvisors are asked, in order, to explain a target name a
+	// placement uses that is not a registered target. Optional.
+	TargetAdvisors []PlacementTargetAdvisor
+}
+
+// PlacementTargetAdvisor explains a name that a caller used as a target
+// but that is not one. An integration that knows of clusters which are
+// not targets (for example clusters it only observes) implements it,
+// so that the refusal says what the name is and what to do about it.
+type PlacementTargetAdvisor interface {
+	// ExplainUnknownTarget returns a sentence for the caller, or ""
+	// when it knows nothing about the name.
+	ExplainUnknownTarget(ctx context.Context, id domain.TargetID) string
 }
 
 // Create starts the durable create-deployment workflow, which persists
 // the deployment and launches orchestration as a child workflow.
 func (s *DeploymentService) Create(ctx context.Context, in domain.CreateDeploymentInput) (domain.DeploymentView, error) {
+	if err := s.checkStaticPlacement(ctx, in.PlacementStrategy); err != nil {
+		return domain.DeploymentView{}, err
+	}
+
 	ac := AuthFromContext(ctx)
 	if ac != nil && ac.Subject != nil {
 		in.Auth = domain.DeliveryAuth{
@@ -67,6 +84,48 @@ func (s *DeploymentService) Create(ctx context.Context, in domain.CreateDeployme
 	}
 
 	return view, nil
+}
+
+// checkStaticPlacement refuses a deployment whose static placement
+// names a target that is not registered or that takes no deployments.
+// Orchestration would otherwise retry such a placement without end and
+// without a reason the caller can read. Placements by selector are not
+// checked: matching nothing yet is a valid state for them.
+func (s *DeploymentService) checkStaticPlacement(ctx context.Context, spec domain.PlacementStrategySpec) error {
+	if spec.Type != domain.PlacementStrategyStatic || len(spec.Targets) == 0 {
+		return nil
+	}
+	tx, err := s.Store.BeginReadOnly(ctx)
+	if err != nil {
+		return fmt.Errorf("begin read tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+	targets, err := tx.Targets().List(ctx)
+	if err != nil {
+		return fmt.Errorf("list targets: %w", err)
+	}
+	states := make(map[domain.TargetID]domain.TargetState, len(targets))
+	for _, t := range targets {
+		states[t.ID()] = t.State()
+	}
+	for _, id := range spec.Targets {
+		state, ok := states[id]
+		if !ok {
+			msg := fmt.Sprintf("placement names target %q, which is not a registered target", id)
+			for _, advisor := range s.TargetAdvisors {
+				if hint := advisor.ExplainUnknownTarget(ctx, id); hint != "" {
+					msg += ": " + hint
+					break
+				}
+			}
+			return fmt.Errorf("%w: %s", domain.ErrInvalidArgument, msg)
+		}
+		if state != domain.TargetStateReady && state != "" {
+			return fmt.Errorf("%w: placement names target %q, which is in state %q and takes no deployments",
+				domain.ErrInvalidArgument, id, state)
+		}
+	}
+	return nil
 }
 
 // Get retrieves a deployment by resource name.

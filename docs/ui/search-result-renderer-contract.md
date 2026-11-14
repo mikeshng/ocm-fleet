@@ -107,15 +107,21 @@ Sources: [result mapping](../../client/web/src/hooks/useInventorySearch.tsx), [m
 
 ## Current query policy and completeness
 
-Simple inventory search makes two parallel requests after a 300 ms input debounce:
+Simple inventory search makes four parallel requests after a 300 ms input debounce:
 
-| Query              | Filter scope                                                                                    | Requested page size |
-| ------------------ | ----------------------------------------------------------------------------------------------- | ------------------- |
-| Clusters           | Kind Cluster type; relative name starts with the term or `clusters/` plus the term              | 5                   |
-| Kubernetes objects | Kubernetes Object type; Pod, Namespace, or Node; observation metadata name starts with the term | 5                   |
+| Query                      | Filter scope                                                                                               | Requested page size |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------- |
+| Created clusters           | Kind Cluster type; relative name starts with the term or `clusters/` plus the term                         | 5                   |
+| Enrolled clusters          | Enrolled Cluster type; name starts with `clusters/` plus the term, or the term is one of its search terms  | 5                   |
+| Clusters of connected hubs | Hub ManagedCluster record type; observed name starts with the term, or the term is one of its search terms | 5                   |
+| Kubernetes objects         | Kubernetes Object type; Pod, Namespace, or Node; observation metadata name starts with the term            | 5                   |
 
-The term is escaped for backslashes and double quotes before insertion into CEL. These are prefix queries, not Orama full-text queries over all inventory fields. Registering another renderer does not automatically add its type to simple search.
+Search terms are whole words that the server writes on a cluster record: its name and the dot-separated parts of that name, each label value and `key=value` pair, and, for a hub's cluster, its hub and its cluster set. A term matches one of them exactly, so a label or a cluster set finds its clusters and a fragment of one does not.
 
-Advanced search sends the raw CEL filter in one request with page size 20. Both modes query scope `-`, do not traverse next-page tokens, and return empty results after logged API failures. Simple search uses `Promise.all`, so failure of either request discards the combined inventory result set. Neither mode promises a complete inventory listing or distinct user-visible query-error state.
+The three cluster result sets are folded before rendering. Where a hub's record is linked to a created or enrolled cluster in the same results, only the hub's record is shown; its renderer names the hub and links to that cluster's page.
 
-Sources: [query construction and mapping](../../client/web/src/hooks/useInventorySearch.tsx), [debouncing](../../client/web/src/components/Search/FleetSearch.tsx), [query API client](../../sdk/common/src/resourceApi.ts).
+The term is escaped for backslashes and double quotes before insertion into CEL. These are prefix and exact-term queries, not Orama full-text queries over all inventory fields. Registering another renderer does not automatically add its type to simple search.
+
+Advanced search sends the raw CEL filter in one request with page size 20. Both modes query scope `-`, do not traverse next-page tokens, and return empty results after logged API failures. Simple search uses `Promise.all`, so failure of any request discards the combined inventory result set. Neither mode promises a complete inventory listing or distinct user-visible query-error state.
+
+Sources: [query construction and mapping](../../client/web/src/hooks/useInventorySearch.tsx), [cluster record types and folding](../../sdk/common/src/objects/fleetCluster.ts), [debouncing](../../client/web/src/components/Search/FleetSearch.tsx), [query API client](../../sdk/common/src/resourceApi.ts).

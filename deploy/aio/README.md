@@ -108,17 +108,24 @@ uses a separate deployment-specific configuration surface; do not mix the two.
 
 **Optional — packaging fills if omitted.** Set an env var only to override.
 
-| Setting               | Env                        | If omitted                                                                                                                             |
-| --------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Issuer                | `OIDC_ISSUER_URL`          | Peer Dex `https://ocm-fleet.localhost:8085/idp` (Dex-on). Setting this switches to Dex-off; there is no packaging issuer in that mode. |
-| UI client             | `OIDC_UI_CLIENT_ID`        | `ocm-fleet-console`                                                                                                                    |
-| UI scope              | `OIDC_UI_SCOPE`            | Dex-on: `openid profile email groups audience:server:client_id:resource-manager`. Dex-off: `openid profile email`                      |
-| Resource audience     | `OIDC_RESOURCE_AUDIENCE`   | `resource-manager`                                                                                                                     |
-| OIDC CA               | `OIDC_CA_FILE`             | sandbox CA on Dex-on. Dex-off: unset unless discovery/TLS needs non-system trust                                                       |
-| Log level             | `LOG_LEVEL`                | `error`. One control for the resource manager server, peer Dex, and s6 lifecycle verbosity (`debug`, `info`, `warn`, `error`)          |
-| Addons                | `OCM_RM_SERVER_ADDONS`     | `kind,kubernetes`                                                                                                                      |
-| Container socket      | `CONTAINER_HOST`           | image default `unix:///var/run/docker.sock`. Override only if the mount path differs                                                   |
-| Kind loopback forward | `KIND_LOOPBACK_FORWARD_TO` | Dex-on + live socket: `ocm-fleet:8085`. Set empty to disable. Not written on Dex-off                                                   |
+| Setting                 | Env                                 | If omitted                                                                                                                             |
+| ----------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Issuer                  | `OIDC_ISSUER_URL`                   | Peer Dex `https://ocm-fleet.localhost:8085/idp` (Dex-on). Setting this switches to Dex-off; there is no packaging issuer in that mode. |
+| UI client               | `OIDC_UI_CLIENT_ID`                 | `ocm-fleet-console`                                                                                                                    |
+| UI scope                | `OIDC_UI_SCOPE`                     | Dex-on: `openid profile email groups audience:server:client_id:resource-manager`. Dex-off: `openid profile email`                      |
+| Resource audience       | `OIDC_RESOURCE_AUDIENCE`            | `resource-manager`                                                                                                                     |
+| OIDC CA                 | `OIDC_CA_FILE`                      | sandbox CA on Dex-on. Dex-off: unset unless discovery/TLS needs non-system trust                                                       |
+| Log level               | `LOG_LEVEL`                         | `error`. One control for the resource manager server, peer Dex, and s6 lifecycle verbosity (`debug`, `info`, `warn`, `error`)          |
+| Addons                  | `OCM_RM_SERVER_ADDONS`              | `kind,kubernetes,ocm`                                                                                                                  |
+| Container socket        | `CONTAINER_HOST`                    | image default `unix:///var/run/docker.sock`. Override only if the mount path differs                                                   |
+| Kind loopback forward   | `KIND_LOOPBACK_FORWARD_TO`          | Dex-on + live socket: `ocm-fleet:8085`. Set empty to disable. Not written on Dex-off                                                   |
+| Enrollment endpoint     | `OCM_RM_ENROLLMENT_SERVER_URL`      | Live socket: `https://ocm-fleet.localhost:8085`. Otherwise unset, and no enrollment manifest is generated                              |
+| Enrollment CA           | `OCM_RM_ENROLLMENT_CA_FILE`         | sandbox CA with the defaulted endpoint. With an explicit endpoint: unset, which means the clusters' system roots                       |
+| Enrollment dial address | `OCM_RM_ENROLLMENT_CONNECT_ADDRESS` | `ocm-fleet:8085` with the defaulted endpoint. With an explicit endpoint: unset, and the endpoint's host is resolved                    |
+| Enrollment agent image  | `OCM_RM_ENROLLMENT_AGENT_IMAGE`     | unset, and no enrollment manifest is generated                                                                                         |
+
+The enrollment settings are explained under
+[Existing clusters and OCM hubs](#existing-clusters-and-ocm-hubs).
 
 `LOG_LEVEL` is the only AIO logging control. It is passed to the resource manager
 (`--log-level`), rendered into peer Dex's logger, and mapped to s6-overlay
@@ -229,6 +236,48 @@ podman run -d \
   --network kind:alias=ocm-fleet \
   quay.io/stolostron/ocm-fleet:latest
 ```
+
+## Existing clusters and OCM hubs
+
+The `ocm` addon connects Open Cluster Management hubs with a read-only
+credential and shows their clusters. The `kubernetes` addon enrolls clusters
+that this container did not create; an enrolled cluster is then deployed to and
+indexed like one it created. The resource manager writes nothing to a hub, and
+nothing to a cluster before it is enrolled: each step returns a manifest that
+the hub's or the cluster's administrator applies.
+
+In the console, **Hubs** connects a hub and offers **Enroll clusters** for it.
+The same steps through the API:
+
+| Step                           | Request                                                                           | What an administrator applies                                                                                          |
+| ------------------------------ | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Read-only account for a hub    | `GET /apis/ocm.open-cluster-management.io/v1alpha/hubAccessManifest`              | The returned manifest, on the hub                                                                                      |
+| Connect the hub                | `POST /apis/ocm.open-cluster-management.io/v1alpha/hubs:connect`                  | Nothing                                                                                                                |
+| Enroll clusters of the hub     | `POST /apis/ocm.open-cluster-management.io/v1alpha/hubs/{id}:enrollmentAddon`     | The returned add-on, on the hub, then a `ManagedClusterAddOn` for each cluster                                         |
+| Enroll a cluster without a hub | `POST /apis/kubernetes.open-cluster-management.io/v1alpha/enrollmentBundles`      | The returned manifest, on the cluster                                                                                  |
+| Withdraw a cluster             | `POST /apis/kubernetes.open-cluster-management.io/v1alpha/clusters/{id}:withdraw` | Nothing. Deleting namespace `ocm-fleet-system` and its cluster role bindings on the cluster ends access from that side |
+| Disconnect the hub             | `POST /apis/ocm.open-cluster-management.io/v1alpha/hubs/{id}:disconnect`          | Nothing. The read-only account stays on the hub until its administrator removes it                                     |
+
+An enrollment manifest runs a small agent on the cluster: once as a job, or,
+through the OCM add-on, for as long as the add-on is enabled there. Build its
+image, make it available to the clusters, and name it with
+`OCM_RM_ENROLLMENT_AGENT_IMAGE`:
+
+```bash
+podman build -f Dockerfile.enrollment-agent -t localhost/ocm-fleet-enrollment-agent:latest .
+podman save -o enrollment-agent.tar localhost/ocm-fleet-enrollment-agent:latest
+kind load image-archive enrollment-agent.tar --name <cluster>
+```
+
+With a live container socket the endpoint defaults suit kind clusters on the
+`kind` network: the agent dials `ocm-fleet:8085` and verifies the sandbox CA.
+For clusters elsewhere, set `OCM_RM_ENROLLMENT_SERVER_URL` to an address those
+clusters can reach, with `OCM_RM_ENROLLMENT_CA_FILE` and
+`OCM_RM_ENROLLMENT_CONNECT_ADDRESS` where they are needed.
+
+The stored credential of an enrolled cluster applies signed deployments only,
+unless the enrollment grants platform delivery (`grantPlatformDelivery`).
+Design: [existing clusters and OCM hubs](../../docs/design/addons/existing-clusters-and-ocm-hubs.md).
 
 ## Fleetctl against Dex-on
 

@@ -15,6 +15,7 @@ Implemented UI references belong directly in `docs/ui/`. Use `spikes/` only for 
 - `client/web` (`@ocm-fleet/web`) — Shell SPA (routing, auth, search, layout). No business logic.
 - `extensions/core/client` (`@ocm-fleet/mock-ui-plugins`) — Core plugins under `src/plugins/<name>-plugin/`.
 - `extensions/kind/client` (`@ocm-fleet/kind-plugin`) — Kind local cluster provider plugin (separated from core).
+- `extensions/ocm/client` (`@ocm-fleet/ocm-plugin`) — OCM hubs plugin: connected hubs, their clusters, and enrollment (separated from core).
 - `sdk/common` (`@ocm-fleet/common`) — Shared types, utils, cross-plugin hooks. Dual CJS/ESM.
 - `sdk/build-utils` (`@ocm-fleet/build-utils`) — Rspack helpers (PF transforms, FleetPlugin). No build step.
 - `e2e` — Playwright tests.
@@ -113,7 +114,7 @@ import clsx from "clsx";
 ## Plugins
 
 - Declared through `FleetPlugin` in `rspack.config.ts`; it validates metadata before delegating to `DynamicRemotePlugin`.
-- Core plugins: `extensions/core/client/src/plugins/<name>-plugin/`. Separated plugins (Kind): `extensions/<name>/client/src/` with own `rspack.config.ts` and `package.json`.
+- Core plugins: `extensions/core/client/src/plugins/<name>-plugin/`. Separated plugins (Kind, OCM hubs): `extensions/<name>/client/src/` with own `rspack.config.ts` and `package.json`.
 - Extensions declare UI capabilities; Go backend reads manifests for navigation.
 - Page contributions use `ocm-fleet.route`/`createRoute` and `ocm-fleet.route-group`/`createRouteGroup`; contribution identity is `routeId`. Use route/route-group terminology for contracts, types, guards, and docs. Preserve JavaScript Module Federation names (`exposedModules`, CodeRefs, `module` props, and exposed component names).
 - New routes generate default links through `pluginPages` and `navLayout` without customization. See [routes and route groups](route-groups.md) before describing visibility, ordering, or enablement. Registry/config fetching is not live plugin discovery.

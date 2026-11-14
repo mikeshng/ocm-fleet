@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,6 +36,11 @@ const ManifestManifestType domain.ManifestType = "kubernetes"
 //   - Attested delivery: verifies the attestation bundle, then applies
 //     using platform credentials from target properties (kubeconfig or
 //     service account token). This is the "run-as-platform" model.
+//
+// A target may also declare, in its delivery_credential property, that
+// its platform credential applies the intent of any authenticated
+// caller (see [platformCredentialGranted]). That is an explicit grant
+// recorded on the target, never a fallback.
 type DeliveryAgent struct {
 	reporter    domain.DeliveryReporter
 	keyResolver *domain.KeyResolver
@@ -112,11 +118,25 @@ func (a *DeliveryAgent) Deliver(ctx context.Context, target domain.TargetInfo, d
 		return nil
 	}
 
+	if platformCredentialGranted(target, auth) {
+		go a.deliverAsyncPlatform(context.WithoutCancel(ctx), target, deliveryID, generation, manifests)
+		return nil
+	}
+
 	if auth.Token == "" {
 		return fmt.Errorf("%w: delivery to target %q requires an authenticated caller token", domain.ErrInvalidArgument, target.ID())
 	}
 	go a.deliverAsync(context.WithoutCancel(ctx), target, deliveryID, generation, manifests, auth)
 	return nil
+}
+
+// platformCredentialGranted reports whether the target's declared rule
+// lets the stored platform credential apply intent that carries no
+// attestation: the target records an explicit grant
+// ([DeliveryCredentialPlatform]) and the caller is authenticated. With
+// any other rule, or none, unsigned intent uses the caller's own token.
+func platformCredentialGranted(target domain.TargetInfo, auth domain.DeliveryAuth) bool {
+	return target.Properties()[PropDeliveryCredential] == DeliveryCredentialPlatform && auth.Caller != nil
 }
 
 // verifierForTarget builds or retrieves a cached [attestation.Verifier]
@@ -240,6 +260,31 @@ func (a *DeliveryAgent) deleteManifests(ctx context.Context, cfg *rest.Config, m
 	return nil
 }
 
+// deleteManifestsWithStoredCredential is deleteManifests for a removal
+// that runs with the platform's stored credential (see
+// [applier.deleteWithStoredCredential]). It returns the objects it left
+// in place because the credential may neither read nor delete them.
+func (a *DeliveryAgent) deleteManifestsWithStoredCredential(ctx context.Context, cfg *rest.Config, manifests []domain.Manifest) (unseen []string, err error) {
+	ap, err := newApplierFromConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+	return deleteWithStoredCredential(ctx, ap, manifests)
+}
+
+func deleteWithStoredCredential(ctx context.Context, ap *applier, manifests []domain.Manifest) (unseen []string, err error) {
+	for i, m := range manifests {
+		left, err := ap.deleteWithStoredCredential(ctx, m.Raw)
+		if err != nil {
+			return unseen, fmt.Errorf("delete manifest %d: %w", i+1, err)
+		}
+		if left != "" {
+			unseen = append(unseen, left)
+		}
+	}
+	return unseen, nil
+}
+
 // deliveryStateForError returns [domain.DeliveryStateAuthFailed] for
 // Kubernetes API authentication/authorization errors (401/403), and
 // [domain.DeliveryStateFailed] for everything else.
@@ -253,9 +298,17 @@ func deliveryStateForError(err error) domain.DeliveryState {
 // Remove deletes all manifested resources from the target cluster.
 // When an attestation is provided the agent verifies it against the
 // target's trust bundle (same dynamic, per-target verification as
-// Deliver) and uses platform credentials. Otherwise falls back to
-// token passthrough (auth.Token).
-// Resources that are already gone (404) are silently skipped.
+// Deliver) and uses platform credentials. It also uses them when the
+// target grants that to authenticated callers (same rule as Deliver).
+// Otherwise falls back to token passthrough (auth.Token).
+// Resources that are already gone (404) are silently skipped. With the
+// platform's stored credential, a delete the cluster forbids is not an
+// error either when the object is not there or is of a kind the
+// credential may not even read (see
+// [applier.deleteWithStoredCredential]); what was left for that reason
+// is named in the result's message. With the caller's own credential a
+// refusal always stands: the stored credential is not tried in its
+// place, not even to look.
 //
 // Like Deliver, the work runs asynchronously. The method validates
 // inputs synchronously and returns nil, then reports the outcome via
@@ -266,6 +319,7 @@ func (a *DeliveryAgent) Remove(ctx context.Context, target domain.TargetInfo, de
 	}
 
 	asyncCtx := context.WithoutCancel(ctx)
+	usePlatform := false
 	if att != nil {
 		v, err := a.verifierForTarget(target)
 		if err != nil {
@@ -282,6 +336,11 @@ func (a *DeliveryAgent) Remove(ctx context.Context, target domain.TargetInfo, de
 			})
 			return nil
 		}
+		usePlatform = true
+	} else if platformCredentialGranted(target, auth) {
+		usePlatform = true
+	}
+	if usePlatform {
 		cfg, err := BuildPlatformRESTConfig(ctx, a.vault, target)
 		if err != nil {
 			_ = a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
@@ -291,16 +350,18 @@ func (a *DeliveryAgent) Remove(ctx context.Context, target domain.TargetInfo, de
 			return nil
 		}
 		go func() {
-			err := a.deleteManifests(asyncCtx, cfg, manifests)
+			unseen, err := a.deleteManifestsWithStoredCredential(asyncCtx, cfg, manifests)
 			if err != nil {
 				_ = a.reporter.ReportResult(asyncCtx, deliveryID, generation, domain.DeliveryResult{
 					State: deliveryStateForError(err), Message: err.Error(),
 				})
 				return
 			}
-			_ = a.reporter.ReportResult(asyncCtx, deliveryID, generation, domain.DeliveryResult{
-				State: domain.DeliveryStateDelivered,
-			})
+			result := domain.DeliveryResult{State: domain.DeliveryStateDelivered}
+			if len(unseen) > 0 {
+				result.Message = "left as they are, because the stored credential may neither read nor delete them: " + strings.Join(unseen, ", ")
+			}
+			_ = a.reporter.ReportResult(asyncCtx, deliveryID, generation, result)
 		}()
 		return nil
 	}

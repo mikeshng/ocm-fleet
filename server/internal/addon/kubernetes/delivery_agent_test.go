@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -742,6 +743,54 @@ func TestAgent_Remove_EmptyManifests_ReportsDelivered(t *testing.T) {
 	result := awaitDone(t, reporter.done)
 	if result.State != domain.DeliveryStateDelivered {
 		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateDelivered, result.Message)
+	}
+}
+
+// When the cluster refuses the caller's own credential for a removal,
+// the refusal stands even on a target whose stored credential the
+// cluster would accept: that credential is not tried in the caller's
+// place, not even to look whether anything is there.
+func TestAgent_Remove_CallerRefused_StoredCredentialIsNotTried(t *testing.T) {
+	var storedSeen atomic.Int32
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") == "Bearer stored" {
+			storedSeen.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","reason":"NotFound","code":404}`)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}`)
+	}))
+	defer ts.Close()
+
+	reporter := newChannelReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter)
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server":            ts.URL,
+			"ca_cert":               tlsServerCAPEM(ts),
+			"service_account_token": "stored",
+		},
+	})
+
+	err := agent.Remove(context.Background(), target, "d1", []domain.Manifest{{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"never-created","namespace":"default"}}`),
+	}}, domain.DeliveryAuth{Token: "a-token-the-cluster-does-not-know"}, nil, 1)
+	if err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	result := awaitDone(t, reporter.done)
+	if result.State != domain.DeliveryStateAuthFailed {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateAuthFailed, result.Message)
+	}
+	if n := storedSeen.Load(); n != 0 {
+		t.Errorf("the stored credential was shown to the cluster %d time(s)", n)
 	}
 }
 

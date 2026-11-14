@@ -9,8 +9,10 @@ const AddonID domain.AddonID = "kubernetes.open-cluster-management.io"
 
 // Descriptor returns the addon descriptor for the generic Kubernetes
 // agent. It declares a delivery capability for Kubernetes
-// targets using token-passthrough delivery (no fleetlet), and an
-// inventory capability for the generic watched-object resource type.
+// targets using token-passthrough delivery (no fleetlet), an inventory
+// capability for the generic watched-object resource type, and
+// inventory capabilities for the records enrollment keeps: clusters
+// taken in and the bundles that authorize it.
 func Descriptor() domain.AddonDescriptor {
 	return domain.AddonDescriptor{
 		ID:   AddonID,
@@ -18,7 +20,42 @@ func Descriptor() domain.AddonDescriptor {
 		Capabilities: []domain.Capability{
 			domain.DeliveryCapability{TargetType: TargetType},
 			domain.InventoryResourceCapability{ResourceType: ObjectResourceType},
+			domain.InventoryResourceCapability{ResourceType: ClusterResourceType},
+			domain.InventoryResourceCapability{ResourceType: EnrollmentBundleResourceType},
 		},
+	}
+}
+
+// Schemas returns every extension resource schema the addon registers.
+func Schemas() []domain.ExtensionResourceSchema {
+	return []domain.ExtensionResourceSchema{InventorySchema(), ClusterSchema(), EnrollmentBundleSchema()}
+}
+
+// ClusterSchema returns the inventory-only schema of a cluster taken in
+// by enrollment ("clusters/{id}").
+func ClusterSchema() domain.ExtensionResourceSchema {
+	return domain.ExtensionResourceSchema{
+		ResourceType: ClusterResourceType,
+		ProtoPackage: "ocm.kubernetes.v1alpha",
+		Version:      "v1alpha",
+		CollectionID: string(ClusterCollectionID),
+		Singular:     "Cluster",
+		Plural:       "Clusters",
+		Inventory:    &domain.InventorySchema{},
+	}
+}
+
+// EnrollmentBundleSchema returns the inventory-only schema of an
+// enrollment bundle ("enrollmentBundles/{id}").
+func EnrollmentBundleSchema() domain.ExtensionResourceSchema {
+	return domain.ExtensionResourceSchema{
+		ResourceType: EnrollmentBundleResourceType,
+		ProtoPackage: "ocm.kubernetes.v1alpha",
+		Version:      "v1alpha",
+		CollectionID: string(EnrollmentBundleCollectionID),
+		Singular:     "EnrollmentBundle",
+		Plural:       "EnrollmentBundles",
+		Inventory:    &domain.InventorySchema{},
 	}
 }
 

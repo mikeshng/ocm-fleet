@@ -1,7 +1,7 @@
 import type { InventoryResource, SearchResultRender } from "@ocm-fleet/common";
 
 const CANONICAL_RE =
-  /\/\/kubernetes\.ocm-fleet\.io\/clusters\/([^/]+)\/apiResources\/([^/]+)\/objects\/([^/]+)/;
+  /\/\/kubernetes\.open-cluster-management\.io\/clusters\/([^/]+)\/(?:namespaces\/[^/]+\/)?apiResources\/([^/]+)\/objects\/([^/]+)/;
 
 const KIND_TO_TAB: Record<string, string> = {
   DaemonSet: "pods",

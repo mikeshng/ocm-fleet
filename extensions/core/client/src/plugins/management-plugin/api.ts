@@ -1,10 +1,8 @@
 const MGMT_BASE = "/v1alpha";
+const TARGETS_PATH = "/apis/open-cluster-management.io/v1alpha/targets";
 
-export async function mgmtFetch<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
-  const res = await fetch(`${MGMT_BASE}${path}`, init);
+async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     const msg =
@@ -14,6 +12,35 @@ export async function mgmtFetch<T>(
     throw new Error(msg);
   }
   return res.json();
+}
+
+export function mgmtFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  return apiFetch(`${MGMT_BASE}${path}`, init);
+}
+
+// --- Targets ---
+
+export interface MgmtTarget {
+  id: string;
+  name: string;
+  type: string;
+  state: string;
+  labels: Record<string, string>;
+  acceptedManifestTypes: string[];
+  /** How the target came to exist, for example "provisioned" or "enrolled". */
+  origin: string;
+  /** The cluster record the target's objects are indexed under. */
+  cluster?: string;
+  accessForm?: string;
+  deliveryCredential?: string;
+}
+
+export interface ListTargetsResponse {
+  targets: MgmtTarget[];
+}
+
+export function listTargets(): Promise<ListTargetsResponse> {
+  return apiFetch(TARGETS_PATH);
 }
 
 export interface RegistrySubjectMapping {

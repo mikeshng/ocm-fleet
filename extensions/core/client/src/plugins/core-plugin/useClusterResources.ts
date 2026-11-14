@@ -102,7 +102,7 @@ export function useClusterResources(
 }
 
 const CANONICAL_RE =
-  /\/\/kubernetes\.ocm-fleet\.io\/clusters\/([^/]+)\/apiResources\/[^/]+\/objects\/[^/]+/;
+  /\/\/kubernetes\.open-cluster-management\.io\/clusters\/([^/]+)\/(?:namespaces\/[^/]+\/)?apiResources\/[^/]+\/objects\/[^/]+/;
 
 export function extractClusterId(resourceName: string): string {
   const m = CANONICAL_RE.exec(resourceName);

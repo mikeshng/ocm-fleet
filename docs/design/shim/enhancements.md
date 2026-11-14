@@ -36,7 +36,7 @@ These are not optional for the requirements they serve. Until each exists, the r
 
 | ID | Capability | Needed for | Until then |
 |---|---|---|---|
-| **FC-1** | A target lifecycle API: create, update labels and properties, remove one target | M-10, M-4 | The workaround in BH-5 |
+| **FC-1** | A target lifecycle API: create, update labels and properties, remove one target | M-10, M-4 | A target enters only through an add-on's declaration or a delivery's output. An enrollment (FC-22) writes its target from inside the resource manager (BH-5), and nothing outside it can do the same. |
 | **FC-2** | Extensions added at run time: a server add-on and a console plugin registered without rebuilding the resource manager | Shipping and upgrading the integration separately from the resource manager (A-12, U-2, K-11) | The integration is built into the resource manager and its console |
 | **FC-3** | Storage for integration-owned records in the management datastore | I-1, DR-11 | No place for correlation records |
 | **FC-4** | Fine-grained authorization, tenants with their own role assignments, and workspaces, enforced in the API and in the datastore | T-1 to T-7, T-11, S-14 | Visibility is provider-only (T-7) |
@@ -63,7 +63,7 @@ These are not optional for the requirements they serve. Until each exists, the r
 | **FC-25** | Console pages for clusters of any origin, observed, enrolled, or created, and a targets page that reads targets | EN-11, EN-12, F-13, U-10 | The cluster list and the cluster page show only the built-in provider's clusters. The targets page is derived from deployments. |
 | **FC-26** | Watching applied state: noticing a delivered resource that another writer changed, took over, or removed | W-16 | A delivery stays reported as active |
 | **FC-27** | Deleting intent with a choice to leave its resources in place, and deletion that spares a resource another owner still claims | W-17, W-6, W-7 | Deleting a deployment removes what it applied, even where an OCM-io work covers the same resource |
-| **FC-28** | Inventory that follows the life of a cluster: records removed or marked as past when a cluster leaves, and a selectable set of what is indexed per target | IS-6, IS-2, N-12 | Rows of a deleted cluster stay and are returned as current. Every target is indexed with the default setting: every kind apart from a short deny list. |
+| **FC-28** | Inventory that follows the life of a cluster and of its objects: records removed or marked as past when a cluster leaves or an object is gone, and a selectable set of what is indexed per target, which never includes the content of a `Secret` | IS-6, IS-2, N-12 | Rows of a deleted cluster stay and are returned as current. Every target is indexed with the default setting: every kind apart from a short deny list. |
 | **FC-29** | The resource manager's own agent on a cluster: a served connection, a per-cluster identity, local apply, and local indexing | EN-3, S-12, S-15, N-12 | The direct form only |
 | **FC-30** | Readable outcomes: the reason for each failed delivery per target, a declared retry policy, and refusal of intent that names a target that does not exist | W-10, W-14, EN-12 | A failed delivery shows as still being created, with no reason, and is retried without limit |
 
@@ -91,7 +91,7 @@ These are not optional for the requirements they serve. Until each exists, the r
 
 | For | Resource manager capabilities | OCM-io enhancements that would help |
 |---|---|---|
-| The first increment: hubs observed, clusters enrolled in the direct form, delivery and inventory by the resource manager | FC-22, FC-23, FC-24, FC-25, FC-28, FC-30; FC-1 or the BH-5 workaround; FC-3, FC-12, FC-19 | None needed. E-7, E-8, and E-11 improve identity, freshness, and verification. |
+| The first increment: hubs observed, clusters enrolled in the direct form, delivery and inventory by the resource manager | FC-22, FC-23, FC-24, and FC-25 first, with the parts of FC-12, FC-28, and FC-30 that they need: a list of targets, inventory that leaves with its cluster, and the reason a cluster gives when it refuses a delivery. Then FC-1, FC-3, and FC-19. | None needed. E-7, E-8, and E-11 improve identity, freshness, and verification. |
 | Both systems on one cluster in full: takeovers noticed, and workloads moved in both directions | FC-26, FC-27 | None |
 | History, tenancy, and attribution | FC-4, FC-5, FC-6, FC-7, FC-17 | E-9 |
 | Clusters that accept no inbound connection, and the larger scale profiles | FC-29, FC-14, FC-15 | None |

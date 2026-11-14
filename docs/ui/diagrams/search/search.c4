@@ -55,8 +55,11 @@ model {
   }
   queries = component 'useInventorySearch query paths' {
     description '''
-      Simple search hardcodes name-prefix CEL for Kind Cluster and Kubernetes
-      Object kinds Pod, Namespace and Node; two requests, pageSize 5 each.
+      Simple search hardcodes CEL for four record types: Kind Cluster by name
+      prefix; enrolled Cluster and a hub's ManagedCluster record by name prefix
+      or an exact search term (label, cluster set, hub); Kubernetes Object kinds
+      Pod, Namespace and Node by name prefix. Four requests, pageSize 5 each.
+      A cluster that a hub's record is linked to is shown once, as that record.
       Registering a renderer does not add a type to these simple queries.
       Advanced filterSearch sends raw CEL unchanged, pageSize 20; no pagination UI.
       Both wait for renderer resolution and turn request failures into empty results.

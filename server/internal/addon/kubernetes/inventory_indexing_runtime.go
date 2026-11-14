@@ -704,6 +704,19 @@ func (h *KubernetesInProcessIndexHost) HasIndexer(id domain.TargetID) bool {
 	return ok
 }
 
+// IndexedClusters returns the cluster resource names of every indexer
+// the host currently tracks (starting or ready). Inventory cleanup uses
+// it to tell a cluster that is being indexed from one that is gone.
+func (h *KubernetesInProcessIndexHost) IndexedClusters() []domain.ResourceName {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]domain.ResourceName, 0, len(h.entries))
+	for _, entry := range h.entries {
+		out = append(out, entry.clusterResourceName)
+	}
+	return out
+}
+
 // lockTarget returns the per-target ops mutex already locked. Hold it only for
 // state transitions (ensure/stop/restart bookkeeping); do not hold it across
 // discovery readiness or indexer run.

@@ -50,10 +50,10 @@ Why these directions, what was considered instead, and what they cost are in [an
 | **OQ-12** | Is the enrollment add-on kept enabled for a cluster after it is enrolled, so that a lapsed credential repairs itself at the price of hub objects, or disabled, so that the hub holds nothing? | EN-5, EN-8, N-2 |
 | **OQ-13** | Which rights does the generated access piece ask for by default? | EN-7, S-15 |
 | **OQ-14** | Under which rule does an unattended delivery use the credential issued at enrollment: only verified signed intent, or also an explicit grant? | S-16, S-3 |
-| **OQ-15** | How does a cluster that enrolls prove which cluster it is: a one-time secret issued for it, the hub's record of it, or both? | EN-6, I-3 |
+| **OQ-15** | How does a cluster that enrolls prove which cluster it is: a secret issued for the enrollment, the hub's record of it, or both? | EN-6, I-3 |
 | **OQ-16** | At what number of enrolled clusters does the direct form stop being supportable for one management plane? | N-12, EN-3, N-1 |
 
-OQ-13, OQ-14, and OQ-15 have to be answered inside the first increment (DR-17). Each has a conservative starting point: the narrowest role that still lets a workload be delivered, signed intent only, and both proofs. No other open question blocks it.
+OQ-13, OQ-14, and OQ-15 have to be answered inside the first increment (DR-17). Each has a conservative starting point: an access piece that asks for the rights to deliver workloads and to read the cluster, not for cluster administration; signed intent only, unless a grant is recorded at enrollment; and both proofs for a cluster that comes through a hub. OQ-10 has one as well: such a cluster is named by its hub connection and its name on that hub. These are starting points, not answers. No other open question blocks the first increment.
 
 ## 3. Tensions and how they are resolved
 

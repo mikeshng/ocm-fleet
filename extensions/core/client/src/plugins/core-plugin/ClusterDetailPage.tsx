@@ -1,14 +1,12 @@
 import "./ClusterDetailPage.scss";
 
-import type {
-  ClusterDetailTabProps,
-  ClusterResource,
-  ResourceResult,
-} from "@ocm-fleet/common";
+import type { ClusterDetailTabProps, ClusterResource } from "@ocm-fleet/common";
 import {
+  clusterRecordFilter,
   createApiClient,
   createResourceApi,
-  extractClusterId,
+  mergeFleetClusters,
+  observedRecordFilter,
   PluginLink,
   usePluginNavigate,
 } from "@ocm-fleet/common";
@@ -19,6 +17,7 @@ import {
 } from "@openshift/dynamic-plugin-sdk";
 import { PageHeader } from "@patternfly/react-component-groups/dist/dynamic/PageHeader";
 import {
+  Alert,
   Breadcrumb,
   BreadcrumbItem,
   Button,
@@ -56,17 +55,16 @@ import { useParams, useSearchParams } from "react-router-dom";
 
 import {
   buildAddonBasePath,
+  clusterCreatedTime,
+  type ClusterRow,
+  clusterRowStatus,
   deriveClusterState,
   extractService,
   formatTime,
-  isTransientState,
-  stateLabel,
+  originLabel,
 } from "./clusterTypes";
 
 const clusterApi = createResourceApi<ClusterResource>("-");
-
-const CLUSTER_TYPE_FILTER =
-  'resourceType == "kind.open-cluster-management.io/Cluster"';
 
 interface ResolvedTab {
   id: string;
@@ -85,28 +83,103 @@ function isClusterDetailTabExtension(
   return e.type === CLUSTER_DETAIL_TAB_TYPE;
 }
 
-function OverviewTab({
-  result,
-  service,
-}: {
-  result: ResourceResult<ClusterResource>;
-  service: string;
-}) {
-  const cluster = result.resource;
-  const state = deriveClusterState(cluster);
-  const sl = stateLabel(state, cluster.state);
-  const isKind = service === "kind.open-cluster-management.io";
+function text(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** The facts shown under "Cluster Information", by the cluster's origin. */
+function clusterFacts(row: ClusterRow): [string, string][] {
+  const cluster = row.result.resource;
+  const observation = cluster.observation ?? {};
+  const facts: [string, string][] = [
+    ["Cluster ID", row.id],
+    ["UID", cluster.uid],
+    ["Origin", originLabel(row)],
+    ["Created", formatTime(clusterCreatedTime(row))],
+    ["Updated", formatTime(cluster.updateTime)],
+  ];
+  if (row.origin === "enrolled") {
+    facts.push(
+      ["API server", text(observation.apiServer)],
+      ["Kubernetes version", text(observation.kubernetesVersion)],
+      ["Access", text(observation.profile)],
+      ["Deployment target", text(observation.target)],
+      ["Stored credential delivers", text(observation.deliveryCredential)],
+      ["Enrolled by", text(observation.enrolledBy)],
+      [
+        "Credential expires",
+        formatTime(text(observation.credentialExpiresAt) || undefined),
+      ],
+    );
+    if (text(observation.state) === "withdrawn") {
+      facts.push(
+        ["Withdrawn", formatTime(text(observation.withdrawnAt) || undefined)],
+        ["Withdrawn by", text(observation.withdrawnBy)],
+        ["Reason", text(observation.withdrawnReason)],
+      );
+    }
+  }
+  if (row.observed) {
+    const hubView = row.observed.resource.observation ?? {};
+    facts.push(
+      ["Hub", row.hub ?? ""],
+      ["Name on the hub", text(hubView.name)],
+      ["Cluster set", text(hubView.clusterSet)],
+    );
+    if (row.origin === "observed") {
+      facts.push(["Kubernetes version", text(hubView.kubernetesVersion)]);
+    }
+  }
+  return facts.filter(([, value]) => value && value !== "—");
+}
+
+function OverviewTab({ row }: { row: ClusterRow }) {
+  const cluster = row.result.resource;
+  const status = clusterRowStatus(row);
+  const isKind =
+    extractService(row.result.name) === "kind.open-cluster-management.io";
+  const enrolledState =
+    row.origin === "enrolled" ? text(cluster.observation?.state) : "";
+  const apiCondition = isKind
+    ? cluster.conditions?.APIServerAvailable
+    : row.origin === "enrolled"
+      ? cluster.conditions?.Reachable
+      : undefined;
 
   return (
     <div className="ocm-fleet-core-overview-layout">
+      {row.origin === "observed" && (
+        <Alert
+          variant="info"
+          isInline
+          title="Observed through a hub, not enrolled"
+        >
+          Hub {row.hub} reports this cluster. Its resources are not indexed and
+          nothing can be deployed to it from here until it is enrolled.
+          Enrollment starts on the Hubs page and changes nothing on the hub
+          until its administrator applies it.
+        </Alert>
+      )}
+      {enrolledState === "needs-enrollment" && (
+        <Alert variant="warning" isInline title="Needs enrollment">
+          The stored credential for this cluster no longer works. Indexing and
+          delivery resume when the cluster is enrolled again.
+        </Alert>
+      )}
+      {enrolledState === "withdrawn" && (
+        <Alert variant="warning" isInline title="Withdrawn">
+          This cluster was withdrawn. It is no longer indexed and nothing is
+          delivered to it. What was delivered before stays on the cluster.
+        </Alert>
+      )}
       <Grid hasGutter>
         <GridItem span={4}>
           <Card isCompact isFullHeight>
             <CardBody>
               <Content component="p">Status</Content>
               <div className="pf-v6-u-mt-sm">
-                <Label color={sl.color}>
-                  {sl.text}
+                <Label color={status.color}>
+                  {status.text}
                   {cluster.reconciling ? " (reconciling)" : ""}
                 </Label>
               </div>
@@ -116,9 +189,9 @@ function OverviewTab({
         <GridItem span={4}>
           <Card isCompact isFullHeight>
             <CardBody>
-              <Content component="p">Provider</Content>
+              <Content component="p">Origin</Content>
               <Title headingLevel="h2" size="2xl">
-                {isKind ? "Kind" : "—"}
+                {originLabel(row)}
               </Title>
             </CardBody>
           </Card>
@@ -128,22 +201,18 @@ function OverviewTab({
             <CardBody>
               <Content component="p">API Server</Content>
               <div className="pf-v6-u-mt-sm">
-                {isKind ? (
+                {apiCondition ? (
                   <Label
-                    color={
-                      cluster.conditions?.APIServerAvailable?.status === "True"
-                        ? "green"
-                        : "grey"
-                    }
+                    color={apiCondition.status === "True" ? "green" : "grey"}
                     isCompact
                   >
-                    {cluster.conditions?.APIServerAvailable?.status === "True"
+                    {apiCondition.status === "True"
                       ? "Available"
                       : "Unavailable"}
                   </Label>
                 ) : (
                   <Label color="grey" isCompact>
-                    —
+                    {row.origin === "observed" ? "Not connected" : "—"}
                   </Label>
                 )}
               </div>
@@ -157,44 +226,18 @@ function OverviewTab({
           <Title headingLevel="h2" size="lg" className="pf-v6-u-mb-md">
             Cluster Information
           </Title>
-          <Grid hasGutter>
-            <GridItem span={6}>
-              <DescriptionList>
-                <DescriptionListGroup>
-                  <DescriptionListTerm>Cluster ID</DescriptionListTerm>
-                  <DescriptionListDescription>
-                    {extractClusterId(cluster.name)}
-                  </DescriptionListDescription>
-                </DescriptionListGroup>
-                <DescriptionListGroup>
-                  <DescriptionListTerm>UID</DescriptionListTerm>
-                  <DescriptionListDescription>
-                    {cluster.uid}
-                  </DescriptionListDescription>
-                </DescriptionListGroup>
-                <DescriptionListGroup>
-                  <DescriptionListTerm>Created</DescriptionListTerm>
-                  <DescriptionListDescription>
-                    {formatTime(cluster.createTime)}
-                  </DescriptionListDescription>
-                </DescriptionListGroup>
-              </DescriptionList>
-            </GridItem>
-            <GridItem span={6}>
-              <DescriptionList>
-                <DescriptionListGroup>
-                  <DescriptionListTerm>Updated</DescriptionListTerm>
-                  <DescriptionListDescription>
-                    {formatTime(cluster.updateTime)}
-                  </DescriptionListDescription>
-                </DescriptionListGroup>
-              </DescriptionList>
-            </GridItem>
-          </Grid>
+          <DescriptionList columnModifier={{ default: "2Col" }}>
+            {clusterFacts(row).map(([term, value]) => (
+              <DescriptionListGroup key={term}>
+                <DescriptionListTerm>{term}</DescriptionListTerm>
+                <DescriptionListDescription>{value}</DescriptionListDescription>
+              </DescriptionListGroup>
+            ))}
+          </DescriptionList>
         </CardBody>
       </Card>
 
-      {isKind && cluster.conditions && (
+      {cluster.conditions && Object.keys(cluster.conditions).length > 0 && (
         <Card>
           <CardBody>
             <Title headingLevel="h2" size="lg" className="pf-v6-u-mb-md">
@@ -239,9 +282,7 @@ function OverviewTab({
 export default function ClusterDetailPage() {
   const { clusterId } = useParams<{ clusterId: string }>();
   const clusters = usePluginNavigate("core-plugin", "ClustersModule");
-  const [result, setResult] = useState<ResourceResult<ClusterResource> | null>(
-    null,
-  );
+  const [row, setRow] = useState<ClusterRow | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -293,7 +334,7 @@ export default function ClusterDetailPage() {
     return tabs.sort((a, b) => a.priority - b.priority);
   }, [tabExtensions]);
 
-  const service = result ? extractService(result.name) : "";
+  const service = row ? extractService(row.result.name) : "";
 
   const fetchCluster = useCallback(
     async (silent = false) => {
@@ -301,16 +342,27 @@ export default function ClusterDetailPage() {
       const id = ++requestIdRef.current;
       if (!silent) setError(null);
       try {
-        const escaped = clusterId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-        const response = await clusterApi.search({
-          filter: `(${CLUSTER_TYPE_FILTER}) && resource.name == "clusters/${escaped}"`,
-          pageSize: 1,
-        });
+        // The cluster's own record and the record a connected hub has of
+        // it are different types; either may be the only one there is.
+        const [own, observed] = await Promise.all([
+          clusterApi.search({
+            filter: clusterRecordFilter(clusterId),
+            pageSize: 2,
+          }),
+          clusterApi.search({
+            filter: observedRecordFilter(clusterId),
+            pageSize: 5,
+          }),
+        ]);
         if (id !== requestIdRef.current) return;
-        if (response.resources.length > 0) {
-          setResult(response.resources[0]);
+        const found = mergeFleetClusters([
+          ...own.resources,
+          ...observed.resources,
+        ]).find((r) => r.id === clusterId);
+        if (found) {
+          setRow(found);
         } else {
-          if (silent) setResult(null);
+          if (silent) setRow(null);
           else setError("Cluster not found");
         }
       } catch (e) {
@@ -331,10 +383,8 @@ export default function ClusterDetailPage() {
     fetchCluster();
   }, [fetchCluster]);
 
-  const cluster = result?.resource;
-  const state = cluster ? deriveClusterState(cluster) : undefined;
-  const isTransient =
-    isTransientState(state) || (cluster?.reconciling ?? false);
+  const status = row ? clusterRowStatus(row) : undefined;
+  const isTransient = status?.transient ?? false;
 
   useEffect(() => {
     if (!isTransient) return;
@@ -344,10 +394,14 @@ export default function ClusterDetailPage() {
 
   const clusterName = useMemo(() => clusterId ?? "", [clusterId]);
 
-  const canDelete = state !== "DELETING";
+  // Only a cluster that was created here can be deleted here. An enrolled
+  // cluster is withdrawn, and an observed one belongs to its hub.
+  const canDelete =
+    row?.origin === "created" &&
+    deriveClusterState(row.result.resource) !== "DELETING";
 
   const handleDelete = async () => {
-    if (!clusterId || !service) return;
+    if (!clusterId || !service || !canDelete) return;
     setIsDeleting(true);
     setShowDeleteModal(false);
     try {
@@ -364,7 +418,7 @@ export default function ClusterDetailPage() {
     return <Spinner aria-label="Loading cluster details" />;
   }
 
-  if (error || !result) {
+  if (error || !row || !status) {
     return (
       <EmptyState titleText={error ?? "Cluster not found"} headingLevel="h1">
         <EmptyStateBody>
@@ -379,9 +433,15 @@ export default function ClusterDetailPage() {
     );
   }
 
-  const sl = stateLabel(state, result.resource.state);
+  // A tab that names a service is for clusters that have a record from
+  // that service, their own or the hub's. The other tabs show what is
+  // indexed from inside a cluster, so they need a cluster that is indexed.
+  const services = new Set([
+    service,
+    row.observed ? extractService(row.observed.name) : service,
+  ]);
   const tabElements = resolvedTabs
-    .filter((tab) => !tab.service || tab.service === service)
+    .filter((tab) => (tab.service ? services.has(tab.service) : row.indexed))
     .map((tab) => (
       <Tab
         key={tab.eventKey}
@@ -398,16 +458,16 @@ export default function ClusterDetailPage() {
     <div className="ocm-fleet-core-detail-layout">
       <PageHeader
         title={clusterName}
-        subtitle={`Created ${formatTime(result.resource.createTime)}`}
+        subtitle={`Created ${formatTime(clusterCreatedTime(row))}`}
         label={
           <Label
-            color={sl.color}
+            color={status.color}
             isCompact
             className="pf-v6-u-mr-sm"
-            icon={state === "PAUSED_AUTH" ? <PauseCircleIcon /> : undefined}
+            icon={status.paused ? <PauseCircleIcon /> : undefined}
           >
-            {sl.text}
-            {result.resource.reconciling ? " (reconciling)" : ""}
+            {status.text}
+            {row.result.resource.reconciling ? " (reconciling)" : ""}
           </Label>
         }
         breadcrumbs={
@@ -428,23 +488,23 @@ export default function ClusterDetailPage() {
           </Breadcrumb>
         }
         actionMenu={
-          <Dropdown
-            isOpen={actionsOpen}
-            onOpenChange={setActionsOpen}
-            toggle={(toggleRef) => (
-              <MenuToggle
-                ref={toggleRef}
-                onClick={() => setActionsOpen((prev) => !prev)}
-                variant="primary"
-                isDisabled={isDeleting}
-              >
-                Actions
-              </MenuToggle>
-            )}
-            popperProps={{ position: "end" }}
-          >
-            <DropdownList>
-              {canDelete && (
+          canDelete ? (
+            <Dropdown
+              isOpen={actionsOpen}
+              onOpenChange={setActionsOpen}
+              toggle={(toggleRef) => (
+                <MenuToggle
+                  ref={toggleRef}
+                  onClick={() => setActionsOpen((prev) => !prev)}
+                  variant="primary"
+                  isDisabled={isDeleting}
+                >
+                  Actions
+                </MenuToggle>
+              )}
+              popperProps={{ position: "end" }}
+            >
+              <DropdownList>
                 <DropdownItem
                   key="delete"
                   isDanger
@@ -455,9 +515,9 @@ export default function ClusterDetailPage() {
                 >
                   Delete cluster
                 </DropdownItem>
-              )}
-            </DropdownList>
-          </Dropdown>
+              </DropdownList>
+            </Dropdown>
+          ) : undefined
         }
       />
 
@@ -474,7 +534,7 @@ export default function ClusterDetailPage() {
             title={<TabTitleText>Overview</TabTitleText>}
           >
             <div className="pf-v6-u-pt-md">
-              <OverviewTab result={result} service={service} />
+              <OverviewTab row={row} />
             </div>
           </Tab>,
           ...tabElements,

@@ -4,7 +4,8 @@ import {
   ClusterResource,
   createApiClient,
   createResourceApi,
-  extractClusterId,
+  fleetClusterTypeFilter,
+  mergeFleetClusters,
   PluginLink,
 } from "@ocm-fleet/common";
 import {
@@ -52,13 +53,13 @@ import { useSearchParams } from "react-router-dom";
 import ClusterSummaryCards from "./ClusterSummaryCards";
 import {
   buildAddonBasePath,
+  clusterCreatedTime,
   type ClusterRow,
+  clusterRowStatus,
   deriveClusterState,
   extractService,
   formatTime,
-  isTransientState,
-  serviceLabel,
-  stateLabel,
+  originLabel,
 } from "./clusterTypes";
 import CreateClusterModal from "./CreateClusterModal";
 
@@ -66,7 +67,14 @@ interface ClusterFilters {
   name: string;
 }
 
-const columns: DataViewTh[] = ["Name", "Provider", "Status", "Created", ""];
+const columns: DataViewTh[] = [
+  "Name",
+  "Origin",
+  "Hub",
+  "Status",
+  "Created",
+  "",
+];
 
 const PER_PAGE_OPTIONS = [
   { title: "10", value: 10 },
@@ -116,15 +124,9 @@ export default function ClustersPage() {
     if (!silent) setLoading(true);
     try {
       const results = await clusterApi.searchAll({
-        filter: 'resourceType == "kind.open-cluster-management.io/Cluster"',
+        filter: fleetClusterTypeFilter(),
       });
-      setRows(
-        results.map((r) => ({
-          result: r,
-          id: extractClusterId(r.resource.name),
-          service: extractService(r.name),
-        })),
-      );
+      setRows(mergeFleetClusters(results));
       setError(null);
       if (silent) setSilentFailCount(0);
     } catch (e) {
@@ -150,11 +152,7 @@ export default function ClustersPage() {
     fetchClusters();
   }, [fetchClusters]);
 
-  const hasTransient = rows.some(
-    (r) =>
-      isTransientState(deriveClusterState(r.result.resource)) ||
-      r.result.resource.reconciling,
-  );
+  const hasTransient = rows.some((r) => clusterRowStatus(r).transient);
   useEffect(() => {
     if (!hasTransient || silentFailCount >= 3) return;
     const id = setInterval(() => fetchClusters(true), 5000);
@@ -180,7 +178,9 @@ export default function ClustersPage() {
     setDeleting(target.id);
     setDeleteTarget(null);
     try {
-      const client = createApiClient(buildAddonBasePath(target.service));
+      const client = createApiClient(
+        buildAddonBasePath(extractService(target.result.name)),
+      );
       await client.delete(`/clusters/${target.id}`);
       await fetchClusters();
     } catch (e) {
@@ -195,10 +195,11 @@ export default function ClustersPage() {
       filtered
         .slice((page - 1) * perPage, (page - 1) * perPage + perPage)
         .map((r) => {
-          const state = deriveClusterState(r.result.resource);
-          const sl = stateLabel(state, r.result.resource.state);
+          const status = clusterRowStatus(r);
           const isDeleting = deleting === r.id;
-          const isPaused = state === "PAUSED_AUTH";
+          const canDelete =
+            r.origin === "created" &&
+            deriveClusterState(r.result.resource) !== "DELETING";
           return [
             {
               cell: (
@@ -213,37 +214,40 @@ export default function ClustersPage() {
             },
             {
               cell: (
-                <Label color="blue" isCompact>
-                  {serviceLabel(r.service)}
+                <Label
+                  color={r.origin === "observed" ? "grey" : "blue"}
+                  isCompact
+                >
+                  {originLabel(r)}
                 </Label>
               ),
             },
+            r.hub ?? "—",
             {
               cell: (
                 <Label
-                  color={sl.color}
+                  color={status.color}
                   isCompact
-                  icon={isPaused ? <PauseCircleIcon /> : undefined}
+                  icon={status.paused ? <PauseCircleIcon /> : undefined}
                 >
-                  {sl.text}
+                  {status.text}
                   {r.result.resource.reconciling ? " (reconciling)" : ""}
                 </Label>
               ),
             },
-            formatTime(r.result.resource.createTime),
+            formatTime(clusterCreatedTime(r)),
             {
-              cell:
-                state !== "DELETING" ? (
-                  <ActionsColumn
-                    items={[
-                      {
-                        title: isDeleting ? "Deleting..." : "Delete",
-                        onClick: () => setDeleteTarget(r),
-                        isDisabled: isDeleting,
-                      },
-                    ]}
-                  />
-                ) : null,
+              cell: canDelete ? (
+                <ActionsColumn
+                  items={[
+                    {
+                      title: isDeleting ? "Deleting..." : "Delete",
+                      onClick: () => setDeleteTarget(r),
+                      isDisabled: isDeleting,
+                    },
+                  ]}
+                />
+              ) : null,
               props: { isActionCell: true },
             },
           ];

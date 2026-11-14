@@ -13,24 +13,67 @@ func TestDescriptor_DeclaresDeliveryAndInventoryCapabilities(t *testing.T) {
 	if desc.ID != kubernetes.AddonID {
 		t.Errorf("ID = %q, want %q", desc.ID, kubernetes.AddonID)
 	}
-	if len(desc.Capabilities) != 2 {
-		t.Fatalf("len(Capabilities) = %d, want 2", len(desc.Capabilities))
+	if len(desc.Capabilities) != 4 {
+		t.Fatalf("len(Capabilities) = %d, want 4", len(desc.Capabilities))
 	}
 
-	var hasDelivery, hasInventory bool
+	var hasDelivery bool
+	inventory := map[domain.ResourceType]bool{}
 	for _, cap := range desc.Capabilities {
 		switch c := cap.(type) {
 		case domain.DeliveryCapability:
 			hasDelivery = c.TargetType == kubernetes.TargetType
 		case domain.InventoryResourceCapability:
-			hasInventory = c.ResourceType == kubernetes.ObjectResourceType
+			inventory[c.ResourceType] = true
 		}
 	}
 	if !hasDelivery {
 		t.Error("expected a DeliveryCapability for kubernetes.TargetType")
 	}
-	if !hasInventory {
-		t.Error("expected an InventoryResourceCapability for kubernetes.ObjectResourceType")
+	for _, rt := range []domain.ResourceType{
+		kubernetes.ObjectResourceType, kubernetes.ClusterResourceType, kubernetes.EnrollmentBundleResourceType,
+	} {
+		if !inventory[rt] {
+			t.Errorf("expected an InventoryResourceCapability for %s", rt)
+		}
+	}
+}
+
+// TestSchemas_MatchInventoryCapabilities pins that every inventory
+// capability the descriptor claims has a schema, each inventory-only
+// and owned by the addon's service name.
+func TestSchemas_MatchInventoryCapabilities(t *testing.T) {
+	schemas := map[domain.ResourceType]domain.ExtensionResourceSchema{}
+	for _, s := range kubernetes.Schemas() {
+		schemas[s.ResourceType] = s
+	}
+	wantCollections := map[domain.ResourceType]string{
+		kubernetes.ObjectResourceType:           "objects",
+		kubernetes.ClusterResourceType:          "clusters",
+		kubernetes.EnrollmentBundleResourceType: "enrollmentBundles",
+	}
+	for _, cap := range kubernetes.Descriptor().Capabilities {
+		inv, ok := cap.(domain.InventoryResourceCapability)
+		if !ok {
+			continue
+		}
+		s, ok := schemas[inv.ResourceType]
+		if !ok {
+			t.Errorf("no schema for inventory capability %s", inv.ResourceType)
+			continue
+		}
+		if s.Inventory == nil || s.Management != nil {
+			t.Errorf("schema %s must be inventory-only", inv.ResourceType)
+		}
+		if s.CollectionID != wantCollections[inv.ResourceType] {
+			t.Errorf("schema %s CollectionID = %q, want %q", inv.ResourceType, s.CollectionID, wantCollections[inv.ResourceType])
+		}
+		if inv.ResourceType.ServiceName() != domain.ServiceName(kubernetes.AddonID) {
+			t.Errorf("schema %s is not under the addon's service name", inv.ResourceType)
+		}
+	}
+	if len(schemas) != len(wantCollections) {
+		t.Errorf("Schemas() returned %d schemas, want %d", len(schemas), len(wantCollections))
 	}
 }
 

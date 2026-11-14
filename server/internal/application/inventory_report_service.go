@@ -347,6 +347,87 @@ func (s *InventoryReportService) ApplyDeltaBatch(ctx context.Context, in Invento
 	return tx.Commit()
 }
 
+// ListCollections returns the distinct collection names that currently
+// hold at least one resource of the inventory type rt. Reporters that
+// nest their resources under a parent (e.g. a cluster) use it to find
+// parents that still own rows.
+func (s *InventoryReportService) ListCollections(ctx context.Context, rt domain.ResourceType) ([]domain.CollectionName, error) {
+	tx, err := s.store.BeginReadOnly(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	if _, err := newReportResolver(tx).lookupInventoryType(ctx, rt); err != nil {
+		return nil, err
+	}
+	names, err := tx.ExtensionResources().ListCollections(ctx, rt)
+	if err != nil {
+		return nil, fmt.Errorf("list collections: %w", err)
+	}
+	return names, nil
+}
+
+// PurgeCollectionPrefix hard-deletes every resource of type rt whose
+// collection name starts with prefix and returns how many were removed.
+// It is the bulk form of an [InventoryReplacementInput.IsDelete] report
+// and follows the same policy: the type must be inventory-only. It is
+// meant for a reporter whose parent resource is gone, so that the rows
+// it reported under that parent do not outlive it.
+func (s *InventoryReportService) PurgeCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string) (int64, error) {
+	if prefix == "" {
+		return 0, fmt.Errorf("%w: collection prefix must not be empty", domain.ErrInvalidArgument)
+	}
+	tx, err := s.store.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	if _, err := newReportResolver(tx).lookupInventoryOnlyType(ctx, rt); err != nil {
+		return 0, err
+	}
+	n, err := tx.ExtensionResources().DeleteByCollectionPrefix(ctx, rt, prefix)
+	if err != nil {
+		return 0, fmt.Errorf("purge collection prefix: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// PurgeStaleCollectionPrefix is [PurgeCollectionPrefix] restricted to
+// the resources no report has written since notWrittenSince. A reporter
+// that has just reported everything that exists under a parent calls it
+// with the time it began, so that what disappeared at the source while
+// nothing was watching does not stay in the inventory.
+func (s *InventoryReportService) PurgeStaleCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error) {
+	if prefix == "" {
+		return 0, fmt.Errorf("%w: collection prefix must not be empty", domain.ErrInvalidArgument)
+	}
+	if notWrittenSince.IsZero() {
+		return 0, fmt.Errorf("%w: the time since which resources must have been written is required", domain.ErrInvalidArgument)
+	}
+	tx, err := s.store.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	if _, err := newReportResolver(tx).lookupInventoryOnlyType(ctx, rt); err != nil {
+		return 0, err
+	}
+	n, err := tx.ExtensionResources().DeleteStaleByCollectionPrefix(ctx, rt, prefix, notWrittenSince)
+	if err != nil {
+		return 0, fmt.Errorf("purge stale collection prefix: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // validateDeltaReport rejects internally conflicting delta fields
 // before identity resolution or persistence. It delegates to
 // [domain.ValidateInventoryDelta], which [ApplyInventoryDeltas] also

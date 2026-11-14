@@ -1,9 +1,20 @@
-import type { ClusterResource, ResourceResult } from "@ocm-fleet/common";
+import type {
+  ClusterResource,
+  FleetClusterRow,
+  FleetClusterStatus,
+  ResourceResult,
+} from "@ocm-fleet/common";
+import {
+  enrolledClusterStatus,
+  observedClusterStatus,
+} from "@ocm-fleet/common";
 
-export interface ClusterRow {
-  result: ResourceResult<ClusterResource>;
-  id: string;
-  service: string;
+/** A cluster of any origin, as the cluster list and detail page hold it. */
+export type ClusterRow = FleetClusterRow<ResourceResult<ClusterResource>>;
+
+export interface ClusterRowStatus extends FleetClusterStatus {
+  paused: boolean;
+  transient: boolean;
 }
 
 const STATE_LABELS: Record<
@@ -89,4 +100,49 @@ export function deriveClusterState(
   if (ready?.status === "True") return "RUNNING";
   if (ready?.status === "False") return "ERROR";
   return undefined;
+}
+
+/** What the list and the detail page show as a cluster's state. */
+export function clusterRowStatus(row: ClusterRow): ClusterRowStatus {
+  if (row.origin === "enrolled") {
+    return {
+      ...enrolledClusterStatus(row.result),
+      paused: false,
+      transient: false,
+    };
+  }
+  if (row.origin === "observed") {
+    return {
+      ...observedClusterStatus(row.result),
+      paused: false,
+      transient: false,
+    };
+  }
+  const resource = row.result.resource;
+  const state = deriveClusterState(resource);
+  const label = stateLabel(state, resource.state);
+  return {
+    text: label.text,
+    color: label.color,
+    healthy: isHealthyState(resource.state),
+    attention: isFailureState(resource.state),
+    paused: state === "PAUSED_AUTH",
+    transient: isTransientState(state) || !!resource.reconciling,
+  };
+}
+
+/** How the cluster came to be known, as a short label. */
+export function originLabel(row: ClusterRow): string {
+  if (row.origin === "enrolled") return "Enrolled";
+  if (row.origin === "observed") return "Observed";
+  return serviceLabel(extractService(row.result.name));
+}
+
+/** When the cluster itself was created, as far as its record tells. */
+export function clusterCreatedTime(row: ClusterRow): string | undefined {
+  if (row.origin === "observed") {
+    const createdAt = row.result.resource.observation?.createdAt;
+    if (typeof createdAt === "string" && createdAt) return createdAt;
+  }
+  return row.result.resource.createTime;
 }

@@ -30,6 +30,54 @@ func (r *recordingInventoryReportBackend) ReplaceBatch(_ context.Context, resour
 	return r.replaceBatchErr
 }
 
+// stalePurgingBackend is a backend that can also remove what was not
+// written since a given time; it records what it was asked.
+type stalePurgingBackend struct {
+	recordingInventoryReportBackend
+	resourceType domain.ResourceType
+	prefix       string
+	since        time.Time
+}
+
+func (b *stalePurgingBackend) PurgeStaleCollectionPrefix(_ context.Context, resourceType domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error) {
+	b.resourceType, b.prefix, b.since = resourceType, prefix, notWrittenSince
+	return 7, nil
+}
+
+func TestDirectInventoryReporter_PurgeObjectsNotReportedSince(t *testing.T) {
+	ctx := context.Background()
+	since := time.Unix(1700000000, 0).UTC()
+
+	// A backend without the capability: nothing is removed, and that is
+	// not an error.
+	plain := kubernetes.NewDirectInventoryReporter(&recordingInventoryReportBackend{})
+	if n, err := plain.PurgeObjectsNotReportedSince(ctx, "clusters/prod", since); n != 0 || err != nil {
+		t.Fatalf("backend without the capability: %d, %v; want 0, nil", n, err)
+	}
+
+	backend := &stalePurgingBackend{}
+	reporter := kubernetes.NewDirectInventoryReporter(backend)
+	n, err := reporter.PurgeObjectsNotReportedSince(ctx, "clusters/prod", since)
+	if err != nil || n != 7 {
+		t.Fatalf("PurgeObjectsNotReportedSince = %d, %v; want 7, nil", n, err)
+	}
+	if backend.resourceType != kubernetes.ObjectResourceType {
+		t.Errorf("resource type = %q, want the object type", backend.resourceType)
+	}
+	// The trailing slash keeps clusters/prod-2 out of clusters/prod.
+	if backend.prefix != "clusters/prod/" {
+		t.Errorf("prefix = %q, want clusters/prod/", backend.prefix)
+	}
+	if !backend.since.Equal(since) {
+		t.Errorf("since = %s, want %s", backend.since, since)
+	}
+
+	backend.prefix = ""
+	if _, err := reporter.PurgeObjectsNotReportedSince(ctx, "", since); err == nil || backend.prefix != "" {
+		t.Errorf("a name that is not a cluster: err %v, backend asked with %q; want an error and no call", err, backend.prefix)
+	}
+}
+
 func TestDirectInventoryReporter_ApplyDelta_EmptyIsNoop(t *testing.T) {
 	fake := &recordingInventoryReportBackend{}
 	reporter := kubernetes.NewDirectInventoryReporter(fake)

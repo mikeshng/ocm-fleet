@@ -38,7 +38,7 @@ func buildTrustBundlePlacement(enabledAddons map[AddonName]bool) domain.Placemen
 	}
 }
 
-// assembleProductionAddons builds production Kind, Kubernetes, and scripted specs.
+// assembleProductionAddons builds production Kind, Kubernetes, OCM, and scripted specs.
 // Agent construction stays at the composition edge because agents have
 // external dependencies (container runtimes, credentials, etc.) that AddonManager
 // should not own; Enable/Connect only register capabilities and wire
@@ -101,6 +101,9 @@ func assembleProductionAddons(
 		})
 	}
 
+	// enrollment is the kubernetes add-on's capability to take existing
+	// clusters in. The OCM integration, assembled below, builds on it.
+	var enrollment *kubernetesEnrollment
 	if enabled[AddonKubernetes] {
 		kubeAgentOpts := []kubernetesaddon.DeliveryAgentOption{
 			kubernetesaddon.WithKeyResolver(keyResolver),
@@ -113,13 +116,25 @@ func assembleProductionAddons(
 		if kubeAgent == nil {
 			return nil, fmt.Errorf("kubernetes delivery agent is nil")
 		}
-		specs = append(specs, AddonSpec{
+		spec := AddonSpec{
 			Descriptor: kubernetesaddon.Descriptor(),
 			Connect: application.ConnectInput{
 				Agent:   kubeAgent,
-				Schemas: []domain.ExtensionResourceSchema{kubernetesaddon.InventorySchema()},
+				Schemas: kubernetesaddon.Schemas(),
 			},
-		})
+		}
+		if enrollment = newKubernetesEnrollment(deps); enrollment != nil {
+			spec.AfterConnect = enrollment.start
+			spec.Close = enrollment.worker.Close
+			spec.HTTPRoutes = enrollment.http.Register
+		}
+		specs = append(specs, spec)
+	}
+
+	if enabled[AddonOCM] {
+		if spec, ok := newOCMIntegration(deps, enrollment); ok {
+			specs = append(specs, spec)
+		}
 	}
 
 	if enabled[AddonScripted] {

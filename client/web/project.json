@@ -14,7 +14,11 @@
     "type:js-project",
     "test:vitest"
   ],
-  "implicitDependencies": ["plugins", "@ocm-fleet/kind-plugin"],
+  "implicitDependencies": [
+    "plugins",
+    "@ocm-fleet/kind-plugin",
+    "@ocm-fleet/ocm-plugin"
+  ],
   "targets": {
     "fmt": {},
     "verify": {},

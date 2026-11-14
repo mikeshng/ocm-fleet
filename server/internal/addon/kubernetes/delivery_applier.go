@@ -94,22 +94,54 @@ func (a *applier) apply(ctx context.Context, raw json.RawMessage) error {
 // delete removes the Kubernetes resource described by the raw JSON manifest.
 // Returns nil if the resource is already gone (404).
 func (a *applier) delete(ctx context.Context, raw json.RawMessage) error {
+	_, err := a.deleteObject(ctx, raw, false)
+	return err
+}
+
+// deleteWithStoredCredential is delete for a removal that runs with the
+// platform's stored credential, whose rights the cluster's side has
+// limited. A cluster answers "forbidden" to a delete it does not allow
+// whether or not the object exists, and with this credential nobody
+// can be asked to try again with more rights. So a forbidden delete is
+// looked at more closely:
+//
+//   - the object is not there: nothing to remove;
+//   - the credential may not read objects of this kind either: the
+//     cluster's side has put the kind outside what the resource manager
+//     may touch. The object is left as it is, and named in unseen so
+//     that the caller can say so;
+//   - the object is there and readable: the error stands.
+//
+// Without this a deployment that the cluster refused at creation could
+// never be deleted.
+func (a *applier) deleteWithStoredCredential(ctx context.Context, raw json.RawMessage) (unseen string, err error) {
+	return a.deleteObject(ctx, raw, true)
+}
+
+func (a *applier) deleteObject(ctx context.Context, raw json.RawMessage, storedCredential bool) (unseen string, err error) {
 	obj := &unstructured.Unstructured{}
 	if err := obj.UnmarshalJSON(raw); err != nil {
-		return fmt.Errorf("parse manifest: %w", err)
+		return "", fmt.Errorf("parse manifest: %w", err)
 	}
 
 	dr, err := a.resolveResource(obj)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	gvk := obj.GroupVersionKind()
-	if err := dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)
+	deleteErr := dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
+	if deleteErr == nil || apierrors.IsNotFound(deleteErr) {
+		return "", nil
 	}
-	return nil
+	if storedCredential && apierrors.IsForbidden(deleteErr) {
+		_, getErr := dr.Get(ctx, obj.GetName(), metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(getErr):
+			return "", nil
+		case apierrors.IsForbidden(getErr):
+			return fmt.Sprintf("%s %s/%s", gvk.Kind, obj.GetNamespace(), obj.GetName()), nil
+		}
+	}
+	return "", fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), deleteErr)
 }

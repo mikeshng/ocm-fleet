@@ -84,7 +84,7 @@ These stories are one journey. Someone already runs a hub with many managed clus
 - It can be applied by any means: by hand, by the pipeline that builds the cluster, or by a GitOps agent on the cluster.
 - No hub object exists for the enrollment at any time.
 
-**Today.** Not available. The access piece for the direct form is two built-in Kubernetes objects, so any tool that applies manifests can deliver it.
+**Today.** Not available. The access piece for the direct form consists of built-in Kubernetes kinds, so any tool that applies manifests can deliver it.
 
 **Phase.** Leading. **Requirements.** EN-4, N-2, U-10, M-8.
 
@@ -178,6 +178,7 @@ These stories are one journey. Someone already runs a hub with many managed clus
 - Removing the access piece from the cluster ends the management plane's access at once.
 - The management plane then reports the cluster as withdrawn, not as failing, and does not enroll it again by itself.
 - Workloads stay in place unless I ask for them to be removed.
+- If intent still points at the cluster, the withdrawal names it and goes ahead only when I say that what it delivered is to stay.
 - The cluster is still registered with my hub, and OCM-io is unaffected.
 
 **Today.** Observed on the test environment: after the service account and its binding were removed from a cluster, a credential that had worked was refused at once, and the hub went on reporting the cluster as available.

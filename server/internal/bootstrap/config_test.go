@@ -460,6 +460,54 @@ func TestUnregisteredAddonRejected(t *testing.T) {
 	}
 }
 
+func TestNewConfig_EnrollmentEndpoint(t *testing.T) {
+	validCA := testutil.MustCAPEM(t)
+	base := bootstrap.ConfigInput{GRPCAddr: ":50051", HTTPAddr: ":8080", DBPath: bootstrap.DefaultSQLitePath}
+
+	in := base
+	in.EnrollmentServerURL = " https://fleet.example:8085/ "
+	in.EnrollmentCABundle = validCA
+	in.EnrollmentConnectAddress = " fleet-internal:8085 "
+	in.EnrollmentAgentImage = " registry.example/agent:1 "
+	got, err := bootstrap.NewConfig(in)
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	assertConfigEqual(t, got, bootstrap.Config{
+		GRPCAddr:                 ":50051",
+		HTTPAddr:                 ":8080",
+		Database:                 bootstrap.SQLite{Path: bootstrap.DefaultSQLitePath},
+		EnrollmentServerURL:      "https://fleet.example:8085",
+		EnrollmentCABundle:       validCA,
+		EnrollmentConnectAddress: "fleet-internal:8085",
+		EnrollmentAgentImage:     "registry.example/agent:1",
+	})
+	if &got.EnrollmentCABundle[0] == &in.EnrollmentCABundle[0] {
+		t.Fatal("EnrollmentCABundle was not copied")
+	}
+
+	for name, tc := range map[string]struct {
+		mutate  func(*bootstrap.ConfigInput)
+		wantErr string
+	}{
+		"cleartext address":    {func(c *bootstrap.ConfigInput) { c.EnrollmentServerURL = "http://fleet.example:8085" }, "must be an https URL"},
+		"address without host": {func(c *bootstrap.ConfigInput) { c.EnrollmentServerURL = "https://" }, "must be an https URL"},
+		"address with path":    {func(c *bootstrap.ConfigInput) { c.EnrollmentServerURL = "https://fleet.example/api" }, "must not carry a path"},
+		"address with user":    {func(c *bootstrap.ConfigInput) { c.EnrollmentServerURL = "https://u:p@fleet.example" }, "must not carry a path"},
+		"CA that is not PEM":   {func(c *bootstrap.ConfigInput) { c.EnrollmentCABundle = []byte("junk") }, "invalid enrollment CA data"},
+		"address without port": {func(c *bootstrap.ConfigInput) { c.EnrollmentConnectAddress = "fleet-internal" }, "must be host:port"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := base
+			tc.mutate(&in)
+			_, err := bootstrap.NewConfig(in)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("NewConfig() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestConfigAddonSet(t *testing.T) {
 	cfg, err := bootstrap.NewConfig(bootstrap.ConfigInput{
 		GRPCAddr: ":50051",
@@ -489,6 +537,10 @@ func assertConfigEqual(t *testing.T, got, want bootstrap.Config) {
 		got.OIDCRegistryID != want.OIDCRegistryID ||
 		got.OIDCRegistrySubjectExpression != want.OIDCRegistrySubjectExpression ||
 		got.OIDCPublicKeyClaimExpression != want.OIDCPublicKeyClaimExpression ||
+		got.EnrollmentServerURL != want.EnrollmentServerURL ||
+		got.EnrollmentConnectAddress != want.EnrollmentConnectAddress ||
+		got.EnrollmentAgentImage != want.EnrollmentAgentImage ||
+		string(got.EnrollmentCABundle) != string(want.EnrollmentCABundle) ||
 		string(got.OIDCCABundle) != string(want.OIDCCABundle) {
 		t.Fatalf("config mismatch:\n got: %#v\nwant: %#v", got, want)
 	}

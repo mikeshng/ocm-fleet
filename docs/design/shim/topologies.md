@@ -13,7 +13,7 @@
 | Management datastore | The operator | Inside the resource manager process, or a PostgreSQL service | Always |
 | Taking in an existing cluster: verification, the stored credential and its renewal, the target, the indexer | OCM Fleet | With the resource manager | When a cluster is enrolled, with a hub or without one |
 | The integration: hub connections, observed clusters, and their console views | An extension of the resource manager | With the resource manager | When a hub is connected |
-| Access piece, direct form: a service account and its role binding | The cluster's administrator | Each enrolled cluster | For the direct form |
+| Access piece, direct form: a service account in a namespace of its own, with its roles and bindings | The cluster's administrator | Each enrolled cluster | For the direct form |
 | Access piece, agent form: the resource manager's agent | OCM Fleet | Each enrolled cluster | For the agent form |
 | Enrollment add-on: an add-on template and its registration | The hub's administrator | The hub, with a small enrollment agent on each cluster while the add-on is enabled there | Optional. One route for rolling out the access piece. |
 | Agent endpoint for OCM-io agents | The integration | With the resource manager | Optional. Only when the management plane serves OCM-io agents. |
@@ -97,7 +97,7 @@ RM is the resource manager with its datastore and console. In the Leading phase 
 
 | Delivery path | Added to the cluster | Added for each delivery | Reaches a cluster that only connects out | Identity the cluster sees | Credential the management plane holds | Where evidence is verified |
 |---|---|---|---|---|---|---|
-| Direct | A service account and its role binding | Nothing beyond the workload | No | The enrolled service account, or the caller's own token where the cluster trusts the identity provider | One per cluster, with the rights the cluster's side granted | On the platform side |
+| Direct | A service account in a namespace of its own, with its roles and bindings | Nothing beyond the workload | No | The enrolled service account, or the caller's own token where the cluster trusts the identity provider | One per cluster, with the rights the cluster's side granted | On the platform side |
 | Agent | The resource manager's agent | Nothing beyond the workload | Yes | The agent's local identity | None | At the target, once implemented |
 | Work agent, optional | Nothing. The klusterlet's connection settings change. | One applied-work record | Yes | The work agent, or an executor service account | None | Nowhere. The management plane records the user. |
 
@@ -145,7 +145,7 @@ A first release validates one combination. Everything else is unclaimed until it
 | Management plane | The Evaluation topology for trial. The Single instance topology on PostgreSQL for use. |
 | Scale | The Standard profile, validated in the direct form before support is claimed (N-1, N-12) |
 | Visibility | Provider-only (T-7) |
-| On managed clusters | Nothing on observed clusters. On enrolled ones, a service account and its role binding, and the add-on's enrollment agent for as long as the add-on is enabled there. |
+| On managed clusters | Nothing on observed clusters. On enrolled ones, a namespace with a service account, its roles and bindings, and the enrollment agent: for as long as the add-on is enabled there, or once as a job where a manifest was applied. |
 | Kubernetes-facing surface | None |
 
 It does not claim tenant isolation, high availability, service-provider scale, clusters that accept no inbound connection, the agent form, noticing when another writer changes what it delivered, moving workloads between the two systems, driven or projected modes, service to OCM-io agents, or membership held by the management plane. Each of those needs its own evidence (Z-8).

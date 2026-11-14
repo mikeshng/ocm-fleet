@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	kubernetesaddon "github.com/stolostron/ocm-fleet/server/internal/addon/kubernetes"
 	"github.com/stolostron/ocm-fleet/server/internal/application"
@@ -14,6 +15,8 @@ import (
 type kubernetesInProcessIndexing struct {
 	// Runtime is injected into Kind/GCP agents and used for StopAll / replay.
 	Runtime kubernetesaddon.IndexingRuntime
+	// Indexed tells inventory cleanup which clusters have an indexer.
+	Indexed kubernetesaddon.IndexedClusterLister
 }
 
 // newKubernetesInProcessIndexing wires the Kubernetes indexing runtime
@@ -37,7 +40,7 @@ func newKubernetesInProcessIndexing(
 		kubernetesaddon.DefaultIndexerClients{},
 		logger,
 	)
-	return &kubernetesInProcessIndexing{Runtime: host}
+	return &kubernetesInProcessIndexing{Runtime: host, Indexed: host}
 }
 
 // directInventoryReportBackend adapts InventoryReportService onto the
@@ -77,6 +80,24 @@ func (b *directInventoryReportBackend) ReplaceBatch(ctx context.Context, resourc
 	}
 	return nil
 }
+
+// ListCollections implements [kubernetesaddon.InventoryRecordStore].
+func (b *directInventoryReportBackend) ListCollections(ctx context.Context, resourceType domain.ResourceType) ([]domain.CollectionName, error) {
+	return b.reports.ListCollections(ctx, resourceType)
+}
+
+// PurgeCollectionPrefix implements [kubernetesaddon.InventoryRecordStore].
+func (b *directInventoryReportBackend) PurgeCollectionPrefix(ctx context.Context, resourceType domain.ResourceType, prefix string) (int64, error) {
+	return b.reports.PurgeCollectionPrefix(ctx, resourceType, prefix)
+}
+
+// PurgeStaleCollectionPrefix implements [kubernetesaddon.StaleInventoryPurger].
+func (b *directInventoryReportBackend) PurgeStaleCollectionPrefix(ctx context.Context, resourceType domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error) {
+	return b.reports.PurgeStaleCollectionPrefix(ctx, resourceType, prefix, notWrittenSince)
+}
+
+var _ kubernetesaddon.InventoryRecordStore = (*directInventoryReportBackend)(nil)
+var _ kubernetesaddon.StaleInventoryPurger = (*directInventoryReportBackend)(nil)
 
 // storeTargetLister adapts the resource manager's target store onto the Kubernetes
 // startup replayer's TargetLister port at the server composition boundary.

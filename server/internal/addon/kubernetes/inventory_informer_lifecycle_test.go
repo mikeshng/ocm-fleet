@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -293,6 +295,280 @@ func TestListAndResync_ListError(t *testing.T) {
 	if inf.retries != 1 {
 		t.Fatalf("retries = %d, want 1", inf.retries)
 	}
+}
+
+// forbiddenPods is the answer of a cluster whose side has not given
+// the credential the right to read pods.
+func forbiddenPods() error {
+	return apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", errors.New("not allowed"))
+}
+
+func podList(pods ...*unstructured.Unstructured) *unstructured.UnstructuredList {
+	list := &unstructured.UnstructuredList{Object: map[string]any{"metadata": map[string]any{"resourceVersion": "1"}}}
+	for _, p := range pods {
+		list.Items = append(list.Items, *p)
+	}
+	return list
+}
+
+func TestListAndResync_ForbiddenIsAStateNotAFailure(t *testing.T) {
+	gvr := podsGVR()
+	dyn := newFakeDynamicClient(gvr)
+	dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, forbiddenPods()
+	})
+	inf := NewInformer(dyn, gvr, ObjectScopeNamespaced, make(chan ResourceEvent, 10), make(chan ResyncEvent, 10), nil, slog.Default())
+
+	if err := inf.listAndResync(context.Background()); !apierrors.IsForbidden(err) {
+		t.Fatalf("listAndResync = %v, want the cluster's refusal", err)
+	}
+	if inf.retries != 0 {
+		t.Errorf("retries = %d: a refusal is not a failure to retry every few seconds", inf.retries)
+	}
+	if inf.forbidden != "list" {
+		t.Errorf("forbidden = %q, want list", inf.forbidden)
+	}
+	// The informers that start after this one must not wait for it.
+	start := time.Now()
+	inf.WaitUntilInitialized(context.Background(), 10*time.Second)
+	if waited := time.Since(start); waited > time.Second {
+		t.Errorf("WaitUntilInitialized waited %s for a resource that cannot be read", waited)
+	}
+}
+
+func TestRun_ForbiddenResourceIsAskedAgainWithGrowingWaits(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		gvr := podsGVR()
+		dyn := newFakeDynamicClient(gvr)
+		var lists atomic.Int32
+		var allowed atomic.Bool
+		dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			lists.Add(1)
+			if !allowed.Load() {
+				return true, nil, forbiddenPods()
+			}
+			return true, podList(makePod("uid-1", "pod-1", "default", "1")), nil
+		})
+		dyn.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+			return true, watch.NewFake(), nil
+		})
+
+		eventCh := make(chan ResourceEvent, 10)
+		resyncCh := make(chan ResyncEvent, 10)
+		stopAcks := ackAllResyncs(resyncCh)
+		defer stopAcks()
+		inf := NewInformer(dyn, gvr, ObjectScopeNamespaced, eventCh, resyncCh, nil, slog.Default())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			inf.Run(ctx)
+		}()
+		synctest.Wait()
+		if got := lists.Load(); got != 1 {
+			t.Fatalf("%d list requests at start, want 1", got)
+		}
+
+		// Attempts 0 s, 30 s, 1.5 min, 3.5 min, 7.5 min, and 15.5 min after
+		// the start, then every 15 minutes: checked just before and just
+		// after each.
+		at := func(elapsed time.Duration, want int32) {
+			t.Helper()
+			time.Sleep(elapsed - time.Since(start))
+			synctest.Wait()
+			if got := lists.Load(); got != want {
+				t.Fatalf("%d list requests %s after the first refusal, want %d", got, elapsed, want)
+			}
+		}
+		at(29*time.Second, 1)
+		at(31*time.Second, 2)
+		at(89*time.Second, 2)
+		at(91*time.Second, 3)
+		at(209*time.Second, 3)
+		at(211*time.Second, 4)
+		at(449*time.Second, 4)
+		at(451*time.Second, 5)
+		at(929*time.Second, 5)
+		at(931*time.Second, 6)
+		at(1829*time.Second, 6) // the wait stops growing at 15 minutes
+		at(1831*time.Second, 7)
+
+		// The cluster's side grants the right: the next attempt indexes the resource.
+		allowed.Store(true)
+		at(2731*time.Second, 8)
+		select {
+		case ev := <-eventCh:
+			if ev.Op != EventAdd || string(ev.Resource.GetUID()) != "uid-1" {
+				t.Fatalf("event after the right was granted: %+v", ev)
+			}
+		default:
+			t.Fatal("the resource was not indexed after the right was granted")
+		}
+
+		cancel()
+		synctest.Wait()
+		<-done
+		if inf.forbidden != "" {
+			t.Errorf("forbidden = %q after a successful list", inf.forbidden)
+		}
+	})
+}
+
+func TestRun_ResourceThatMayBeListedButNotWatchedIsReadAgainAfterEachWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gvr := podsGVR()
+		dyn := newFakeDynamicClient(gvr)
+		var lists atomic.Int32
+		dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			lists.Add(1)
+			return true, podList(makePod("uid-1", "pod-1", "default", "1")), nil
+		})
+		dyn.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+			return true, nil, forbiddenPods()
+		})
+
+		eventCh := make(chan ResourceEvent, 10)
+		resyncCh := make(chan ResyncEvent, 10)
+		stopAcks := ackAllResyncs(resyncCh)
+		defer stopAcks()
+		inf := NewInformer(dyn, gvr, ObjectScopeNamespaced, eventCh, resyncCh, nil, slog.Default())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			inf.Run(ctx)
+		}()
+		synctest.Wait()
+		if got := lists.Load(); got != 1 {
+			t.Fatalf("%d list requests at start, want 1", got)
+		}
+		if ev := <-eventCh; ev.Op != EventAdd {
+			t.Fatalf("first event: %+v", ev)
+		}
+
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		if got := lists.Load(); got != 1 {
+			t.Fatalf("%d list requests within the first wait, want 1: the resource must not be listed in a loop", got)
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if got := lists.Load(); got != 2 {
+			t.Fatalf("%d list requests after the first wait, want 2", got)
+		}
+		// In one hour: lists at 0 s, 30 s, and 1.5, 3.5, 7.5, 15.5, 30.5, and 45.5 minutes.
+		time.Sleep(time.Hour - 31*time.Second)
+		synctest.Wait()
+		if got := lists.Load(); got != 8 {
+			t.Fatalf("%d list requests in the first hour, want 8", got)
+		}
+
+		cancel()
+		synctest.Wait()
+		<-done
+		if inf.forbidden != "watch" {
+			t.Errorf("forbidden = %q, want the watch noted as refused", inf.forbidden)
+		}
+	})
+}
+
+func TestRun_ObjectsOfAResourceThatStaysRefusedLeaveTheInventory(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gvr := podsGVR()
+		dyn := newFakeDynamicClient(gvr)
+		var refused atomic.Bool
+		var lists atomic.Int32
+		dyn.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			lists.Add(1)
+			if refused.Load() {
+				return true, nil, forbiddenPods()
+			}
+			return true, podList(makePod("uid-1", "pod-1", "default", "1")), nil
+		})
+		var mu sync.Mutex
+		var currentWatch *watch.FakeWatcher
+		dyn.PrependWatchReactor("pods", func(k8stesting.Action) (bool, watch.Interface, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			currentWatch = watch.NewFake()
+			return true, currentWatch, nil
+		})
+
+		// The writer's side: note the size of every LIST snapshot and confirm it.
+		eventCh := make(chan ResourceEvent, 10)
+		resyncCh := make(chan ResyncEvent)
+		var snapshots []int
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			for rs := range resyncCh {
+				mu.Lock()
+				snapshots = append(snapshots, len(rs.Resources))
+				mu.Unlock()
+				rs.Ack <- nil
+			}
+		}()
+		seen := func() string {
+			mu.Lock()
+			defer mu.Unlock()
+			return fmt.Sprint(snapshots)
+		}
+		inf := NewInformer(dyn, gvr, ObjectScopeNamespaced, eventCh, resyncCh, nil, slog.Default())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			inf.Run(ctx)
+		}()
+		synctest.Wait()
+		if seen() != "[1]" {
+			t.Fatalf("snapshots %s; want the pod indexed", seen())
+		}
+
+		// The cluster's side takes the right away; the watch ends.
+		refused.Store(true)
+		mu.Lock()
+		w := currentWatch
+		mu.Unlock()
+		w.Error(&metav1.Status{Status: metav1.StatusFailure, Message: "watch ended"})
+
+		// Refused at 2 s and 32 s: a refusal that passes costs nothing yet.
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if seen() != "[1]" || lists.Load() != 3 {
+			t.Fatalf("snapshots %s after %d lists; want the pod kept through two refusals", seen(), lists.Load())
+		}
+		// Refused a third time at 92 s: the pod leaves the inventory.
+		time.Sleep(40 * time.Second)
+		synctest.Wait()
+		if seen() != "[1 0]" || lists.Load() != 4 {
+			t.Fatalf("snapshots %s after %d lists; want an empty snapshot that removes the pod", seen(), lists.Load())
+		}
+
+		// The right comes back: the next attempt (212 s) indexes the pod again.
+		refused.Store(false)
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if seen() != "[1 0 1]" || lists.Load() != 5 {
+			t.Fatalf("snapshots %s after %d lists; want the pod indexed again", seen(), lists.Load())
+		}
+
+		cancel()
+		synctest.Wait()
+		<-done
+		close(resyncCh)
+		<-writerDone
+		if len(inf.resourceIndex) != 1 || inf.forbidden != "" {
+			t.Errorf("index %v, forbidden %q at the end; want the pod and no refusal", inf.resourceIndex, inf.forbidden)
+		}
+	})
 }
 
 func TestListAndResync_Pagination(t *testing.T) {
@@ -817,6 +1093,66 @@ func TestDiscoverAndReconcile_DiscoveryErrorNilSupported(t *testing.T) {
 	if len(mgr.stoppers) != 0 {
 		t.Fatalf("expected no stoppers on hard discovery failure, got %d", len(mgr.stoppers))
 	}
+	if mgr.Settled() {
+		t.Fatal("a manager whose discovery failed has no picture of the cluster: it must not count as settled")
+	}
+}
+
+// A manager is settled once every resource has been listed or has been
+// refused repeatedly. One refusal is not enough: a cluster that is
+// still starting refuses requests it allows a moment later.
+func TestSettled_WaitsForListsAndRepeatedRefusals(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pods := podsGVR()
+		secrets := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+		disc := newFakeDiscovery([]*metav1.APIResourceList{{
+			GroupVersion: "v1",
+			APIResources: []metav1.APIResource{
+				{Name: "pods", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+				{Name: "secrets", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+			},
+		}})
+		dyn := newFakeDynamicClient(pods, secrets)
+		dyn.PrependReactor("list", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "", errors.New("not allowed"))
+		})
+		eventCh := make(chan ResourceEvent, 10)
+		resyncCh := make(chan ResyncEvent, 10)
+		stopAck := ackAllResyncs(resyncCh)
+		defer stopAck()
+		mgr := NewInformerManager(dyn, disc, eventCh, resyncCh, nil, nil, slog.Default())
+		if mgr.Settled() {
+			t.Fatal("settled before the first reconcile")
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		start := time.Now()
+		mgr.discoverAndReconcile(ctx, nil, nil)
+		synctest.Wait()
+		if len(mgr.stoppers) != 2 {
+			t.Fatalf("stoppers = %d, want 2", len(mgr.stoppers))
+		}
+		if mgr.Settled() {
+			t.Fatal("settled after a single refusal")
+		}
+		// Secrets are refused again 30 s and 90 s after the first refusal.
+		time.Sleep(time.Until(start.Add(80 * time.Second)))
+		synctest.Wait()
+		if mgr.Settled() {
+			t.Fatal("settled after two refusals")
+		}
+		time.Sleep(time.Until(start.Add(110 * time.Second)))
+		synctest.Wait()
+		if !mgr.Settled() {
+			t.Fatal("not settled after pods were listed and secrets were refused three times")
+		}
+
+		if err := mgr.StopAll(context.Background()); err != nil {
+			t.Fatalf("StopAll: %v", err)
+		}
+		synctest.Wait()
+	})
 }
 
 // awaitRunContinuousReady advances fake time so RunContinuous can finish CRD

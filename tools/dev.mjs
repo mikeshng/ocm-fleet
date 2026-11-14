@@ -10,6 +10,7 @@ const wsRoot = root;
 const guiDist = resolve(root, "client/web/dist");
 const corePluginsDist = resolve(root, "extensions/core/client/dist");
 const kindPluginsDist = resolve(root, "extensions/kind/client/dist");
+const ocmPluginsDist = resolve(root, "extensions/ocm/client/dist");
 const watchOnly = process.argv.includes("--watch");
 
 function nx(target) {
@@ -35,6 +36,7 @@ if (!watchOnly) {
   console.log("Running initial build...");
   nx("plugins:build");
   nx("@ocm-fleet/kind-plugin:build");
+  nx("@ocm-fleet/ocm-plugin:build");
   nx("web:generate-registry");
   nx("web:build");
   nx("web:merge");
@@ -56,18 +58,21 @@ function spawnRspack(cwd) {
 
 const corePluginsCwd = resolve(root, "extensions/core/client");
 const kindPluginsCwd = resolve(root, "extensions/kind/client");
+const ocmPluginsCwd = resolve(root, "extensions/ocm/client");
 const guiCwd = resolve(root, "client/web");
 
 let corePluginsWatch = spawnRspack(corePluginsCwd);
 let kindPluginsWatch = spawnRspack(kindPluginsCwd);
+let ocmPluginsWatch = spawnRspack(ocmPluginsCwd);
 let guiWatch = spawnRspack(guiCwd);
 
 const corePluginsConfig = resolve(corePluginsCwd, "rspack.config.ts");
 const kindPluginsConfig = resolve(kindPluginsCwd, "rspack.config.ts");
+const ocmPluginsConfig = resolve(ocmPluginsCwd, "rspack.config.ts");
 const guiConfig = resolve(guiCwd, "rspack.config.ts");
 const configWatcher = new Watchpack({ aggregateTimeout: 300 });
 configWatcher.watch({
-  files: [corePluginsConfig, kindPluginsConfig, guiConfig],
+  files: [corePluginsConfig, kindPluginsConfig, ocmPluginsConfig, guiConfig],
 });
 configWatcher.on("change", (changedFile) => {
   if (changedFile === corePluginsConfig) {
@@ -88,6 +93,15 @@ configWatcher.on("change", (changedFile) => {
     prev.on("close", () => {
       kindPluginsWatch = spawnRspack(kindPluginsCwd);
     });
+  } else if (changedFile === ocmPluginsConfig) {
+    console.log(
+      "\nocm plugins rspack.config.ts changed — restarting build...\n",
+    );
+    const prev = ocmPluginsWatch;
+    prev.kill();
+    prev.on("close", () => {
+      ocmPluginsWatch = spawnRspack(ocmPluginsCwd);
+    });
   } else if (changedFile === guiConfig) {
     console.log("\ngui rspack.config.ts changed — restarting web build...\n");
     const prev = guiWatch;
@@ -101,13 +115,17 @@ configWatcher.on("change", (changedFile) => {
 mkdirSync(guiDist, { recursive: true });
 mkdirSync(corePluginsDist, { recursive: true });
 mkdirSync(kindPluginsDist, { recursive: true });
+mkdirSync(ocmPluginsDist, { recursive: true });
 const distWatcher = new Watchpack({ aggregateTimeout: 1500 });
-distWatcher.watch({ directories: [guiDist, corePluginsDist, kindPluginsDist] });
+distWatcher.watch({
+  directories: [guiDist, corePluginsDist, kindPluginsDist, ocmPluginsDist],
+});
 distWatcher.on("aggregated", merge);
 
 process.on("SIGINT", () => {
   corePluginsWatch.kill();
   kindPluginsWatch.kill();
+  ocmPluginsWatch.kill();
   guiWatch.kill();
   configWatcher.close();
   distWatcher.close();

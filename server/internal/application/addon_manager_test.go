@@ -1180,7 +1180,9 @@ func TestAddonManager_EnableKubernetesDescriptorRecordsCapabilities(t *testing.T
 		case domain.DeliveryCapability:
 			hasDelivery = c.TargetType == kubernetesaddon.TargetType
 		case domain.InventoryResourceCapability:
-			hasInventory = c.ResourceType == kubernetesaddon.ObjectResourceType
+			if c.ResourceType == kubernetesaddon.ObjectResourceType {
+				hasInventory = true
+			}
 		}
 	}
 	if !hasDelivery {

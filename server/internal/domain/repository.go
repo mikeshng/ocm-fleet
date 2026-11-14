@@ -146,6 +146,38 @@ type ExtensionResourceRepository interface {
 	// [InventoryReplacement.IsDelete] via ReplaceInventory instead.
 	ApplyInventoryDeltas(ctx context.Context, deltas []InventoryDelta) error
 
+	// ListCollections returns, ordered by name, the distinct collection
+	// names that hold at least one extension resource of type rt. For a
+	// nested type the collection name carries its parent segments (e.g.
+	// "clusters/c1/namespaces/default/apiResources/pods/objects"), so a
+	// caller can tell which parents still own rows without reading the
+	// rows themselves.
+	ListCollections(ctx context.Context, rt ResourceType) ([]CollectionName, error)
+
+	// DeleteByCollectionPrefix hard-deletes every extension resource of
+	// type rt whose collection name starts with prefix, with the same
+	// cascade and orphaned alias-claim cleanup as [Delete], and returns
+	// how many rows were removed. Zero matching rows is success. It
+	// exists so that everything reported under a parent that is gone
+	// (e.g. prefix "clusters/c1/") can be removed in one statement
+	// instead of one exact-name delete per row. An empty prefix is
+	// rejected with [ErrInvalidArgument]: removing a whole type is
+	// never what a caller of this method means. Like inventory deletes
+	// through [ReplaceInventory], inventory-only type policy is enforced
+	// by the application layer, not here.
+	DeleteByCollectionPrefix(ctx context.Context, rt ResourceType, prefix string) (int64, error)
+
+	// DeleteStaleByCollectionPrefix is [DeleteByCollectionPrefix]
+	// restricted to the resources whose inventory was last written
+	// before notWrittenSince (the ReceivedAt of the latest
+	// [ReplaceInventory] or [ApplyInventoryDeltas] that touched them); a
+	// resource with no inventory row counts as stale. A reporter that
+	// has just reported everything that exists under a parent uses it
+	// to remove what it did not report: the resources whose source
+	// disappeared while no reporter was watching. Times are compared
+	// to the millisecond at least.
+	DeleteStaleByCollectionPrefix(ctx context.Context, rt ResourceType, prefix string, notWrittenSince time.Time) (int64, error)
+
 	// Observation history (append-only). Neither ReplaceInventory nor
 	// ApplyInventoryDeltas populates this synchronously today -- see
 	// their doc above -- so this always returns an empty result until
