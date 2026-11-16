@@ -61,17 +61,34 @@ func (s *EnrollmentService) forgetProbeHistory(clusterID string) {
 }
 
 // CheckCluster looks after one enrolled cluster's credential: it
-// renews the credential when a third of its lifetime is left, takes
-// the target out of placement when the credential lapsed, treats a
+// renews the credential when a third of its lifetime is left, stops
+// new placement on the target when the credential lapsed, treats a
 // cluster that consistently refuses a credential that has not expired
 // as withdrawn by its own side, and keeps the indexer running.
 func (s *EnrollmentService) CheckCluster(ctx context.Context, clusterID string) error {
 	lock := s.lockCluster(clusterID)
 	defer lock.Unlock()
 
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return err
+	}
 	target, found, err := s.getTarget(ctx, TargetIDForCluster(clusterID))
 	if err != nil {
 		return err
+	}
+	// The record is authoritative about a withdrawal: the worker finishes
+	// a cleanup that was interrupted and never renews, lapses, or
+	// re-places a cluster the operator withdrew.
+	if state.obs.State == ClusterStateWithdrawn && state.obs.WithdrawnAt != nil {
+		if found && IsEnrolledTarget(target) {
+			purged, err := s.finishWithdrawal(ctx, clusterID, target)
+			if err != nil {
+				return err
+			}
+			s.logger.Info("withdrawal cleanup finished", "cluster", clusterID, "objects_removed", purged)
+		}
+		return nil
 	}
 	if !found || !IsEnrolledTarget(target) {
 		return nil
@@ -109,7 +126,10 @@ func (s *EnrollmentService) CheckCluster(ctx context.Context, clusterID string) 
 		}
 	}
 
-	state := s.loadClusterState(ctx, clusterID)
+	state, err = s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return err
+	}
 	before := state.fingerprint()
 	state.obs = observationFromTarget(target, state.obs)
 	if state.obs.State == "" || state.obs.State == ClusterStateNeedsEnrollment {
@@ -164,6 +184,7 @@ func (s *EnrollmentService) CheckCluster(ctx context.Context, clusterID string) 
 		if err := s.putTarget(ctx, ready, now); err != nil {
 			return err
 		}
+		s.reevaluatePlacement(ctx, "cluster "+clusterID+" is ready again")
 		target = ready
 	}
 
@@ -181,25 +202,36 @@ func (s *EnrollmentService) CheckCluster(ctx context.Context, clusterID string) 
 	return s.writeClusterState(ctx, clusterID, target.Labels(), state, now)
 }
 
-// lapse takes a cluster whose credential is gone or expired out of
-// placement until its side presents a new one. Nothing is removed: the
-// target, its labels, and the indexed objects stay.
+// lapse marks the target of a cluster whose credential is gone or
+// expired as not ready until its side presents a new one. Placement
+// then selects it for nothing new, and the deployments that already
+// hold it keep it: nothing is removed. The target, its labels, and the
+// indexed objects stay.
 func (s *EnrollmentService) lapse(ctx context.Context, clusterID string, target domain.TargetInfo, reason, message string, now time.Time) error {
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return err
+	}
+	// A withdrawal is newer than the credential problem: the record stays
+	// withdrawn.
+	if state.obs.State == ClusterStateWithdrawn && state.obs.WithdrawnAt != nil {
+		return nil
+	}
 	if target.State() != domain.TargetStateInitializing {
 		waiting := domain.NewTargetInfo(target.ID(), target.Type(), target.Name(), domain.TargetStateInitializing,
 			target.Labels(), target.Properties(), target.AcceptedManifestTypes())
 		if err := s.putTarget(ctx, waiting, now); err != nil {
 			return err
 		}
+		s.reevaluatePlacement(ctx, "the credential of cluster "+clusterID+" lapsed")
 		if s.indexing != nil {
 			if err := s.indexing.StopIndexer(ctx, target.ID()); err != nil {
 				s.logger.Warn("could not stop indexer of a cluster whose credential lapsed", "cluster", clusterID, "error", err)
 			}
 		}
-		s.logger.Warn("cluster credential lapsed; target is out of placement until a new credential is presented",
+		s.logger.Warn("cluster credential lapsed; the target takes no new placement until a new credential is presented",
 			"cluster", clusterID, "reason", reason)
 	}
-	state := s.loadClusterState(ctx, clusterID)
 	before := state.fingerprint()
 	state.obs = observationFromTarget(target, state.obs)
 	state.obs.State = ClusterStateNeedsEnrollment

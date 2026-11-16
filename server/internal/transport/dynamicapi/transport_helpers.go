@@ -71,6 +71,8 @@ func HTTPError(w http.ResponseWriter, code codes.Code, msg string) {
 	switch code {
 	case codes.InvalidArgument:
 		httpCode = http.StatusBadRequest
+	case codes.Unauthenticated:
+		httpCode = http.StatusUnauthorized
 	case codes.NotFound:
 		httpCode = http.StatusNotFound
 	case codes.AlreadyExists, codes.Aborted:

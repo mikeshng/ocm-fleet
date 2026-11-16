@@ -168,7 +168,7 @@ var File_ocm_v1alpha_delivery_completed_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_delivery_completed_proto_rawDesc = "" +
 	"\n" +
-	"$ocm/v1alpha/delivery_completed.proto\x12\vocm.v1alpha\x1a!ocm/v1alpha/manifest_result.proto\x1a$ocm/v1alpha/provisioned_target.proto\x1a!ocm/v1alpha/produced_secret.proto\"\xc5\x03\n" +
+	"$ocm/v1alpha/delivery_completed.proto\x12\vocm.v1alpha\x1a!ocm/v1alpha/manifest_result.proto\x1a!ocm/v1alpha/produced_secret.proto\x1a$ocm/v1alpha/provisioned_target.proto\"\xc5\x03\n" +
 	"\x11DeliveryCompleted\x12\x1f\n" +
 	"\vdelivery_id\x18\x01 \x01(\tR\n" +
 	"deliveryId\x12:\n" +
@@ -222,8 +222,8 @@ func file_ocm_v1alpha_delivery_completed_proto_init() {
 		return
 	}
 	file_ocm_v1alpha_manifest_result_proto_init()
-	file_ocm_v1alpha_provisioned_target_proto_init()
 	file_ocm_v1alpha_produced_secret_proto_init()
+	file_ocm_v1alpha_provisioned_target_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

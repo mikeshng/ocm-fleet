@@ -3,6 +3,7 @@ package domain
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -58,6 +59,21 @@ func (s *CreateManagedResourceWorkflowSpec) PersistManagedResource() Activity[Cr
 				ErrInvalidArgument, in.ResourceType)
 		}
 
+		// An activity may run more than once. If an earlier attempt
+		// committed and its result was not recorded, the resource
+		// already exists: that stored aggregate is this activity's
+		// result, and creating another would duplicate it. A create the
+		// caller must reject as a duplicate name is refused before the
+		// workflow starts, and a concurrent duplicate is refused when
+		// its workflow instance is started: the instance ID is derived
+		// from the type and name.
+		switch view, err := tx.ExtensionResources().GetView(ctx, in.ResourceType.FullName(in.Name)); {
+		case err == nil:
+			return view, nil
+		case !errors.Is(err, ErrNotFound):
+			return ExtensionResourceView{}, fmt.Errorf("look up existing managed resource: %w", err)
+		}
+
 		now := s.now()
 		fID := FulfillmentID(uuid.New().String())
 
@@ -110,10 +126,15 @@ func (s *CreateManagedResourceWorkflowSpec) PersistManagedResource() Activity[Cr
 }
 
 // StartOrchestration starts the orchestration workflow for the derived
-// fulfillment.
+// fulfillment. Idempotent: treats [ErrAlreadyRunning] as success so an
+// activity replay after the orchestration already started does not
+// fail the workflow.
 func (s *CreateManagedResourceWorkflowSpec) StartOrchestration() Activity[FulfillmentID, struct{}] {
 	return NewActivity("start-mr-orchestration", func(ctx context.Context, id FulfillmentID) (struct{}, error) {
 		_, err := s.Orchestration.Start(ctx, id)
+		if err != nil && errors.Is(err, ErrAlreadyRunning) {
+			return struct{}{}, nil
+		}
 		return struct{}{}, err
 	})
 }

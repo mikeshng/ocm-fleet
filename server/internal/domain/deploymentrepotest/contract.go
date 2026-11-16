@@ -50,6 +50,45 @@ func Run(t *testing.T, factory Factory) {
 		})
 	}
 
+	sampleDelivery := func(fid domain.FulfillmentID, tid domain.TargetID, state domain.DeliveryState, message string, attempts int) domain.Delivery {
+		return domain.DeliveryFromSnapshot(domain.DeliverySnapshot{
+			ID:            domain.DeliveryID(string(fid) + ":" + string(tid)),
+			FulfillmentID: fid,
+			TargetID:      tid,
+			Manifests:     []domain.Manifest{{Raw: json.RawMessage(`{"kind":"ConfigMap"}`)}},
+			Generation:    1,
+			State:         state,
+			Operation:     domain.DeliveryOperationDeliver,
+			Message:       message,
+			Attempts:      attempts,
+			CreatedAt:     fixedTime,
+			UpdatedAt:     fixedTime,
+		})
+	}
+
+	// checkDeliveries asserts that got matches want, including the
+	// target-ID ordering the view promises.
+	checkDeliveries := func(t *testing.T, prefix string, got, want []domain.Delivery) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s: Deliveries len = %d, want %d", prefix, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].TargetID() != want[i].TargetID() {
+				t.Errorf("%s: Deliveries[%d].TargetID = %q, want %q", prefix, i, got[i].TargetID(), want[i].TargetID())
+			}
+			if got[i].State() != want[i].State() {
+				t.Errorf("%s: Deliveries[%d].State = %q, want %q", prefix, i, got[i].State(), want[i].State())
+			}
+			if got[i].Message() != want[i].Message() {
+				t.Errorf("%s: Deliveries[%d].Message = %q, want %q", prefix, i, got[i].Message(), want[i].Message())
+			}
+			if got[i].Attempts() != want[i].Attempts() {
+				t.Errorf("%s: Deliveries[%d].Attempts = %d, want %d", prefix, i, got[i].Attempts(), want[i].Attempts())
+			}
+		}
+	}
+
 	t.Run("CreateAndGet", func(t *testing.T) {
 		tx := factory(t)
 		defer tx.RollbackOnExit()
@@ -132,6 +171,25 @@ func Run(t *testing.T, factory Factory) {
 			t.Fatalf("Create deployment: %v", err)
 		}
 
+		// Deliveries of the fulfillment are part of the view: the API
+		// reports why a target failed from here. Seed them out of target
+		// order, plus one belonging to an unrelated fulfillment that
+		// must not leak into this view.
+		const reason = `apply object 1: conflict with "work-agent": .data.owner`
+		wantDeliveries := []domain.Delivery{
+			sampleDelivery(f.ID(), "t1", domain.DeliveryStateFailed, reason, 2),
+			sampleDelivery(f.ID(), "t2", domain.DeliveryStateDelivered, "", 0),
+		}
+		for _, dl := range []domain.Delivery{
+			sampleDelivery(f.ID(), "t2", domain.DeliveryStateDelivered, "", 0),
+			sampleDelivery("f-view-other", "t9", domain.DeliveryStateFailed, "other fulfillment", 1),
+			sampleDelivery(f.ID(), "t1", domain.DeliveryStateFailed, reason, 2),
+		} {
+			if err := tx.Deliveries().Put(ctx, dl); err != nil {
+				t.Fatalf("Put delivery %s: %v", dl.ID(), err)
+			}
+		}
+
 		v, err := repo.GetView(ctx, "deployments/d-view")
 		if err != nil {
 			t.Fatalf("GetView: %v", err)
@@ -160,18 +218,32 @@ func Run(t *testing.T, factory Factory) {
 		if v.Fulfillment.RolloutStrategy().Type != domain.RolloutStrategyImmediate {
 			t.Errorf("RolloutStrategy.Type = %q, want %q", v.Fulfillment.RolloutStrategy().Type, domain.RolloutStrategyImmediate)
 		}
+		checkDeliveries(t, "GetView", v.Deliveries, wantDeliveries)
 	})
 
 	t.Run("ListView", func(t *testing.T) {
 		tx := factory(t)
 		defer tx.RollbackOnExit()
 
+		// The names differ in ways a locale collation orders differently
+		// from byte-wise comparison: an upper-case letter and a
+		// punctuation character before the lower-case names. ListView
+		// promises byte order, because the page token walk seeks with
+		// Go's comparison.
+		wantOrder := []domain.ResourceName{
+			"deployments/D-list",
+			"deployments/_list",
+			"deployments/d-list-a",
+			"deployments/d-list-b",
+		}
 		for _, pair := range []struct {
 			depName domain.ResourceName
 			fid     domain.FulfillmentID
 		}{
 			{"deployments/d-list-a", "f-list-a"},
 			{"deployments/d-list-b", "f-list-b"},
+			{"deployments/D-list", "f-list-upper"},
+			{"deployments/_list", "f-list-punct"},
 		} {
 			f := sampleFulfillment(pair.fid)
 			if err := tx.Fulfillments().Create(ctx, f); err != nil {
@@ -183,24 +255,152 @@ func Run(t *testing.T, factory Factory) {
 			}
 		}
 
+		// Each view carries the deliveries of its own fulfillment.
+		wantDeliveries := map[domain.ResourceName][]domain.Delivery{
+			"deployments/d-list-a": {
+				sampleDelivery("f-list-a", "t1", domain.DeliveryStateDelivered, "", 0),
+			},
+			"deployments/d-list-b": {
+				sampleDelivery("f-list-b", "t1", domain.DeliveryStateFailed, "apply failed", 3),
+				sampleDelivery("f-list-b", "t2", domain.DeliveryStateProgressing, "", 0),
+			},
+		}
+		for _, dl := range []domain.Delivery{
+			sampleDelivery("f-list-a", "t1", domain.DeliveryStateDelivered, "", 0),
+			sampleDelivery("f-list-b", "t2", domain.DeliveryStateProgressing, "", 0),
+			sampleDelivery("f-list-b", "t1", domain.DeliveryStateFailed, "apply failed", 3),
+		} {
+			if err := tx.Deliveries().Put(ctx, dl); err != nil {
+				t.Fatalf("Put delivery %s: %v", dl.ID(), err)
+			}
+		}
+
 		views, err := tx.Deployments().ListView(ctx)
 		if err != nil {
 			t.Fatalf("ListView: %v", err)
 		}
-		if len(views) != 2 {
-			t.Fatalf("ListView len = %d, want 2", len(views))
+		if len(views) != len(wantOrder) {
+			t.Fatalf("ListView len = %d, want %d", len(views), len(wantOrder))
 		}
-		seen := map[domain.ResourceName]bool{}
-		for _, v := range views {
-			seen[v.Deployment.Name()] = true
+		for i, v := range views {
+			if got := v.Deployment.Name(); got != wantOrder[i] {
+				t.Errorf("ListView[%d].Name = %q, want %q (byte order)", i, got, wantOrder[i])
+			}
 			if v.Deployment.FulfillmentID() != v.Fulfillment.ID() {
 				t.Errorf("deployment %s: FulfillmentID %q != Fulfillment.ID %q", v.Deployment.Name(), v.Deployment.FulfillmentID(), v.Fulfillment.ID())
 			}
+			checkDeliveries(t, string(v.Deployment.Name()), v.Deliveries, wantDeliveries[v.Deployment.Name()])
 		}
-		for _, id := range []domain.ResourceName{"deployments/d-list-a", "deployments/d-list-b"} {
-			if !seen[id] {
-				t.Errorf("ListView missing deployment %q", id)
+	})
+
+	t.Run("ListViewPage", func(t *testing.T) {
+		tx := factory(t)
+		defer tx.RollbackOnExit()
+
+		// The same byte-order trap as ListView, on a collection small
+		// enough to walk one view at a time.
+		wantOrder := []domain.ResourceName{
+			"deployments/D-page",
+			"deployments/_page",
+			"deployments/d-page",
+		}
+		for _, pair := range []struct {
+			depName domain.ResourceName
+			fid     domain.FulfillmentID
+		}{
+			{"deployments/d-page", "f-page-lower"},
+			{"deployments/D-page", "f-page-upper"},
+			{"deployments/_page", "f-page-punct"},
+		} {
+			if err := tx.Fulfillments().Create(ctx, sampleFulfillment(pair.fid)); err != nil {
+				t.Fatalf("Create fulfillment %q: %v", pair.fid, err)
 			}
+			d := sampleThinDeployment(pair.depName, pair.fid)
+			if err := tx.Deployments().Create(ctx, d); err != nil {
+				t.Fatalf("Create deployment %q: %v", pair.depName, err)
+			}
+		}
+
+		// Each page carries the deliveries of the fulfillments it holds
+		// and no others. The middle deployment's fulfillment has none,
+		// which keeps a page that loads nothing from looking correct.
+		wantDeliveries := map[domain.ResourceName][]domain.Delivery{
+			"deployments/D-page": {
+				sampleDelivery("f-page-upper", "t2", domain.DeliveryStateDelivered, "", 0),
+			},
+			"deployments/d-page": {
+				sampleDelivery("f-page-lower", "t1", domain.DeliveryStateFailed, "apply failed", 2),
+			},
+		}
+		for _, dl := range []domain.Delivery{
+			sampleDelivery("f-page-lower", "t1", domain.DeliveryStateFailed, "apply failed", 2),
+			sampleDelivery("f-page-upper", "t2", domain.DeliveryStateDelivered, "", 0),
+		} {
+			if err := tx.Deliveries().Put(ctx, dl); err != nil {
+				t.Fatalf("Put delivery %s: %v", dl.ID(), err)
+			}
+		}
+
+		repo := tx.Deployments()
+		var visited []domain.ResourceName
+		after := domain.ResourceName("")
+		for {
+			if len(visited) > len(wantOrder) {
+				t.Fatalf("ListViewPage walk visited %d views, want %d", len(visited), len(wantOrder))
+			}
+			page, err := repo.ListViewPage(ctx, after, 1)
+			if err != nil {
+				t.Fatalf("ListViewPage(after %q): %v", after, err)
+			}
+			if len(page.Views) != 1 {
+				t.Fatalf("ListViewPage(after %q) len = %d, want 1", after, len(page.Views))
+			}
+			v := page.Views[0]
+			name := v.Deployment.Name()
+			visited = append(visited, name)
+			checkDeliveries(t, string(name), v.Deliveries, wantDeliveries[name])
+			if !page.More {
+				break
+			}
+			after = name
+		}
+		if len(visited) != len(wantOrder) {
+			t.Fatalf("ListViewPage walk visited %d views, want %d", len(visited), len(wantOrder))
+		}
+		for i, got := range visited {
+			if got != wantOrder[i] {
+				t.Errorf("ListViewPage walk[%d] = %q, want %q (byte order)", i, got, wantOrder[i])
+			}
+		}
+
+		// A page that exactly fills the limit reports no more.
+		full, err := repo.ListViewPage(ctx, "", len(wantOrder))
+		if err != nil {
+			t.Fatalf("ListViewPage(full): %v", err)
+		}
+		if len(full.Views) != len(wantOrder) || full.More {
+			t.Fatalf("full page = (%d views, more %t), want (%d, false)", len(full.Views), full.More, len(wantOrder))
+		}
+
+		// The predicate is strictly after the token name: a name that is
+		// stored nowhere between two views resumes at the next view,
+		// and the last stored name ends the walk.
+		gap, err := repo.ListViewPage(ctx, "deployments/C", len(wantOrder))
+		if err != nil {
+			t.Fatalf("ListViewPage(gap): %v", err)
+		}
+		if len(gap.Views) != len(wantOrder) {
+			t.Fatalf("ListViewPage(gap) len = %d, want %d", len(gap.Views), len(wantOrder))
+		}
+		if got := gap.Views[0].Deployment.Name(); got != wantOrder[0] {
+			t.Errorf("ListViewPage(gap) starts at %q, want %q", got, wantOrder[0])
+		}
+		past, err := repo.ListViewPage(ctx, wantOrder[len(wantOrder)-1], len(wantOrder))
+		if err != nil {
+			t.Fatalf("ListViewPage(past): %v", err)
+		}
+		if len(past.Views) != 0 || past.More {
+			t.Fatalf("past page = (%d views, more %t), want (0, false)", len(past.Views), past.More)
 		}
 	})
 

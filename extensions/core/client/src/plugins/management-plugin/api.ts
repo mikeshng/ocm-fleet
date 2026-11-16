@@ -1,5 +1,7 @@
 const MGMT_BASE = "/v1alpha";
 const TARGETS_PATH = "/apis/open-cluster-management.io/v1alpha/targets";
+/** A defensive bound on a walk the server never ends; 10k pages is 500k deployments. */
+const MAX_DEPLOYMENT_LIST_PAGES = 10_000;
 
 async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
@@ -75,8 +77,37 @@ export type DeploymentState =
   | "STATE_CREATING"
   | "STATE_ACTIVE"
   | "STATE_DELETING"
+  | "STATE_FAILED";
+
+export type TargetDeliveryState =
+  | "STATE_UNSPECIFIED"
+  | "STATE_PENDING"
+  | "STATE_ACCEPTED"
+  | "STATE_PROGRESSING"
+  | "STATE_DELIVERED"
   | "STATE_FAILED"
-  | "STATE_PAUSED_AUTH";
+  | "STATE_PARTIAL"
+  | "STATE_AUTH_FAILED";
+
+/** The kind of work a target delivery status describes. */
+export type TargetDeliveryOperation =
+  "OPERATION_UNSPECIFIED" | "OPERATION_DELIVER" | "OPERATION_REMOVE";
+
+/** Delivery state of one deployment on one target. */
+export interface TargetDeliveryStatus {
+  targetId: string;
+  state: TargetDeliveryState;
+  /**
+   * Whether the recorded work applies the manifests to the target or
+   * removes them from it. A missing value is a delivery.
+   */
+  operation?: TargetDeliveryOperation;
+  /** Reason the last delivery attempt failed; empty once delivered. */
+  message?: string;
+  /** Failed delivery attempts at the current generation. */
+  attempts?: number;
+  updateTime?: string;
+}
 
 export interface Manifest {
   manifestType: string;
@@ -114,6 +145,8 @@ export interface MgmtDeployment {
   createTime: string;
   updateTime: string;
   etag: string;
+  /** Delivery state on each resolved target, ordered by target ID. */
+  targetStatuses?: TargetDeliveryStatus[];
 }
 
 export interface ListDeploymentsResponse {
@@ -121,8 +154,36 @@ export interface ListDeploymentsResponse {
   nextPageToken: string;
 }
 
-export function listDeployments(): Promise<ListDeploymentsResponse> {
-  return mgmtFetch("/deployments");
+export async function listDeployments(): Promise<ListDeploymentsResponse> {
+  // The server answers one page at a time: follow nextPageToken and merge
+  // the pages so callers see every deployment. A server whose pages never
+  // end is reported rather than followed forever: a token answered twice is
+  // a cycle, and a page cap bounds a server that keeps minting new tokens.
+  const deployments: MgmtDeployment[] = [];
+  const seenTokens = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    if (seenTokens.size >= MAX_DEPLOYMENT_LIST_PAGES) {
+      throw new Error(
+        `The deployment list did not end after ${MAX_DEPLOYMENT_LIST_PAGES} pages`,
+      );
+    }
+    const params = new URLSearchParams();
+    if (pageToken) params.set("pageToken", pageToken);
+    const response = await mgmtFetch<ListDeploymentsResponse>(
+      `/deployments${params.size ? `?${params}` : ""}`,
+    );
+    deployments.push(...(response.deployments ?? []));
+    const next = response.nextPageToken || undefined;
+    if (next && seenTokens.has(next)) {
+      throw new Error(
+        `Cyclic pagination detected: repeated nextPageToken "${next}"`,
+      );
+    }
+    if (next) seenTokens.add(next);
+    pageToken = next;
+  } while (pageToken);
+  return { deployments, nextPageToken: "" };
 }
 
 export interface CreateDeploymentRequest {

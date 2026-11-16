@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,11 +45,18 @@ type Provider struct {
 	audience   string
 	caCertPEM  []byte
 	caCertPath string
-	jwkPriv    jwk.Key
-	jwksJSON   []byte
 	server     *http.Server
 	listener   net.Listener
 	httpClient *http.Client
+
+	// mu guards the rotating signing key and the JWKS document served for it.
+	mu       sync.RWMutex
+	jwkPriv  jwk.Key
+	jwksJSON []byte
+	keySeq   int64
+	// jwksFetches counts requests to the JWKS endpoint, so a test can tell
+	// how many times a verifier fetched it.
+	jwksFetches atomic.Int64
 }
 
 // TokenClaims configures the claims embedded in a token issued by
@@ -121,37 +130,9 @@ func newProvider(opts ...Option) (*Provider, error) {
 		return nil, err
 	}
 
-	signingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	jwkPriv, jwksJSON, err := newSigningKey("test-kid")
 	if err != nil {
-		return nil, fmt.Errorf("oidctest: generate ECDSA signing key: %w", err)
-	}
-
-	jwkPriv, err := jwk.Import(signingKey)
-	if err != nil {
-		return nil, fmt.Errorf("oidctest: import private key to JWK: %w", err)
-	}
-	if err := jwkPriv.Set(jwk.KeyIDKey, "test-kid"); err != nil {
-		return nil, fmt.Errorf("oidctest: set key ID: %w", err)
-	}
-
-	pubKey, err := jwk.Import(signingKey.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("oidctest: import public key to JWK: %w", err)
-	}
-	if err := pubKey.Set(jwk.KeyIDKey, "test-kid"); err != nil {
-		return nil, fmt.Errorf("oidctest: set key ID on public key: %w", err)
-	}
-	if err := pubKey.Set(jwk.AlgorithmKey, jwa.ES256()); err != nil {
-		return nil, fmt.Errorf("oidctest: set algorithm on public key: %w", err)
-	}
-
-	keySet := jwk.NewSet()
-	if err := keySet.AddKey(pubKey); err != nil {
-		return nil, fmt.Errorf("oidctest: add public key to set: %w", err)
-	}
-	jwksJSON, err := json.Marshal(keySet)
-	if err != nil {
-		return nil, fmt.Errorf("oidctest: marshal JWKS: %w", err)
+		return nil, err
 	}
 
 	caCertPEM := pem.EncodeToMemory(&pem.Block{
@@ -339,11 +320,18 @@ func (p *Provider) issue(claims TokenClaims) (string, error) {
 		return "", fmt.Errorf("oidctest: build token: %w", err)
 	}
 
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), p.jwkPriv))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), p.signingKey()))
 	if err != nil {
 		return "", fmt.Errorf("oidctest: sign token: %w", err)
 	}
 	return string(signed), nil
+}
+
+// signingKey returns the current private signing key.
+func (p *Provider) signingKey() jwk.Key {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.jwkPriv
 }
 
 // IssueToken creates a signed JWT with the given claims.
@@ -371,8 +359,71 @@ func (p *Provider) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 
 // handleJWKS serves the provider's public signing keys as JWKS.
 func (p *Provider) handleJWKS(w http.ResponseWriter, _ *http.Request) {
+	p.jwksFetches.Add(1)
+	p.mu.RLock()
+	body := p.jwksJSON
+	p.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(p.jwksJSON)
+	_, _ = w.Write(body)
+}
+
+// RotateSigningKey replaces the provider's signing key, the way an identity
+// provider does on its own schedule. Tokens are signed by the new key from
+// then on and the JWKS endpoint publishes the new key only, so a verifier
+// that still holds the old key set must fetch again to accept them.
+func (p *Provider) RotateSigningKey(t *testing.T) {
+	t.Helper()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.keySeq++
+	priv, jwksJSON, err := newSigningKey(fmt.Sprintf("test-kid-%d", p.keySeq))
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	p.jwkPriv = priv
+	p.jwksJSON = jwksJSON
+}
+
+// JWKSFetchCount returns how many times the JWKS endpoint has been served.
+func (p *Provider) JWKSFetchCount() int64 { return p.jwksFetches.Load() }
+
+// newSigningKey generates a P-256 signing key with the given key ID and
+// returns the private JWK and the JWKS document holding the public half.
+func newSigningKey(kid string) (jwk.Key, []byte, error) {
+	signingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("oidctest: generate ECDSA signing key: %w", err)
+	}
+
+	jwkPriv, err := jwk.Import(signingKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("oidctest: import private key to JWK: %w", err)
+	}
+	if err := jwkPriv.Set(jwk.KeyIDKey, kid); err != nil {
+		return nil, nil, fmt.Errorf("oidctest: set key ID: %w", err)
+	}
+
+	pubKey, err := jwk.Import(signingKey.PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("oidctest: import public key to JWK: %w", err)
+	}
+	if err := pubKey.Set(jwk.KeyIDKey, kid); err != nil {
+		return nil, nil, fmt.Errorf("oidctest: set key ID on public key: %w", err)
+	}
+	if err := pubKey.Set(jwk.AlgorithmKey, jwa.ES256()); err != nil {
+		return nil, nil, fmt.Errorf("oidctest: set algorithm on public key: %w", err)
+	}
+
+	keySet := jwk.NewSet()
+	if err := keySet.AddKey(pubKey); err != nil {
+		return nil, nil, fmt.Errorf("oidctest: add public key to set: %w", err)
+	}
+	jwksJSON, err := json.Marshal(keySet)
+	if err != nil {
+		return nil, nil, fmt.Errorf("oidctest: marshal JWKS: %w", err)
+	}
+	return jwkPriv, jwksJSON, nil
 }
 
 // generateCA creates a short-lived self-signed CA certificate and key.

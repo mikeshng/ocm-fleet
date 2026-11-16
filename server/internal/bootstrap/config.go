@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -127,6 +128,7 @@ type ConfigInput struct {
 	EnrollmentCABundle            []byte // content read at the edge; empty when unused
 	EnrollmentConnectAddress      string
 	EnrollmentAgentImage          string
+	ClusterEgressAllow            string // comma-separated CIDRs, resolved at the edge
 }
 
 // Config is the normalized typed production configuration accepted by
@@ -182,6 +184,12 @@ type Config struct {
 	EnrollmentCABundle       []byte
 	EnrollmentConnectAddress string
 	EnrollmentAgentImage     string
+
+	// ClusterEgressAllow lists address ranges the resource manager may
+	// dial for a cluster or a hub although they are otherwise refused:
+	// loopback, link-local (where cloud instance metadata lives), and the
+	// other non-cluster ranges. Private cluster ranges need no entry.
+	ClusterEgressAllow []netip.Prefix
 }
 
 // NewConfig parses resolved edge input into a normalized Config. It performs
@@ -222,6 +230,11 @@ func NewConfig(in ConfigInput) (Config, error) {
 		return Config{}, fmt.Errorf("exactly one of SQLite path or database URL is required")
 	}
 
+	egressAllow, err := parseEgressAllowList(in.ClusterEgressAllow)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		GRPCAddr:                      in.GRPCAddr,
 		HTTPAddr:                      in.HTTPAddr,
@@ -241,6 +254,7 @@ func NewConfig(in ConfigInput) (Config, error) {
 		EnrollmentCABundle:            append([]byte(nil), in.EnrollmentCABundle...),
 		EnrollmentConnectAddress:      strings.TrimSpace(in.EnrollmentConnectAddress),
 		EnrollmentAgentImage:          strings.TrimSpace(in.EnrollmentAgentImage),
+		ClusterEgressAllow:            egressAllow,
 	}
 	if err := cfg.checkInvariants(); err != nil {
 		return Config{}, err
@@ -350,6 +364,32 @@ func parseEnrollmentServerURL(raw string) error {
 		return fmt.Errorf("invalid enrollment server URL: must not carry a path, query, or credentials")
 	}
 	return nil
+}
+
+// parseEgressAllowList parses a comma-separated list of CIDR prefixes, or
+// single addresses, that the cluster egress policy permits. Empty entries are
+// dropped; empty input yields nil.
+func parseEgressAllowList(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(entry); err == nil {
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cluster egress allow entry %q: must be a CIDR prefix or an address", entry)
+		}
+		out = append(out, netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()))
+	}
+	return out, nil
 }
 
 // normalizeAddonList splits a comma-separated addon wire string into a stable

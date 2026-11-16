@@ -35,6 +35,7 @@ type OnboardingActionExtension = Extension<
     form: CodeRef<ComponentType<OnboardingActionFormProps>>;
     overviewCta?: string;
     category?: string;
+    completeWhenResourceExists?: string;
   }
 >;
 

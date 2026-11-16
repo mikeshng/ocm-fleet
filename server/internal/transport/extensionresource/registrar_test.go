@@ -3,6 +3,7 @@ package extensionresource_test
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +63,7 @@ func clusterConfig(t *testing.T) *extensionresource.ResourceTypeConfig {
 			Management: &extensionresource.ManagementCapabilityConfig{
 				SpecMessage:    schema.Management.SpecMessage,
 				SpecDescriptor: desc.Message,
+				ValidateID:     schema.Management.ValidateID,
 			},
 		},
 	}
@@ -109,7 +111,10 @@ func (d *blockingRemoveDynamicDelivery) Deliver(
 	}
 	if d.reporter != nil {
 		go func() {
-			_ = d.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+			_ = d.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+				State:     domain.DeliveryStateDelivered,
+				Operation: domain.DeliveryOperationDeliver,
+			})
 		}()
 	}
 	return nil
@@ -136,7 +141,10 @@ func (d *blockingRemoveDynamicDelivery) Remove(
 	case <-d.release:
 		if d.reporter != nil {
 			go func() {
-				_ = d.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+				_ = d.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+					State:     domain.DeliveryStateDelivered,
+					Operation: domain.DeliveryOperationRemove,
+				})
 			}()
 		}
 		return nil
@@ -445,6 +453,32 @@ func TestDynamic_ValidationRejectsInvalidSpec(t *testing.T) {
 	}
 }
 
+func TestDynamic_CreateRejectsIDTheProviderCannotTake(t *testing.T) {
+	env := setup(t)
+	ctx := context.Background()
+
+	for _, id := range []string{"My_Cluster", strings.Repeat("a", 40)} {
+		createReq := dynamicpb.NewMessage(env.svc.Descriptors.CreateRequest)
+		createReq.Set(env.svc.Descriptors.CreateRequest.Fields().ByNumber(1), protoreflect.ValueOfString(id))
+
+		resource := dynamicpb.NewMessage(env.svc.Descriptors.Resource)
+		specField := env.svc.Descriptors.Resource.Fields().ByName("spec")
+		spec := dynamicpb.NewMessage(env.svc.Descriptors.Spec)
+		resource.Set(specField, protoreflect.ValueOfMessage(spec))
+		createReq.Set(env.svc.Descriptors.CreateRequest.Fields().ByNumber(2), protoreflect.ValueOfMessage(resource))
+
+		resp := dynamicpb.NewMessage(env.svc.Descriptors.Resource)
+		err := env.conn.Invoke(ctx, "/ocm.kind.v1alpha.ClusterService/CreateCluster", createReq, resp)
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.InvalidArgument {
+			t.Fatalf("CreateCluster(%q) = %v, want InvalidArgument", id, err)
+		}
+		if !strings.Contains(st.Message(), "cluster_id") {
+			t.Errorf("CreateCluster(%q) message = %q, want it to name the id field", id, st.Message())
+		}
+	}
+}
+
 func TestDynamic_ListAndDelete(t *testing.T) {
 	env := setup(t)
 	ctx := context.Background()
@@ -492,6 +526,88 @@ func TestDynamic_ListAndDelete(t *testing.T) {
 	stateField := env.svc.Descriptors.Resource.Fields().ByName("state")
 	if int32(deleteResp.Get(stateField).Enum()) != 3 { // DELETING
 		t.Errorf("deleted state = %d, want 3 (DELETING)", deleteResp.Get(stateField).Enum())
+	}
+}
+
+func TestDynamic_ListPages(t *testing.T) {
+	env := setup(t)
+	ctx := context.Background()
+
+	create := func(id string) {
+		t.Helper()
+		createReq := dynamicpb.NewMessage(env.svc.Descriptors.CreateRequest)
+		createReq.Set(env.svc.Descriptors.CreateRequest.Fields().ByNumber(1), protoreflect.ValueOfString(id))
+		resource := dynamicpb.NewMessage(env.svc.Descriptors.Resource)
+		spec := dynamicpb.NewMessage(env.svc.Descriptors.Spec)
+		spec.Set(env.svc.Descriptors.Spec.Fields().ByName("name"), protoreflect.ValueOfString(id))
+		resource.Set(env.svc.Descriptors.Resource.Fields().ByName("spec"), protoreflect.ValueOfMessage(spec))
+		createReq.Set(env.svc.Descriptors.CreateRequest.Fields().ByNumber(2), protoreflect.ValueOfMessage(resource))
+		resp := dynamicpb.NewMessage(env.svc.Descriptors.Resource)
+		if err := env.conn.Invoke(ctx, "/ocm.kind.v1alpha.ClusterService/CreateCluster", createReq, resp); err != nil {
+			t.Fatalf("CreateCluster(%s): %v", id, err)
+		}
+	}
+	for _, id := range []string{"cluster-a", "cluster-b", "cluster-c"} {
+		create(id)
+	}
+
+	namesField := env.svc.Descriptors.Resource.Fields().ByName("name")
+	nextField := env.svc.Descriptors.ListResponse.Fields().ByName("next_page_token")
+	list := func(req *dynamicpb.Message) ([]string, string) {
+		t.Helper()
+		resp := dynamicpb.NewMessage(env.svc.Descriptors.ListResponse)
+		if err := env.conn.Invoke(ctx, "/ocm.kind.v1alpha.ClusterService/ListClusters", req, resp); err != nil {
+			t.Fatalf("ListClusters: %v", err)
+		}
+		resources := resp.Get(env.svc.Descriptors.ListResponse.Fields().ByNumber(1)).List()
+		names := make([]string, resources.Len())
+		for i := range names {
+			names[i] = resources.Get(i).Message().Get(namesField).String()
+		}
+		return names, resp.Get(nextField).String()
+	}
+	request := func(size int32, token string) *dynamicpb.Message {
+		req := dynamicpb.NewMessage(env.svc.Descriptors.ListRequest)
+		req.Set(env.svc.Descriptors.ListRequest.Fields().ByName("page_size"), protoreflect.ValueOfInt32(size))
+		if token != "" {
+			req.Set(env.svc.Descriptors.ListRequest.Fields().ByName("page_token"), protoreflect.ValueOfString(token))
+		}
+		return req
+	}
+
+	page1, token1 := list(request(2, ""))
+	if len(page1) != 2 || token1 == "" {
+		t.Fatalf("first page = %v, token %q; want 2 resources and a token", page1, token1)
+	}
+	if page1[0] != "clusters/cluster-a" || page1[1] != "clusters/cluster-b" {
+		t.Errorf("first page = %v, want cluster-a then cluster-b (listed by name)", page1)
+	}
+	page2, token2 := list(request(2, token1))
+	if len(page2) != 1 || page2[0] != "clusters/cluster-c" || token2 != "" {
+		t.Errorf("second page = %v, token %q; want [clusters/cluster-c] and no token", page2, token2)
+	}
+
+	// A page size of zero means the default, and the last page carries
+	// no token.
+	all, token := list(request(0, ""))
+	if len(all) != 3 || token != "" {
+		t.Errorf("default page = %v, token %q; want all 3 resources and no token", all, token)
+	}
+
+	// A token this server did not issue is rejected.
+	req := request(2, "not-a-token!")
+	resp := dynamicpb.NewMessage(env.svc.Descriptors.ListResponse)
+	err := env.conn.Invoke(ctx, "/ocm.kind.v1alpha.ClusterService/ListClusters", req, resp)
+	if s, ok := status.FromError(err); !ok || s.Code() != codes.InvalidArgument {
+		t.Errorf("invalid token error = %v, want InvalidArgument", err)
+	}
+
+	// A negative page size is invalid; it does not mean the default.
+	req = request(-1, "")
+	resp = dynamicpb.NewMessage(env.svc.Descriptors.ListResponse)
+	err = env.conn.Invoke(ctx, "/ocm.kind.v1alpha.ClusterService/ListClusters", req, resp)
+	if s, ok := status.FromError(err); !ok || s.Code() != codes.InvalidArgument {
+		t.Errorf("negative page size error = %v, want InvalidArgument", err)
 	}
 }
 

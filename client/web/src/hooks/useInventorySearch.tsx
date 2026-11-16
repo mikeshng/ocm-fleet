@@ -1,12 +1,5 @@
 import type { ResourceResult, SearchResultResolve } from "@ocm-fleet/common";
-import {
-  createResourceApi,
-  ENROLLED_CLUSTER_TYPE,
-  foldLinkedClusterResults,
-  KIND_CLUSTER_TYPE,
-  KUBERNETES_OBJECT_TYPE,
-  OBSERVED_CLUSTER_TYPE,
-} from "@ocm-fleet/common";
+import { createResourceApi, foldLinkedClusterResults } from "@ocm-fleet/common";
 import {
   useExtensions,
   useResolvedExtensions,
@@ -27,6 +20,7 @@ import { highlightText } from "../components/Search/highlightUtils";
 import type { SearchResultItem } from "../components/Search/searchIndex";
 import type { SearchResultRendererExtension } from "../extensions/isSearchResultRendererExtension";
 import { isSearchResultRendererExtension } from "../extensions/isSearchResultRendererExtension";
+import { inventorySearchFilters } from "../utils/inventoryFilters";
 
 interface ResolvedRenderer {
   label: string;
@@ -138,27 +132,12 @@ export function useInventorySearch(): {
     async (term: string): Promise<SearchResultItem[]> => {
       if (!loaded) return [];
       try {
-        const escaped = term.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-        const clusterFilter = [
-          `(resourceType == "${KIND_CLUSTER_TYPE}")`,
-          `&& (resource.name.startsWith("${escaped}") || resource.name.startsWith("clusters/${escaped}"))`,
-        ].join(" ");
-        // Enrolled clusters and the clusters of connected hubs are found
-        // by the start of their name, or by a whole term: a label
-        // (key=value), a cluster set, or a hub.
-        const enrolledFilter = [
-          `(resourceType == "${ENROLLED_CLUSTER_TYPE}")`,
-          `&& (resource.name.startsWith("clusters/${escaped}") || "${escaped}" in resource.observation.searchTerms)`,
-        ].join(" ");
-        const observedFilter = [
-          `(resourceType == "${OBSERVED_CLUSTER_TYPE}")`,
-          `&& (resource.observation.name.startsWith("${escaped}") || "${escaped}" in resource.observation.searchTerms)`,
-        ].join(" ");
-        const k8sFilter = [
-          `resourceType == "${KUBERNETES_OBJECT_TYPE}"`,
-          `&& (resource.observation.kind == "Pod" || resource.observation.kind == "Namespace" || resource.observation.kind == "Node")`,
-          `&& resource.observation.metadata.name.startsWith("${escaped}")`,
-        ].join(" ");
+        const {
+          clusters: clusterFilter,
+          enrolled: enrolledFilter,
+          observed: observedFilter,
+          kubernetes: k8sFilter,
+        } = inventorySearchFilters(term);
         const [
           clusterResponse,
           enrolledResponse,

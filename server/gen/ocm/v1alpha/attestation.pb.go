@@ -805,7 +805,7 @@ var File_ocm_v1alpha_attestation_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_attestation_proto_rawDesc = "" +
 	"\n" +
-	"\x1docm/v1alpha/attestation.proto\x12\vocm.v1alpha\x1a\x1aocm/v1alpha/manifest.proto\x1a#ocm/v1alpha/manifest_strategy.proto\x1a$ocm/v1alpha/placement_strategy.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"E\n" +
+	"\x1docm/v1alpha/attestation.proto\x12\vocm.v1alpha\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1aocm/v1alpha/manifest.proto\x1a#ocm/v1alpha/manifest_strategy.proto\x1a$ocm/v1alpha/placement_strategy.proto\"E\n" +
 	"\x11FederatedIdentity\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12\x16\n" +
 	"\x06issuer\x18\x02 \x01(\tR\x06issuer\"\x8f\x01\n" +

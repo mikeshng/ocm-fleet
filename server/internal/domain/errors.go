@@ -45,6 +45,21 @@ var (
 	// Unlike ErrInvalidArgument, the request itself isn't malformed --
 	// resubmitting it unchanged after the feature lands would succeed.
 	ErrUnimplemented = errors.New("unimplemented")
+
+	// ErrFulfillmentNotRunning indicates that a fulfillment has no
+	// running workflow instance: it completed, or it never started.
+	// Signals sent to it can never be observed, so a sender may treat
+	// the obligation as delivered.
+	ErrFulfillmentNotRunning = errors.New("fulfillment workflow is not running")
+
+	// ErrPlacementUnresolved indicates that a placement strategy
+	// cannot resolve against the targets it was given, for example a
+	// static placement that names a target that is not among them.
+	// Resolution depends only on the strategy and those targets, so
+	// repeating it with the same input cannot succeed. It is not
+	// terminal either: the orchestration waits, reloads the targets,
+	// and resolves again.
+	ErrPlacementUnresolved = errors.New("placement unresolved")
 )
 
 // terminalPrefix is the marker prepended to terminal errors.
@@ -91,4 +106,16 @@ func IsAuthExpired(err error) bool {
 		return true
 	}
 	return err != nil && strings.Contains(err.Error(), ErrAuthExpired.Error())
+}
+
+// IsPlacementUnresolved reports whether err indicates a placement that
+// cannot resolve against the targets it was given. Like [IsTerminal],
+// it checks the Go error chain first, then falls back to string
+// matching so the classification survives serialization across
+// workflow engine boundaries.
+func IsPlacementUnresolved(err error) bool {
+	if errors.Is(err, ErrPlacementUnresolved) {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), ErrPlacementUnresolved.Error())
 }

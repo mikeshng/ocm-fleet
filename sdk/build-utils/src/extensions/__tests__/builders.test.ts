@@ -271,4 +271,37 @@ describe("createOnboardingAction", () => {
       }),
     ).toThrow(/form/);
   });
+
+  it("preserves completeWhenResourceExists", () => {
+    const ext = createOnboardingAction({
+      id: "ocm-hub-connect",
+      label: "OCM hub",
+      icon: { $codeRef: "Icon.default" },
+      card: { $codeRef: "Card.default" },
+      form: { $codeRef: "Form.default" },
+      completeWhenResourceExists: "ocm.open-cluster-management.io/Hub",
+    });
+    expect(ext.properties.completeWhenResourceExists).toBe(
+      "ocm.open-cluster-management.io/Hub",
+    );
+  });
+
+  it("throws on a malformed completeWhenResourceExists", () => {
+    for (const value of [
+      "Hub",
+      "ocm.open-cluster-management.io/",
+      "a b/Kind",
+    ]) {
+      expect(() =>
+        createOnboardingAction({
+          id: "bad",
+          label: "Bad",
+          icon: { $codeRef: "I.default" },
+          card: { $codeRef: "C.default" },
+          form: { $codeRef: "F.default" },
+          completeWhenResourceExists: value,
+        }),
+      ).toThrow(/completeWhenResourceExists/);
+    }
+  });
 });

@@ -41,6 +41,10 @@ type ReportResultProbe interface {
 	// the delivery's current generation and is silently discarded.
 	Stale(reportGen, currentGen Generation)
 
+	// StaleOperation is called when the report's operation does not
+	// match the delivery's current operation and is silently discarded.
+	StaleOperation(reportOp, currentOp DeliveryOperation)
+
 	// Error is called when an error occurs.
 	Error(err error)
 
@@ -69,6 +73,7 @@ func (NoOpReportEventProbe) End()                         {}
 // NoOpReportResultProbe is a [ReportResultProbe] that discards all calls.
 type NoOpReportResultProbe struct{}
 
-func (NoOpReportResultProbe) Stale(Generation, Generation) {}
-func (NoOpReportResultProbe) Error(error)                  {}
-func (NoOpReportResultProbe) End()                         {}
+func (NoOpReportResultProbe) Stale(Generation, Generation)                        {}
+func (NoOpReportResultProbe) StaleOperation(DeliveryOperation, DeliveryOperation) {}
+func (NoOpReportResultProbe) Error(error)                                         {}
+func (NoOpReportResultProbe) End()                                                {}

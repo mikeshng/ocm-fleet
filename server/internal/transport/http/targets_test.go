@@ -50,6 +50,9 @@ func TestTargetsHandler_ListsTargetsWithoutSecrets(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store: every answer on this route is uncached", got)
+	}
 	body := rec.Body.String()
 	for _, secret := range []string{"direct-credential", "sa-token", "BEGIN CERTIFICATE", "issuer_url", "unknown properties stay private"} {
 		if strings.Contains(body, secret) {
@@ -89,5 +92,8 @@ func TestTargetsHandler_ListError(t *testing.T) {
 		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, transporthttp.TargetsPath, nil))
 	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "10.0.0.1") {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store: the failure answer is uncached too", got)
 	}
 }

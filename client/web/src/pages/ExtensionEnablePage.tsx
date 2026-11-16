@@ -9,7 +9,6 @@ import {
 } from "@patternfly/react-core";
 import {
   ExclamationCircleIcon,
-  ExternalLinkAltIcon,
   OptimizeIcon,
   ServicesIcon,
 } from "@patternfly/react-icons";
@@ -102,14 +101,6 @@ export const ExtensionEnablePage = ({
           <EmptyStateActions>
             <Button variant="primary" onClick={handleEnable}>
               install
-            </Button>
-            <Button
-              variant="link"
-              href="#"
-              iconPosition="right"
-              icon={<ExternalLinkAltIcon />}
-            >
-              Learn more
             </Button>
           </EmptyStateActions>
         </EmptyStateFooter>

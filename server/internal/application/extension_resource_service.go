@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -101,6 +102,18 @@ func (s *ExtensionResourceService) Create(ctx context.Context, in CreateExtensio
 		return domain.ExtensionResourceView{}, fmt.Errorf(
 			"%w: type %q has no management metadata; cannot create managed instance",
 			domain.ErrInvalidArgument, in.ResourceType)
+	}
+
+	// The persist activity treats an existing resource as its own
+	// replay and returns it, so a second caller's create must be refused
+	// here or it would silently replace nothing and report success.
+	fullName := in.ResourceType.FullName(in.Name)
+	switch _, err := tx.ExtensionResources().GetView(ctx, fullName); {
+	case err == nil:
+		return domain.ExtensionResourceView{}, fmt.Errorf(
+			"%w: %s %q", domain.ErrAlreadyExists, in.ResourceType, in.Name)
+	case !errors.Is(err, domain.ErrNotFound):
+		return domain.ExtensionResourceView{}, fmt.Errorf("look up %q: %w", fullName, err)
 	}
 
 	var prov *domain.Provenance

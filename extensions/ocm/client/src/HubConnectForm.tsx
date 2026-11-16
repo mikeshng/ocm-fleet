@@ -25,10 +25,17 @@ import {
   getHubAccessManifest,
   type HubAccessManifest,
 } from "./api";
+import {
+  connectHubRequest,
+  displayNameError,
+  hubIdError,
+} from "./connectHubRequest";
 
 interface HubConnectFormProps {
   onConnected: (hubId: string) => void;
   onCancel: () => void;
+  /** Reports a connect in flight so the host can keep the form open. */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 /**
@@ -39,10 +46,12 @@ interface HubConnectFormProps {
 export default function HubConnectForm({
   onConnected,
   onCancel,
+  onBusyChange,
 }: HubConnectFormProps) {
   const [access, setAccess] = useState<HubAccessManifest | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [hubId, setHubId] = useState("");
+  const [displayName, setDisplayName] = useState("");
   const [mode, setMode] = useState<"fields" | "kubeconfig">("fields");
   const [apiServer, setApiServer] = useState("");
   const [caCert, setCaCert] = useState("");
@@ -70,25 +79,33 @@ export default function HubConnectForm({
   }, []);
 
   const id = hubId.trim();
+  const idError = hubIdError(hubId);
+  const nameError = displayNameError(displayName);
   const complete =
-    id !== "" &&
+    idError === null &&
+    nameError === null &&
     (mode === "kubeconfig"
       ? kubeconfig.trim() !== ""
       : apiServer.trim() !== "" && caCert.trim() !== "" && token.trim() !== "");
+
+  useEffect(() => {
+    onBusyChange?.(submitting);
+  }, [submitting, onBusyChange]);
 
   const submit = async () => {
     setSubmitting(true);
     setError(null);
     try {
       await connectHub(
-        mode === "kubeconfig"
-          ? { hubId: id, kubeconfig }
-          : {
-              hubId: id,
-              apiServer: apiServer.trim(),
-              caCert,
-              token: token.trim(),
-            },
+        connectHubRequest({
+          hubId,
+          displayName,
+          mode,
+          apiServer,
+          caCert,
+          token,
+          kubeconfig,
+        }),
       );
       onConnected(id);
     } catch (e) {
@@ -146,13 +163,34 @@ export default function HubConnectForm({
           isRequired
           value={hubId}
           onChange={(_event, value) => setHubId(value)}
+          validated={id !== "" && idError ? "error" : "default"}
           placeholder="hub1"
         />
         <FormHelperText>
           <HelperText>
-            <HelperTextItem>
-              A short name for this hub here: lowercase letters, digits, and
-              hyphens.
+            <HelperTextItem
+              variant={id !== "" && idError ? "error" : "default"}
+            >
+              {id !== "" && idError
+                ? idError
+                : "A short name for this hub here: 1 to 40 lowercase letters, digits, or hyphens, starting and ending with a letter or digit."}
+            </HelperTextItem>
+          </HelperText>
+        </FormHelperText>
+      </FormGroup>
+      <FormGroup label="Display name" fieldId="ocm-hub-display-name">
+        <TextInput
+          id="ocm-hub-display-name"
+          value={displayName}
+          onChange={(_event, value) => setDisplayName(value)}
+          validated={nameError ? "error" : "default"}
+          placeholder="Production hub"
+        />
+        <FormHelperText>
+          <HelperText>
+            <HelperTextItem variant={nameError ? "error" : "default"}>
+              {nameError ??
+                "Shown beside the hub ID in the hubs table. At most 120 bytes."}
             </HelperTextItem>
           </HelperText>
         </FormHelperText>

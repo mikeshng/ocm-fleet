@@ -1,0 +1,8 @@
+# Enables the enrollment add-on for the managed cluster "cluster1" of the hub it is applied to.
+# The namespace is the cluster's namespace on that hub.
+apiVersion: addon.open-cluster-management.io/v1alpha1
+kind: ManagedClusterAddOn
+metadata:
+  name: ocm-fleet-enrollment
+  namespace: cluster1
+spec: {}

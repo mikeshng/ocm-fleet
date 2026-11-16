@@ -53,6 +53,12 @@ func TestResumeDeployment_StaleEtag_Aborted(t *testing.T) {
 func TestResumeDeployment_CorrectEtag_Succeeds(t *testing.T) {
 	store, _ := setupStore(t)
 	seedPausedDeployment(t, store, "deployments/d1", 3)
+	seedDelivery(t, store, domain.DeliveryFromSnapshot(domain.DeliverySnapshot{
+		ID: "deployments/d1:t1", FulfillmentID: "deployments/d1", TargetID: "t1",
+		State:    domain.DeliveryStateFailed,
+		Message:  `apply object 1: conflict with "work-agent"`,
+		Attempts: 2,
+	}))
 
 	// Compute the current etag by reading the view.
 	tx, err := store.BeginReadOnly(context.Background())
@@ -78,6 +84,26 @@ func TestResumeDeployment_CorrectEtag_Succeeds(t *testing.T) {
 	}
 	if result.Fulfillment.Generation() != 4 {
 		t.Errorf("Generation = %d, want 4", result.Fulfillment.Generation())
+	}
+
+	// The returned view is the resume response; it must carry the same
+	// delivery statuses a subsequent read would report, including the
+	// reason the last delivery attempt failed.
+	if len(result.Deliveries) != 1 {
+		t.Fatalf("len(result.Deliveries) = %d, want 1", len(result.Deliveries))
+	}
+	got := result.Deliveries[0]
+	if got.TargetID() != "t1" {
+		t.Errorf("TargetID = %q, want t1", got.TargetID())
+	}
+	if got.State() != domain.DeliveryStateFailed {
+		t.Errorf("State = %q, want failed", got.State())
+	}
+	if got.Message() != `apply object 1: conflict with "work-agent"` {
+		t.Errorf("Message = %q", got.Message())
+	}
+	if got.Attempts() != 2 {
+		t.Errorf("Attempts = %d, want 2", got.Attempts())
 	}
 }
 

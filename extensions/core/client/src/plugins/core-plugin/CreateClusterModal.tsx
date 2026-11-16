@@ -25,7 +25,7 @@ import {
   StackItem,
 } from "@patternfly/react-core";
 import type { ComponentType } from "react";
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type ClusterProviderExtension = Extension<
   "ocm-fleet.cluster-provider",
@@ -47,6 +47,8 @@ interface CreateClusterModalProps {
   isOpen: boolean;
   preselectedProvider: string | null;
   onClose: () => void;
+  /** Called after the provider reports that the cluster exists. */
+  onCreated: () => void;
   onProviderSelect: (providerId: string) => void;
 }
 
@@ -54,6 +56,7 @@ export default function CreateClusterModal({
   isOpen,
   preselectedProvider,
   onClose,
+  onCreated,
   onProviderSelect,
 }: CreateClusterModalProps) {
   const providerCandidates = useExtensions(isClusterProvider);
@@ -66,6 +69,12 @@ export default function CreateClusterModal({
   }, [providerExtensions]);
 
   const selectedProviderId = isOpen ? preselectedProvider : null;
+  const [wizardBusy, setWizardBusy] = useState(false);
+
+  // A different wizard (or none) starts with no create in flight.
+  useEffect(() => {
+    setWizardBusy(false);
+  }, [selectedProviderId]);
 
   const selectProvider = useCallback(
     (id: string) => {
@@ -81,7 +90,7 @@ export default function CreateClusterModal({
   return (
     <Modal
       isOpen={isOpen}
-      onClose={onClose}
+      onClose={wizardBusy ? undefined : onClose}
       variant="large"
       aria-label="Create cluster"
     >
@@ -111,7 +120,13 @@ export default function CreateClusterModal({
           }
           const WizardComponent = ext.properties
             .wizard as unknown as ComponentType<ClusterProviderWizardProps>;
-          return <WizardComponent onClose={onClose} />;
+          return (
+            <WizardComponent
+              onClose={onClose}
+              onCreated={onCreated}
+              onBusyChange={setWizardBusy}
+            />
+          );
         })()
       ) : (
         <>

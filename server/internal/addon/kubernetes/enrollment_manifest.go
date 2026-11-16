@@ -223,9 +223,12 @@ func BuildAccessPiece(opts AccessPieceOptions) (AccessPiece, error) {
 	case AccessProfileClusterAdmin:
 		access = append(access, clusterBinding(accessBindingName+"-cluster-admin", "cluster-admin"))
 	case AccessProfileWorkloads:
+		// A deployment may bring its namespace, and a removal deletes
+		// what the deployment applied: the right to create namespaces
+		// comes with the right to delete them.
 		access = append(access,
 			clusterBinding(accessBindingName+"-edit", "edit"),
-			clusterRules(rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"create", "update", "patch"}}),
+			clusterRules(rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"create", "update", "patch", "delete"}}),
 			clusterBinding(accessClusterRoleName, accessClusterRoleName),
 		)
 	case AccessProfileReadOnly:

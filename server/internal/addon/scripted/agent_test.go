@@ -151,6 +151,9 @@ func TestAgent_Deliver_ImmediateSuccess(t *testing.T) {
 	// Should get a delivered result (completion).
 	select {
 	case result := <-reporter.done:
+		if result.Operation != domain.DeliveryOperationDeliver {
+			t.Errorf("result operation = %v, want deliver", result.Operation)
+		}
 		if result.State != domain.DeliveryStateDelivered {
 			t.Errorf("result state = %v, want delivered", result.State)
 		}
@@ -310,11 +313,11 @@ func TestAgent_Deliver_WithLatency(t *testing.T) {
 		"behavior": {
 			"delivery": {
 				"acknowledgement": {
-					"latency": {"constant": "0.05s"},
+					"latency": {"constant": "0.5s"},
 					"outcome": {"constant": "SUCCESS"}
 				},
 				"completion": {
-					"latency": {"constant": "0.05s"},
+					"latency": {"constant": "0.5s"},
 					"outcome": {"constant": "SUCCESS"}
 				}
 			}
@@ -332,8 +335,9 @@ func TestAgent_Deliver_WithLatency(t *testing.T) {
 	}
 	deliverElapsed := time.Since(start)
 
-	// Deliver should return quickly (async ack/completion).
-	if deliverElapsed > 100*time.Millisecond {
+	// Deliver should return quickly (async ack/completion): a synchronous implementation
+	// would take at least the two 500 ms latencies, so the bound is well clear of both.
+	if deliverElapsed > 250*time.Millisecond {
 		t.Errorf("Deliver took too long: %v", deliverElapsed)
 	}
 
@@ -342,11 +346,11 @@ func TestAgent_Deliver_WithLatency(t *testing.T) {
 	select {
 	case <-reporter.ackCh:
 		ackLatency := time.Since(ackStart)
-		// Ack should have been delayed by ~50ms in the async goroutine.
-		if ackLatency < 40*time.Millisecond {
+		// Ack should have been delayed by ~500ms in the async goroutine.
+		if ackLatency < 400*time.Millisecond {
 			t.Errorf("ack event arrived too quickly: %v", ackLatency)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for ack event")
 	}
 
@@ -356,7 +360,7 @@ func TestAgent_Deliver_WithLatency(t *testing.T) {
 		if result.State != domain.DeliveryStateDelivered {
 			t.Errorf("result state = %v, want delivered", result.State)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for result")
 	}
 

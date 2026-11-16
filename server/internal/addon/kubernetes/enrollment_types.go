@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
+	"github.com/stolostron/ocm-fleet/server/internal/kubelabels"
 )
 
 // Enrollment takes in a cluster that already exists: one the resource
@@ -70,6 +71,10 @@ const (
 	PropEnrollmentSource = "enrollment_source"
 	// PropAccessProfile is the access profile declared at enrollment.
 	PropAccessProfile = "access_profile"
+	// PropClusterUID is the cluster's own identifier, as the cluster
+	// reported it when it was enrolled: the UID of its kube-system
+	// namespace. Absent when the credential may not read it.
+	PropClusterUID = "cluster_uid"
 
 	propTrustBundle = "trust_bundle"
 )
@@ -116,8 +121,9 @@ type ClusterState string
 const (
 	// ClusterStateEnrolled: the target exists and its credential works.
 	ClusterStateEnrolled ClusterState = "enrolled"
-	// ClusterStateNeedsEnrollment: the credential lapsed; the target is
-	// out of placement until the cluster's side presents a new one.
+	// ClusterStateNeedsEnrollment: the credential lapsed; the target
+	// takes no new placement until the cluster's side presents a new
+	// one, and keeps what it holds.
 	ClusterStateNeedsEnrollment ClusterState = "needs-enrollment"
 	// ClusterStateWithdrawn: the cluster left, by either side's choice.
 	// Only the record remains.
@@ -139,6 +145,9 @@ const (
 	DefaultTokenLifetime = 12 * time.Hour
 	// MinTokenLifetime is the shortest lifetime Kubernetes issues.
 	MinTokenLifetime = 10 * time.Minute
+	// MaxTokenLifetime is the longest lifetime a bundle may ask for:
+	// the credential reads the cluster, so its validity is bounded.
+	MaxTokenLifetime = 24 * time.Hour
 )
 
 // ClusterSource names who vouched for an enrolled cluster other than
@@ -154,12 +163,15 @@ type ClusterSource struct {
 // ClusterObservation is the observation payload of a cluster record.
 // It holds nothing secret.
 type ClusterObservation struct {
-	Name                string         `json:"name"`
-	State               ClusterState   `json:"state"`
-	Origin              string         `json:"origin"`
-	AccessForm          string         `json:"accessForm"`
-	APIServer           string         `json:"apiServer"`
-	CAFingerprint       string         `json:"caFingerprint,omitempty"`
+	Name          string       `json:"name"`
+	State         ClusterState `json:"state"`
+	Origin        string       `json:"origin"`
+	AccessForm    string       `json:"accessForm"`
+	APIServer     string       `json:"apiServer"`
+	CAFingerprint string       `json:"caFingerprint,omitempty"`
+	// ClusterUID identifies the cluster itself, whatever address it is
+	// reached at: the UID of its kube-system namespace.
+	ClusterUID          string         `json:"clusterUID,omitempty"`
 	Target              string         `json:"target,omitempty"`
 	KubernetesVersion   string         `json:"kubernetesVersion,omitempty"`
 	ServiceAccount      string         `json:"serviceAccount,omitempty"`
@@ -228,6 +240,10 @@ var clusterIDPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z
 // maxClusterIDLength keeps "k8s-<id>" a valid name wherever it is used.
 const maxClusterIDLength = 200
 
+// maxClusterIDLabelLength is the longest one dot-separated part of an
+// id may be: each part is a DNS label wherever the id is used.
+const maxClusterIDLabelLength = 63
+
 // ValidateClusterID checks that id is usable as a cluster id.
 func ValidateClusterID(id string) error {
 	if id == "" {
@@ -238,6 +254,11 @@ func ValidateClusterID(id string) error {
 	}
 	if !clusterIDPattern.MatchString(id) {
 		return fmt.Errorf("%w: cluster id %q must consist of lowercase letters, digits, '-' and '.', and start and end with a letter or digit", domain.ErrInvalidArgument, id)
+	}
+	for _, label := range strings.Split(id, ".") {
+		if len(label) > maxClusterIDLabelLength {
+			return fmt.Errorf("%w: cluster id %q has a part longer than %d characters", domain.ErrInvalidArgument, id, maxClusterIDLabelLength)
+		}
 	}
 	return nil
 }
@@ -347,6 +368,21 @@ func SameCA(a, b []byte) bool {
 	return false
 }
 
+// SameCASet reports whether a and b hold exactly the same certificates.
+// A bundle with an extra certificate is a different trust set: one side
+// cannot narrow or widen the other's.
+func SameCASet(a, b []byte) bool {
+	fa, err := CAFingerprints(a)
+	if err != nil {
+		return false
+	}
+	fb, err := CAFingerprints(b)
+	if err != nil {
+		return false
+	}
+	return slices.Equal(fa, fb)
+}
+
 // firstCAFingerprint returns one fingerprint to show for a CA bundle.
 func firstCAFingerprint(caPEM []byte) string {
 	fps, err := CAFingerprints(caPEM)
@@ -425,15 +461,16 @@ func labelsToProperty(labels map[string]string) string {
 	return string(data)
 }
 
-// validateLabels rejects label keys and values that cannot be used in
-// placement or shown safely.
+// validateLabels rejects label keys and values that are not valid
+// Kubernetes labels: they are put on records, targets, and placement
+// selectors as labels.
 func validateLabels(labels map[string]string) error {
 	for k, v := range labels {
-		if k == "" || len(k) > 317 || strings.ContainsAny(k, " \t\n\r") {
-			return fmt.Errorf("%w: label key %q is not valid", domain.ErrInvalidArgument, k)
+		if !kubelabels.ValidKey(k) {
+			return fmt.Errorf("%w: label key %q is not a valid Kubernetes label key", domain.ErrInvalidArgument, k)
 		}
-		if len(v) > 253 || strings.ContainsAny(v, "\n\r") {
-			return fmt.Errorf("%w: value of label %q is not valid", domain.ErrInvalidArgument, k)
+		if !kubelabels.ValidValue(v) {
+			return fmt.Errorf("%w: value of label %q is not a valid Kubernetes label value", domain.ErrInvalidArgument, k)
 		}
 	}
 	return nil

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -247,8 +249,66 @@ func TestEnroll_OneClusterOneTarget(t *testing.T) {
 	t.Run("the same address with another CA is another cluster", func(t *testing.T) {
 		otherCA := testCA(t, "rebuilt")
 		h.cluster(api).ca = otherCA
+		h.cluster(api).uid = "kube-system-of-rebuilt"
 		if _, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "rebuilt", APIServer: api, CACert: otherCA, Token: token}); err != nil {
 			t.Fatalf("Enroll: %v", err)
+		}
+	})
+}
+
+// A cluster can be reached at more than one address: by name and by IP,
+// from inside a network and from outside. The address therefore cannot
+// say that two enrollments are one cluster. The cluster's own
+// identifier can.
+func TestEnroll_OneClusterAtTwoAddresses(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, ca, token := h.addCluster("ext", time.Hour)
+	const second = "https://10.0.0.9:6443"
+	h.alsoAt(second, api)
+
+	rec, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "ext", APIServer: api, CACert: ca, Token: token})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if rec.Observation.ClusterUID != "kube-system-of-ext" {
+		t.Fatalf("the record's identifier of the cluster = %q", rec.Observation.ClusterUID)
+	}
+	if target, _ := h.target("ext"); target.Properties()[PropClusterUID] != "kube-system-of-ext" {
+		t.Errorf("the target's %s = %q", PropClusterUID, target.Properties()[PropClusterUID])
+	}
+
+	t.Run("it is not enrolled a second time at its other address", func(t *testing.T) {
+		_, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "ext-by-ip", APIServer: second, CACert: ca, Token: token})
+		ee := enrollErr(t, err, ErrEnrollmentConflict, "cluster-already-known")
+		if ee.Details["target"] != "k8s-ext" || ee.Details["cluster"] != "ext" {
+			t.Errorf("details = %v", ee.Details)
+		}
+		if !strings.Contains(ee.Message, api) {
+			t.Errorf("the refusal does not say where the cluster is already reached: %q", ee.Message)
+		}
+		if _, found := h.target("ext-by-ip"); found {
+			t.Error("a second target was registered for the same cluster")
+		}
+	})
+	t.Run("its own credential is still refreshed", func(t *testing.T) {
+		fresh := h.mintToken(api, "ext-second", time.Hour)
+		if _, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "ext", APIServer: api, CACert: ca, Token: fresh}); err != nil {
+			t.Fatalf("refresh under the same id: %v", err)
+		}
+	})
+	t.Run("a cluster that reports no identifier is known by its address alone", func(t *testing.T) {
+		api2, ca2, token2 := h.addCluster("quiet", time.Hour)
+		h.cluster(api2).uid = ""
+		const other = "https://10.0.0.10:6443"
+		h.alsoAt(other, api2)
+		if _, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "quiet", APIServer: api2, CACert: ca2, Token: token2}); err != nil {
+			t.Fatalf("Enroll: %v", err)
+		}
+		// The limit this leaves: nothing tells the two addresses apart
+		// from two clusters.
+		if _, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "quiet-by-ip", APIServer: other, CACert: ca2, Token: token2}); err != nil {
+			t.Fatalf("Enroll at the other address: %v", err)
 		}
 	})
 }
@@ -329,20 +389,27 @@ func TestBundle_AuthenticationFailuresLookAlike(t *testing.T) {
 	req := PresentRequest{CACert: ca, Token: token}
 
 	message := ""
-	for name, b := range map[string]string{
-		"wrong secret":   bundle.ID + ".wrong",
-		"unknown bundle": "eb-000000000000.secret",
-		"malformed":      "garbage",
-		"empty":          "",
+	for _, tt := range []struct {
+		name   string
+		bearer string
+		reason string
+	}{
+		{"wrong secret", bundle.ID + ".wrong", "bundle-secret-mismatch"},
+		{"unknown bundle", "eb-000000000000.secret", "bundle-unknown"},
+		{"malformed", "garbage", "bundle-malformed"},
+		{"empty", "", "bundle-malformed"},
 	} {
-		_, err := h.svc.Present(ctx, b, req)
+		_, err := h.svc.Present(ctx, tt.bearer, req)
 		if !errors.Is(err, ErrEnrollmentUnauthenticated) {
-			t.Fatalf("%s: error = %v, want unauthenticated", name, err)
+			t.Fatalf("%s: error = %v, want unauthenticated", tt.name, err)
 		}
+		// The sentence is uniform while the reason names the bundle's
+		// state; the reason is the documented contract.
+		enrollErr(t, err, ErrEnrollmentUnauthenticated, tt.reason)
 		if message == "" {
 			message = err.Error()
 		} else if err.Error() != message {
-			t.Errorf("%s: message %q differs from %q; failures must not reveal which bundles exist", name, err.Error(), message)
+			t.Errorf("%s: message %q differs from %q; the sentence must be the same for every failure", tt.name, err.Error(), message)
 		}
 	}
 	h.assertNothingRecorded("ext2")
@@ -394,15 +461,20 @@ func TestBundle_CreateValidation(t *testing.T) {
 	api, _, _ := h.addCluster("ext2", time.Hour)
 	ok := CreateBundleRequest{Scope: BundleScope{ClusterID: "ext2", APIServer: api}}
 	cases := map[string]func(r *CreateBundleRequest){
-		"no cluster":          func(r *CreateBundleRequest) { r.Scope = BundleScope{} },
-		"no address":          func(r *CreateBundleRequest) { r.Scope.APIServer = "" },
-		"both scopes":         func(r *CreateBundleRequest) { r.Scope.Verifier = "x"; r.Scope.VerifierScope = "y" },
-		"unknown verifier":    func(r *CreateBundleRequest) { r.Scope = BundleScope{Verifier: "nobody", VerifierScope: "s"} },
-		"unknown profile":     func(r *CreateBundleRequest) { r.Profile = "everything" },
-		"custom without role": func(r *CreateBundleRequest) { r.Profile = AccessProfileCustom },
-		"role without custom": func(r *CreateBundleRequest) { r.Profile = AccessProfileReadOnly; r.ClusterRole = "x" },
-		"short token":         func(r *CreateBundleRequest) { r.TokenLifetime = time.Minute },
-		"negative ttl":        func(r *CreateBundleRequest) { r.TTL = -time.Second },
+		"no cluster":                        func(r *CreateBundleRequest) { r.Scope = BundleScope{} },
+		"no address":                        func(r *CreateBundleRequest) { r.Scope.APIServer = "" },
+		"both scopes":                       func(r *CreateBundleRequest) { r.Scope.Verifier = "x"; r.Scope.VerifierScope = "y" },
+		"unknown verifier":                  func(r *CreateBundleRequest) { r.Scope = BundleScope{Verifier: "nobody", VerifierScope: "s"} },
+		"unknown profile":                   func(r *CreateBundleRequest) { r.Profile = "everything" },
+		"custom without role":               func(r *CreateBundleRequest) { r.Profile = AccessProfileCustom },
+		"role without custom":               func(r *CreateBundleRequest) { r.Profile = AccessProfileReadOnly; r.ClusterRole = "x" },
+		"role with a colon":                 func(r *CreateBundleRequest) { r.Profile = AccessProfileCustom; r.ClusterRole = "team:ops" },
+		"role with an underscore":           func(r *CreateBundleRequest) { r.Profile = AccessProfileCustom; r.ClusterRole = "team_ops" },
+		"short token":                       func(r *CreateBundleRequest) { r.TokenLifetime = time.Minute },
+		"negative ttl":                      func(r *CreateBundleRequest) { r.TTL = -time.Second },
+		"token lifetime above the maximum":  func(r *CreateBundleRequest) { r.TokenLifetime = MaxTokenLifetime + time.Second },
+		"bundle lifetime above the maximum": func(r *CreateBundleRequest) { r.TTL = MaxBundleTTL + time.Second },
+		"bundle id outside the shape":       func(r *CreateBundleRequest) { r.ID = "bundle" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -424,6 +496,62 @@ func TestBundle_CreateValidation(t *testing.T) {
 			t.Errorf("bundle = %+v", b)
 		}
 	})
+	t.Run("a dotted cluster role is accepted", func(t *testing.T) {
+		req := ok
+		req.ClusterRole = "team.ops"
+		b, _, err := h.svc.CreateBundle(ctx, req)
+		if err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+		if b.Profile != AccessProfileCustom || b.ClusterRole != "team.ops" {
+			t.Errorf("bundle = %+v", b)
+		}
+	})
+	t.Run("the longest lifetimes are accepted", func(t *testing.T) {
+		req := ok
+		req.TokenLifetime = MaxTokenLifetime
+		req.TTL = MaxBundleTTL
+		if _, _, err := h.svc.CreateBundle(ctx, req); err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+	})
+}
+
+// A create may name its bundle id, so a client that is unsure whether
+// a create landed can retry it safely. The retry is a conflict that
+// names the existing bundle, and it leaves the first bundle's secret
+// working: it never overwrites the secret or mints a second one.
+func TestBundle_ChosenID(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, _, _ := h.addCluster("ext2", time.Hour)
+	const id = "eb-0123456789ab"
+
+	bundle, bearer, err := h.svc.CreateBundle(ctx, CreateBundleRequest{
+		ID: id, Scope: BundleScope{ClusterID: "ext2", APIServer: api}, Actor: "ops",
+	})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	if bundle.ID != id || !strings.HasPrefix(bearer, id+".") {
+		t.Fatalf("bundle = %+v, bearer = %q; want the chosen id %q", bundle, bearer, id)
+	}
+
+	// The repeat names the existing bundle, whatever the rest of its
+	// body says: the conflict is about the id.
+	_, _, err = h.svc.CreateBundle(ctx, CreateBundleRequest{
+		ID: id, Scope: BundleScope{ClusterID: "ext2", APIServer: api}, Profile: AccessProfileReadOnly, Actor: "ops",
+	})
+	ee := enrollErr(t, err, ErrEnrollmentConflict, "bundle-id-in-use")
+	if ee.Details["name"] != "enrollmentBundles/"+id {
+		t.Errorf("details = %v, want the existing bundle's name", ee.Details)
+	}
+
+	// The conflict left the first secret in place.
+	obs, err := h.svc.authenticateBundle(ctx, bearer)
+	if err != nil || obs.ID != id {
+		t.Fatalf("authenticateBundle with the first secret = %+v, %v; want bundle %q", obs, err, id)
+	}
 }
 
 // fakeVerifier vouches for the clusters in its map.
@@ -887,5 +1015,531 @@ func TestListBundles(t *testing.T) {
 	}
 	if got, _ := h.svc.ListBundles(ctx); len(got) != 1 || got[0].ID != two.ID {
 		t.Errorf("after a revocation ListBundles = %v", got)
+	}
+}
+
+func TestValidateLabelsRejectsKubernetesInvalidLabels(t *testing.T) {
+	valid := map[string]string{
+		"app.kubernetes.io/name": "web",
+		// The name part of a label key may carry uppercase.
+		"Foo":            "Prod",
+		"a.b_c-d":        "v1.2_3",
+		"ok":             "",
+		"example.com/ok": strings.Repeat("v", 63),
+	}
+	if err := validateLabels(valid); err != nil {
+		t.Fatalf("validateLabels(%v) = %v, want nil", valid, err)
+	}
+	invalid := map[string]map[string]string{
+		"three parts":        {"a/b/c": "v"},
+		"empty prefix":       {"/name": "v"},
+		"empty name":         {"example.com/": "v"},
+		"space in key":       {"bad key": "v"},
+		"colon in key":       {"ok:name": "v"},
+		"key name too long":  {strings.Repeat("k", 64): "v"},
+		"value too long":     {"ok": strings.Repeat("v", 64)},
+		"space in value":     {"ok": "has space"},
+		"leading dash value": {"ok": "-x"},
+	}
+	for name, labels := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if err := validateLabels(labels); !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Fatalf("validateLabels(%v) = %v, want ErrInvalidArgument", labels, err)
+			}
+		})
+	}
+}
+
+func TestValidateClusterIDLabelsAreAtMost63(t *testing.T) {
+	for _, ok := range []string{strings.Repeat("a", 63), strings.Repeat("a", 63) + ".hub"} {
+		if err := ValidateClusterID(ok); err != nil {
+			t.Errorf("ValidateClusterID(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{strings.Repeat("a", 64), strings.Repeat("a", 64) + ".hub"} {
+		if err := ValidateClusterID(bad); !errors.Is(err, domain.ErrInvalidArgument) {
+			t.Errorf("ValidateClusterID(%q) = %v, want ErrInvalidArgument", bad, err)
+		}
+	}
+}
+
+// A withdrawal that lands while a presentation is being verified wins
+// over the bundle: the pre-probe check cannot see it, the check under
+// the cluster's lock can.
+func TestPresent_WithdrawalDuringProbe_RefusesTheOldBundle(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, ca, token := h.addCluster("ext", time.Hour)
+	_, bearer, err := h.svc.CreateBundle(ctx, CreateBundleRequest{Scope: BundleScope{ClusterID: "ext", APIServer: api}, Actor: "ops"})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	if _, err := h.svc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: token}); err != nil {
+		t.Fatalf("Present: %v", err)
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h.prober.probeEntered = entered
+	h.prober.probeRelease = release
+
+	racing := h.mintToken(api, "racing", time.Hour)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: racing})
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the presentation never reached the probe")
+	}
+	if _, err := h.svc.Withdraw(ctx, "ext", WithdrawRequest{Actor: "ops", Reason: "gone"}); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	close(release)
+
+	enrollErr(t, <-done, ErrEnrollmentRefused, "cluster-withdrawn")
+	if _, found := h.target("ext"); found {
+		t.Error("the cluster was enrolled again after the withdrawal")
+	}
+	rec, err := h.svc.GetCluster(ctx, "ext")
+	if err != nil {
+		t.Fatalf("GetCluster: %v", err)
+	}
+	if rec.Observation.State != ClusterStateWithdrawn {
+		t.Errorf("record state = %q, want %q", rec.Observation.State, ClusterStateWithdrawn)
+	}
+}
+
+// failingPurgeRecords fails a number of PurgeCollectionPrefix calls.
+type failingPurgeRecords struct {
+	*storeRecordStore
+	mu       sync.Mutex
+	failures int
+}
+
+func (f *failingPurgeRecords) PurgeCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string) (int64, error) {
+	f.mu.Lock()
+	if f.failures > 0 {
+		f.failures--
+		f.mu.Unlock()
+		return 0, errors.New("record store unavailable")
+	}
+	f.mu.Unlock()
+	return f.storeRecordStore.PurgeCollectionPrefix(ctx, rt, prefix)
+}
+
+// A withdrawal writes its record before the cleanup: a cleanup failure
+// leaves the record withdrawn, and a retry finishes the cleanup while
+// keeping the first withdrawal's time, actor, and reason.
+func TestWithdraw_CleanupFailure_RecordIsWithdrawnAndRetryFinishes(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	records := &failingPurgeRecords{storeRecordStore: h.records, failures: 1}
+	svc := h.serviceWithRecords(records)
+
+	api, ca, token := h.addCluster("ext", time.Hour)
+	if _, err := svc.Enroll(ctx, EnrollRequest{ClusterID: "ext", APIServer: api, CACert: ca, Token: token}); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	h.seedObjects("ext", 2)
+
+	if _, err := svc.Withdraw(ctx, "ext", WithdrawRequest{Actor: "first", Reason: "moving away"}); err == nil {
+		t.Fatal("the withdrawal reported success although the cleanup failed")
+	}
+	rec, err := svc.GetCluster(ctx, "ext")
+	if err != nil {
+		t.Fatalf("GetCluster: %v", err)
+	}
+	if rec.Observation.State != ClusterStateWithdrawn || rec.Observation.WithdrawnBy != "first" ||
+		rec.Observation.WithdrawnReason != "moving away" {
+		t.Errorf("record after the failed cleanup = %+v", rec.Observation)
+	}
+	withdrawnAt := rec.Observation.WithdrawnAt
+	if left, found := h.target("ext"); !found {
+		t.Error("the target is gone although the cleanup stopped before removing it")
+	} else if left.State() != domain.TargetStateTerminated {
+		t.Errorf("state of the target the cleanup left = %q, want %q: nothing may be dispatched to a withdrawn cluster",
+			left.State(), domain.TargetStateTerminated)
+	}
+	if !h.hasObjects("ext") {
+		t.Error("the indexed objects are gone although purging failed")
+	}
+
+	h.clock.Advance(time.Minute)
+	retry, err := svc.Withdraw(ctx, "ext", WithdrawRequest{Actor: "second", Reason: "second try"})
+	if err != nil {
+		t.Fatalf("Withdraw retry: %v", err)
+	}
+	if retry.Observation.WithdrawnBy != "first" || retry.Observation.WithdrawnReason != "moving away" ||
+		retry.Observation.WithdrawnAt == nil || withdrawnAt == nil || !retry.Observation.WithdrawnAt.Equal(*withdrawnAt) {
+		t.Errorf("retry changed the withdrawal: %+v", retry.Observation)
+	}
+	if _, found := h.target("ext"); found {
+		t.Error("the target is still there after the retry")
+	}
+	if h.hasObjects("ext") {
+		t.Error("the indexed objects are still there after the retry")
+	}
+	if _, ok := h.vaultToken("ext"); ok {
+		t.Error("the credential is still in the vault after the retry")
+	}
+}
+
+// The record is authoritative after a withdrawal whose cleanup failed:
+// renewal refuses, and the worker finishes the cleanup instead of
+// lapsing the cluster or taking its target back into placement. The
+// withdrawal keeps its first time, actor, and reason.
+func TestCheckCluster_FinishesAnInterruptedWithdrawal(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	records := &failingPurgeRecords{storeRecordStore: h.records, failures: 1}
+	svc := h.serviceWithRecords(records)
+
+	api, ca, token := h.addCluster("ext", time.Hour)
+	if _, err := svc.Enroll(ctx, EnrollRequest{ClusterID: "ext", APIServer: api, CACert: ca, Token: token}); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	h.seedObjects("ext", 2)
+	if _, err := svc.Withdraw(ctx, "ext", WithdrawRequest{Actor: "ops", Reason: "moving away"}); err == nil {
+		t.Fatal("the withdrawal reported success although the cleanup failed")
+	}
+	withdrawn, err := svc.GetCluster(ctx, "ext")
+	if err != nil {
+		t.Fatalf("GetCluster after the failed withdrawal: %v", err)
+	}
+
+	// Renewal must not write an enrolled record over the withdrawal,
+	// neither through the API nor through the worker's own path.
+	if _, err := svc.RenewCredential(ctx, "ext"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("RenewCredential on a withdrawn cluster = %v, want not found", err)
+	}
+	leftover, found := h.target("ext")
+	if !found {
+		t.Fatal("the target is gone although the cleanup stopped before removing it")
+	}
+	if _, err := svc.renew(ctx, "ext", leftover, []byte(token)); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("renew on a withdrawn cluster = %v, want not found", err)
+	}
+	if got, ok := h.vaultToken("ext"); !ok || got != token {
+		t.Errorf("the credential in the vault changed: %q, %v", got, ok)
+	}
+
+	// The credential has lapsed by the time the worker looks: it must
+	// finish the withdrawal, not lapse the cluster.
+	h.clock.Advance(2 * time.Hour)
+	if err := svc.CheckCluster(ctx, "ext"); err != nil {
+		t.Fatalf("CheckCluster: %v", err)
+	}
+	after, err := svc.GetCluster(ctx, "ext")
+	if err != nil {
+		t.Fatalf("GetCluster after the worker: %v", err)
+	}
+	if after.Observation.State != ClusterStateWithdrawn || after.Observation.WithdrawnBy != "ops" ||
+		after.Observation.WithdrawnReason != "moving away" || after.Observation.WithdrawnAt == nil ||
+		withdrawn.Observation.WithdrawnAt == nil || !after.Observation.WithdrawnAt.Equal(*withdrawn.Observation.WithdrawnAt) {
+		t.Errorf("the worker changed the withdrawal: %+v", after.Observation)
+	}
+	if _, found := h.target("ext"); found {
+		t.Error("the target is still there after the worker's check")
+	}
+	if h.hasObjects("ext") {
+		t.Error("the indexed objects are still there after the worker's check")
+	}
+	if _, ok := h.vaultToken("ext"); ok {
+		t.Error("the credential is still in the vault after the worker's check")
+	}
+}
+
+// failingReadStore fails BeginReadOnly a fixed number of times.
+type failingReadStore struct {
+	domain.Store
+	mu       sync.Mutex
+	failures int
+}
+
+func (f *failingReadStore) BeginReadOnly(ctx context.Context) (domain.Tx, error) {
+	f.mu.Lock()
+	if f.failures > 0 {
+		f.failures--
+		f.mu.Unlock()
+		return nil, errors.New("store unavailable")
+	}
+	f.mu.Unlock()
+	return f.Store.BeginReadOnly(ctx)
+}
+
+// A record read that fails under the admission lock must fail the
+// presentation, not start from an empty state: an empty state would
+// erase the withdrawal that landed during the probe and readmit the
+// pre-withdrawal bundle.
+func TestPresent_RecordReadFailureDuringAdmit_DoesNotReadmit(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, ca, token := h.addCluster("ext", time.Hour)
+	_, bearer, err := h.svc.CreateBundle(ctx, CreateBundleRequest{Scope: BundleScope{ClusterID: "ext", APIServer: api}, Actor: "ops"})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	if _, err := h.svc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: token}); err != nil {
+		t.Fatalf("Present: %v", err)
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h.prober.probeEntered = entered
+	h.prober.probeRelease = release
+
+	store := &failingReadStore{Store: h.store}
+	racingSvc := h.serviceWithStore(store)
+	racing := h.mintToken(api, "racing", time.Hour)
+	done := make(chan error, 1)
+	go func() {
+		_, err := racingSvc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: racing})
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the presentation never reached the probe")
+	}
+	if _, err := h.svc.Withdraw(ctx, "ext", WithdrawRequest{Actor: "ops", Reason: "gone"}); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	store.mu.Lock()
+	store.failures = 1
+	store.mu.Unlock()
+	close(release)
+
+	err = <-done
+	if err == nil {
+		t.Fatal("Present succeeded although the record could not be read")
+	}
+	if !strings.Contains(err.Error(), "store unavailable") {
+		t.Fatalf("Present err = %v, want the record read failure", err)
+	}
+	if _, found := h.target("ext"); found {
+		t.Error("the cluster was enrolled again after the withdrawal")
+	}
+	rec, err := h.svc.GetCluster(ctx, "ext")
+	if err != nil {
+		t.Fatalf("GetCluster: %v", err)
+	}
+	if rec.Observation.State != ClusterStateWithdrawn {
+		t.Errorf("record state = %q, want %q", rec.Observation.State, ClusterStateWithdrawn)
+	}
+}
+
+// A revocation that lands while a presentation is being verified must
+// win: the use recorded after the admission re-reads the bundle record
+// and finds it gone, so the revoked bundle is not written back.
+func TestRevokeBundle_DuringPresent_DoesNotResurrectTheRecord(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, ca, token := h.addCluster("ext", time.Hour)
+	bundle, bearer, err := h.svc.CreateBundle(ctx, CreateBundleRequest{Scope: BundleScope{ClusterID: "ext", APIServer: api}, Actor: "ops"})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	if _, err := h.svc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: token}); err != nil {
+		t.Fatalf("Present: %v", err)
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h.prober.probeEntered = entered
+	h.prober.probeRelease = release
+
+	racing := h.mintToken(api, "racing", time.Hour)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: racing})
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the presentation never reached the probe")
+	}
+	if err := h.svc.RevokeBundle(ctx, bundle.ID, "ops"); err != nil {
+		t.Fatalf("RevokeBundle: %v", err)
+	}
+	close(release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Present after the bundle authenticated: %v", err)
+	}
+	if _, err := h.svc.GetBundle(ctx, bundle.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("revoked bundle read back: %v", err)
+	}
+	bundles, err := h.svc.ListBundles(ctx)
+	if err != nil {
+		t.Fatalf("ListBundles: %v", err)
+	}
+	for _, b := range bundles {
+		if b.ID == bundle.ID {
+			t.Fatalf("revoked bundle %s is listed again after a presentation", bundle.ID)
+		}
+	}
+}
+
+// The per-bundle lock map holds only bundles being changed right now:
+// the entry goes when the last caller holding or waiting for it
+// releases it, and callers waiting for that lock share its entry.
+func TestLockBundle_EntryGoesWhenTheLastCallerReleasesIt(t *testing.T) {
+	h := newEnrollHarness(t)
+	count := func() int {
+		h.svc.mu.Lock()
+		defer h.svc.mu.Unlock()
+		return len(h.svc.bundleLocks)
+	}
+	const id = "eb-0123456789ab"
+	held := h.svc.lockBundle(id)
+	if got := count(); got != 1 {
+		t.Fatalf("entries while locked = %d, want 1", got)
+	}
+	acquired := make(chan struct{})
+	go func() {
+		l := h.svc.lockBundle(id)
+		h.svc.unlockBundle(id, l)
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("a second caller did not wait for the held lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("entries with a holder and a waiter = %d, want 1", got)
+	}
+	h.svc.unlockBundle(id, held)
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting caller never acquired the lock")
+	}
+	if got := count(); got != 0 {
+		t.Fatalf("entries after the last caller released = %d, want none", got)
+	}
+}
+
+// A caller cannot make the per-bundle lock map hold ids that name no
+// bundle, however many well-formed ids it sends.
+func TestRevokeBundle_LeavesNoLockEntriesForUnknownIDs(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("eb-%012x", i)
+		if err := h.svc.RevokeBundle(ctx, id, "ops"); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("revoke of unknown id %s = %v, want not-found", id, err)
+		}
+	}
+	h.svc.mu.Lock()
+	n := len(h.svc.bundleLocks)
+	h.svc.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("revokes of unknown ids left %d lock entries", n)
+	}
+}
+
+// Presentations of one bundle that overlap count every use: each use is
+// recorded from a record read under the bundle's lock, not from the
+// snapshot the authentication returned.
+func TestPresent_OverlappingPresentationsCountEveryUse(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, ca, _ := h.addCluster("ext", time.Hour)
+	bundle, bearer, err := h.svc.CreateBundle(ctx, CreateBundleRequest{Scope: BundleScope{ClusterID: "ext", APIServer: api}, Actor: "ops"})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	h.prober.probeEntered = entered
+	h.prober.probeRelease = release
+
+	done := make(chan error, 2)
+	for _, name := range []string{"first", "second"} {
+		tok := h.mintToken(api, name, time.Hour)
+		go func() {
+			_, err := h.svc.Present(ctx, bearer, PresentRequest{CACert: ca, Token: tok})
+			done <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("a presentation never reached the probe")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("Present: %v", err)
+		}
+	}
+	got, err := h.svc.GetBundle(ctx, bundle.ID)
+	if err != nil {
+		t.Fatalf("GetBundle: %v", err)
+	}
+	if got.Uses != 2 {
+		t.Fatalf("bundle uses = %d, want 2 (an increment was lost)", got.Uses)
+	}
+}
+
+// An integration can keep a condition of its own on an enrolled
+// cluster's record. It stays next to the conditions the enrollment
+// keeps, through whatever the enrollment writes later.
+func TestSetExternalCondition(t *testing.T) {
+	h := newEnrollHarness(t)
+	ctx := context.Background()
+	api, ca, token := h.addCluster("ext", time.Hour)
+	if _, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "ext", APIServer: api, CACert: ca, Token: token}); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	const factsCurrent domain.ConditionType = "FactsCurrent"
+
+	changed, err := h.svc.SetExternalCondition(ctx, "ext", factsCurrent, domain.ConditionFalse, "RegistryAway", "the registry does not answer")
+	if err != nil || !changed {
+		t.Fatalf("SetExternalCondition: changed %v, %v", changed, err)
+	}
+	conds := h.conditions("ext")
+	if c := conds[factsCurrent]; c.Status() != domain.ConditionFalse || c.Reason() != "RegistryAway" || c.Message() != "the registry does not answer" {
+		t.Fatalf("the record's condition = %+v", c)
+	}
+	if conds[ClusterConditionReady].Status() != domain.ConditionTrue || conds[ClusterConditionEnrolled].Status() != domain.ConditionTrue {
+		t.Errorf("setting an integration's condition changed the enrollment's own: %v", conds)
+	}
+	if changed, err := h.svc.SetExternalCondition(ctx, "ext", factsCurrent, domain.ConditionFalse, "RegistryAway", "the registry does not answer"); err != nil || changed {
+		t.Errorf("the same condition again: changed %v, %v; want the record left alone", changed, err)
+	}
+
+	// What the enrollment writes later keeps it.
+	if _, err := h.svc.SetExternalLabels(ctx, "ext", map[string]string{"region": "eu"}); err != nil {
+		t.Fatalf("SetExternalLabels: %v", err)
+	}
+	fresh := h.mintToken(api, "ext-second", time.Hour)
+	if _, err := h.svc.Enroll(ctx, EnrollRequest{ClusterID: "ext", APIServer: api, CACert: ca, Token: fresh}); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if c, ok := h.conditions("ext")[factsCurrent]; !ok || c.Reason() != "RegistryAway" {
+		t.Errorf("the integration's condition did not survive later writes of the record: %+v, %v", c, ok)
+	}
+	rec, err := h.svc.GetCluster(ctx, "ext")
+	if err != nil || rec.Labels["region"] != "eu" {
+		t.Errorf("the record's labels after the condition was set = %v, %v", rec.Labels, err)
+	}
+
+	if _, err := h.svc.SetExternalCondition(ctx, "ext", ClusterConditionReady, domain.ConditionFalse, "X", "x"); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Errorf("a condition the enrollment keeps was set from outside: %v", err)
+	}
+	if _, err := h.svc.SetExternalCondition(ctx, "nope", factsCurrent, domain.ConditionTrue, "X", "x"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("a cluster that is not enrolled: %v", err)
 	}
 }

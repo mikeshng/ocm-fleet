@@ -35,6 +35,11 @@ type HubProbe struct {
 	// ServiceAccount is set when that is a service account.
 	Username       string
 	ServiceAccount kubernetesaddon.ServiceAccountRef
+	// ClusterUID identifies the cluster the hub runs on: the UID of its
+	// kube-system namespace. It is the same at every address the hub is
+	// reached at. Empty when the credential may not read it, as with an
+	// account made before the integration asked for that right.
+	ClusterUID string
 	// CanRead: may list and watch ManagedCluster objects.
 	CanRead bool
 	// CanWrite: may change clusters or create work on the hub. The
@@ -62,23 +67,30 @@ type HubClients interface {
 }
 
 // ClientGoHubClients is the [HubClients] that talks to real hubs.
-type ClientGoHubClients struct{}
+type ClientGoHubClients struct {
+	// Egress decides which addresses the integration may dial. The zero
+	// value applies the default refusals; see
+	// [kubernetesaddon.EgressPolicy].
+	Egress kubernetesaddon.EgressPolicy
+}
 
 var _ HubClients = ClientGoHubClients{}
 
-func hubRESTConfig(conn HubConnection) (*rest.Config, error) {
+func (c ClientGoHubClients) restConfig(conn HubConnection) (*rest.Config, error) {
 	if conn.APIServer == "" || conn.CACert == "" {
 		return nil, fmt.Errorf("%w: hub API address and CA certificate are required", domain.ErrInvalidArgument)
 	}
-	return &rest.Config{
+	cfg := &rest.Config{
 		Host:            conn.APIServer,
 		TLSClientConfig: rest.TLSClientConfig{CAData: []byte(conn.CACert)},
-	}, nil
+	}
+	c.Egress.DialConfig(cfg)
+	return cfg, nil
 }
 
 // Probe implements [HubClients].
-func (ClientGoHubClients) Probe(ctx context.Context, conn HubConnection) (HubProbe, error) {
-	prober := kubernetesaddon.ClientGoClusterProber{}
+func (c ClientGoHubClients) Probe(ctx context.Context, conn HubConnection) (HubProbe, error) {
+	prober := kubernetesaddon.ClientGoClusterProber{Egress: c.Egress}
 	username, err := prober.Identity(ctx, conn.clusterConnection())
 	if err != nil {
 		return HubProbe{}, err
@@ -87,7 +99,7 @@ func (ClientGoHubClients) Probe(ctx context.Context, conn HubConnection) (HubPro
 	out.ServiceAccount, _ = kubernetesaddon.ServiceAccountFromUsername(username)
 	out.TokenIssuedAt, out.TokenExpiresAt = kubernetesaddon.TokenLifetime(conn.Token)
 
-	cfg, err := hubRESTConfig(conn)
+	cfg, err := c.restConfig(conn)
 	if err != nil {
 		return HubProbe{}, err
 	}
@@ -147,6 +159,17 @@ func (ClientGoHubClients) Probe(ctx context.Context, conn HubConnection) (HubPro
 			return HubProbe{}, fmt.Errorf("list ManagedCluster objects: %w", err)
 		}
 	}
+
+	// What identifies the hub apart from its address. A credential that
+	// may not read it leaves the hub without one.
+	ns, err := client.CoreV1().Namespaces().Get(ctx, hubIdentityNamespace, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		out.ClusterUID = string(ns.UID)
+	case apierrors.IsForbidden(err), apierrors.IsNotFound(err):
+	default:
+		return HubProbe{}, fmt.Errorf("read the hub's identifier: %w", err)
+	}
 	return out, nil
 }
 
@@ -154,8 +177,8 @@ func (ClientGoHubClients) Probe(ctx context.Context, conn HubConnection) (HubPro
 var errNotAHub = errors.New("the cluster does not serve the ManagedCluster API")
 
 // Dynamic implements [HubClients].
-func (ClientGoHubClients) Dynamic(conn HubConnection, token func() string) (dynamic.Interface, error) {
-	cfg, err := hubRESTConfig(conn)
+func (c ClientGoHubClients) Dynamic(conn HubConnection, token func() string) (dynamic.Interface, error) {
+	cfg, err := c.restConfig(conn)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +193,8 @@ func (ClientGoHubClients) Dynamic(conn HubConnection, token func() string) (dyna
 }
 
 // RenewToken implements [HubClients].
-func (ClientGoHubClients) RenewToken(ctx context.Context, conn HubConnection, sa kubernetesaddon.ServiceAccountRef, lifetime time.Duration) (string, time.Time, error) {
-	return kubernetesaddon.ClientGoClusterProber{}.RenewToken(ctx, conn.clusterConnection(), sa, lifetime)
+func (c ClientGoHubClients) RenewToken(ctx context.Context, conn HubConnection, sa kubernetesaddon.ServiceAccountRef, lifetime time.Duration) (string, time.Time, error) {
+	return kubernetesaddon.ClientGoClusterProber{Egress: c.Egress}.RenewToken(ctx, conn.clusterConnection(), sa, lifetime)
 }
 
 // bearerTransport adds the current bearer token to each request.

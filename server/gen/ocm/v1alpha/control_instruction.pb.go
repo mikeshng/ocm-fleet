@@ -109,7 +109,7 @@ var File_ocm_v1alpha_control_instruction_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_control_instruction_proto_rawDesc = "" +
 	"\n" +
-	"%ocm/v1alpha/control_instruction.proto\x12\vocm.v1alpha\x1a!ocm/v1alpha/target_accepted.proto\x1a ocm/v1alpha/fleetlet_error.proto\"\x9f\x01\n" +
+	"%ocm/v1alpha/control_instruction.proto\x12\vocm.v1alpha\x1a ocm/v1alpha/fleetlet_error.proto\x1a!ocm/v1alpha/target_accepted.proto\"\x9f\x01\n" +
 	"\x12ControlInstruction\x12F\n" +
 	"\x0ftarget_accepted\x18\x01 \x01(\v2\x1b.ocm.v1alpha.TargetAcceptedH\x00R\x0etargetAccepted\x122\n" +
 	"\x05error\x18\x02 \x01(\v2\x1a.ocm.v1alpha.FleetletErrorH\x00R\x05errorB\r\n" +
@@ -148,8 +148,8 @@ func file_ocm_v1alpha_control_instruction_proto_init() {
 	if File_ocm_v1alpha_control_instruction_proto != nil {
 		return
 	}
-	file_ocm_v1alpha_target_accepted_proto_init()
 	file_ocm_v1alpha_fleetlet_error_proto_init()
+	file_ocm_v1alpha_target_accepted_proto_init()
 	file_ocm_v1alpha_control_instruction_proto_msgTypes[0].OneofWrappers = []any{
 		(*ControlInstruction_TargetAccepted)(nil),
 		(*ControlInstruction_Error)(nil),

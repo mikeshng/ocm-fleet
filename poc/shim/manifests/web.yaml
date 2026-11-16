@@ -1,0 +1,26 @@
+# A second small workload, placed by a label instead of by a cluster's name.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/part-of: fleet-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10

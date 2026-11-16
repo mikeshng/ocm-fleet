@@ -88,10 +88,10 @@ func TestCheckCluster_CannotRenewThenLapsesThenRecovers(t *testing.T) {
 		t.Fatal("a lapsed credential removed the target")
 	}
 	if target.State() != domain.TargetStateInitializing {
-		t.Errorf("target state = %q, want initializing (out of placement)", target.State())
+		t.Errorf("target state = %q, want initializing (no new placement)", target.State())
 	}
 	if pool := domain.PlacementTargets([]domain.TargetInfo{target}); len(pool) != 0 {
-		t.Error("a target with a lapsed credential is still offered to placement")
+		t.Error("a target with a lapsed credential is still offered for new placement")
 	}
 	rec, _ = h.svc.GetCluster(ctx, "ext")
 	if rec.Observation.State != ClusterStateNeedsEnrollment {

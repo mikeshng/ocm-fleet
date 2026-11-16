@@ -17,6 +17,14 @@ export interface Condition {
   message?: string;
 }
 
+/** How a hub's enrollment add-on reaches the hub's clusters. */
+export interface EnrollmentRollout {
+  /** manual, every-cluster, or placement. */
+  mode: string;
+  placementNamespace?: string;
+  placementName?: string;
+}
+
 export interface HubObservation {
   id: string;
   displayName?: string;
@@ -32,6 +40,12 @@ export interface HubObservation {
   acceptedCount?: number;
   availableCount?: number;
   enrolledCount?: number;
+  /** How many of the hub's clusters were enrolled through its add-on. */
+  enrolledThroughHubCount?: number;
+  /** The rollout of the add-on last generated for this connection. */
+  enrollmentRollout?: EnrollmentRollout;
+  /** How many valid enrollment secrets cover the hub's clusters. */
+  enrollmentSecrets?: number;
 }
 
 export interface HubResource {
@@ -94,6 +108,10 @@ export interface EnrollmentAddonRequest {
   profile?: string;
   grantPlatformDelivery?: boolean;
   removeAccessWithAddon?: boolean;
+  /** manual, every-cluster, or placement; left out, the hub's last one. */
+  rollout?: string;
+  placementNamespace?: string;
+  placementName?: string;
 }
 
 export interface EnrollmentBundle {
@@ -108,8 +126,10 @@ export interface EnrollmentAddon {
   bundle: EnrollmentBundle;
   /** Applied once to the hub by its administrator. Carries a secret. */
   manifest: string;
-  /** What enables the add-on for one cluster. */
+  /** What enables the add-on for one cluster; empty unless the rollout is manual. */
   enableExample: string;
+  /** The rollout the add-on was made for. */
+  rollout?: EnrollmentRollout;
   instructions: string[];
 }
 
@@ -160,7 +180,33 @@ export function createEnrollmentAddon(
   hubId: string,
   req: EnrollmentAddonRequest,
 ): Promise<EnrollmentAddon> {
-  return ocmRequest(`/hubs/${encodeURIComponent(hubId)}:enrollmentAddon`, req);
+  return ocmRequest(
+    `/hubs/${encodeURIComponent(hubId)}:generateEnrollmentAddon`,
+    req,
+  );
+}
+
+/**
+ * Reads the live observation of a connected hub: what its watch sees now.
+ * The hub records are written at most every few minutes while only the
+ * last-heard time changes, so a view that shows that time reads it here.
+ */
+export function getHubObservation(hubId: string): Promise<HubObservation> {
+  return ocmRequest(`/hubs/${encodeURIComponent(hubId)}/observation`);
+}
+
+const ENROLLMENT_BASE = "/apis/kubernetes.open-cluster-management.io/v1alpha";
+
+/** Revokes an enrollment bundle; its manifest then enrolls nothing. */
+export async function revokeEnrollmentBundle(id: string): Promise<void> {
+  const res = await fetch(
+    `${ENROLLMENT_BASE}/enrollmentBundles/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) {
+    const payload: unknown = await res.json().catch(() => null);
+    throw new Error(errorMessage(payload, res.status));
+  }
 }
 
 const hubApi = createResourceApi<HubResource>("-");
@@ -168,10 +214,6 @@ const observedApi = createResourceApi<ObservedClusterResource>("-");
 
 function celString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-export function listHubs(): Promise<HubResult[]> {
-  return hubApi.searchAll({ filter: `resourceType == "${HUB_TYPE}"` });
 }
 
 export function listHubClusters(
@@ -182,17 +224,105 @@ export function listHubClusters(
   });
 }
 
-/** The hub's record of the cluster that a console cluster id stands for. */
-export async function findObservedCluster(
+/** The hub id a listed record is about. */
+export function hubIdOf(hub: HubResult): string {
+  return (
+    hub.resource.observation?.id ?? hub.resource.name.replace(/^hubs\//, "")
+  );
+}
+
+/**
+ * How many of a hub's clusters the hub does not report as available. A
+ * record that carries no counts yet has none.
+ */
+export function unavailableClusterCount(observation?: HubObservation): number {
+  return Math.max(
+    0,
+    (observation?.clusterCount ?? 0) - (observation?.availableCount ?? 0),
+  );
+}
+
+/**
+ * Puts each hub's live last-heard time on its listed record. The records
+ * are written at most every few minutes while only that time changes, so
+ * a hub that answers could show an older time than one that does not; the
+ * live observation of each hub answers the watch's time. A hub whose
+ * observation cannot be read keeps its record's time.
+ */
+export function mergeLiveHubTimes(
+  hubs: HubResult[],
+  live: ReadonlyMap<string, string | undefined>,
+): HubResult[] {
+  return hubs.map((hub) => {
+    const lastSeenAt = live.get(hubIdOf(hub));
+    const observation = hub.resource.observation;
+    if (!lastSeenAt || !observation || observation.lastSeenAt === lastSeenAt) {
+      return hub;
+    }
+    return {
+      ...hub,
+      resource: {
+        ...hub.resource,
+        observation: { ...observation, lastSeenAt },
+      },
+    };
+  });
+}
+
+async function liveHubTimes(
+  hubs: HubResult[],
+): Promise<Map<string, string | undefined>> {
+  const pairs = await Promise.all(
+    hubs.map(async (hub): Promise<[string, string | undefined]> => {
+      const id = hubIdOf(hub);
+      try {
+        return [id, (await getHubObservation(id)).lastSeenAt];
+      } catch {
+        return [id, undefined];
+      }
+    }),
+  );
+  return new Map(pairs);
+}
+
+export async function listHubs(): Promise<HubResult[]> {
+  const hubs = await hubApi.searchAll({
+    filter: `resourceType == "${HUB_TYPE}"`,
+  });
+  return mergeLiveHubTimes(hubs, await liveHubTimes(hubs));
+}
+
+/**
+ * Puts the hub records of one cluster in the order they are shown: the
+ * records linked to the cluster before one that only shares its name, the
+ * record of the preferred hub first among them, then by hub id.
+ */
+export function orderObservedClusters(
+  records: ObservedClusterResult[],
   clusterId: string,
-): Promise<ObservedClusterResult | undefined> {
+  preferredHub?: string,
+): ObservedClusterResult[] {
+  const linked = records.filter((r) => linkedClusterId(r) === clusterId);
+  const shown = linked.length > 0 ? linked : records.slice(0, 1);
+  const hubOf = (r: ObservedClusterResult) => r.resource.observation?.hub ?? "";
+  return [...shown].sort(
+    (a, b) =>
+      Number(hubOf(b) === preferredHub) - Number(hubOf(a) === preferredHub) ||
+      hubOf(a).localeCompare(hubOf(b)),
+  );
+}
+
+/**
+ * The hubs' records of the cluster that a console cluster id stands for:
+ * one per connected hub that reports it.
+ */
+export async function findObservedClusters(
+  clusterId: string,
+  preferredHub?: string,
+): Promise<ObservedClusterResult[]> {
   const { resources } = await observedApi.search({
     filter: observedRecordFilter(clusterId),
-    pageSize: 5,
+    pageSize: 20,
   });
-  // The record linked to the cluster comes before one that only shares
-  // its name.
-  return (
-    resources.find((r) => linkedClusterId(r) === clusterId) ?? resources[0]
-  );
+  return orderObservedClusters(resources, clusterId, preferredHub);
 }

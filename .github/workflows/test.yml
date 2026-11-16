@@ -68,6 +68,12 @@ jobs:
           setup_only: true
           version: "1.75.0"
 
+      # Regenerate the protobuf and OpenAPI artifacts and fail when the
+      # committed copies differ from what the protos and pinned generators
+      # produce.
+      - name: Check generated API artifacts
+        run: npx nx run proto:check:generated
+
       # Native analysis entries validate their own source/configuration hashes;
       # restoring an older archive still helps on partially changed modules.
       - name: Cache Go lint analysis

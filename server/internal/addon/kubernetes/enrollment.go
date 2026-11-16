@@ -54,6 +54,12 @@ type VerifiedCluster struct {
 // so that signed intent can be verified for them.
 type TrustBundleSource func(ctx context.Context) ([]domain.TrustBundleEntry, error)
 
+// PlacementReevaluator brings placement up to date after the target
+// fleet changes: a target joined, left, or changed its labels.
+type PlacementReevaluator interface {
+	ReevaluatePlacement(ctx context.Context) error
+}
+
 // EnrollmentDeps are the collaborators of an [EnrollmentService].
 type EnrollmentDeps struct {
 	Store   domain.Store
@@ -63,8 +69,11 @@ type EnrollmentDeps struct {
 	Indexing IndexingRuntime
 	Prober   ClusterProber
 	// Trust may be nil: enrolled targets then accept no signed intent.
-	Trust  TrustBundleSource
-	Logger *slog.Logger
+	Trust TrustBundleSource
+	// Placement may be nil: target fleet changes are then not followed
+	// by a placement comparison (assemblies without workflows).
+	Placement PlacementReevaluator
+	Logger    *slog.Logger
 	// Now and Random default to the wall clock and crypto/rand.
 	Now    func() time.Time
 	Random io.Reader
@@ -72,21 +81,26 @@ type EnrollmentDeps struct {
 
 // EnrollmentService takes existing clusters in and lets them go.
 type EnrollmentService struct {
-	store    domain.Store
-	vault    domain.Vault
-	records  InventoryRecordStore
-	indexing IndexingRuntime
-	prober   ClusterProber
-	trust    TrustBundleSource
-	logger   *slog.Logger
-	now      func() time.Time
-	random   io.Reader
+	store     domain.Store
+	vault     domain.Vault
+	records   InventoryRecordStore
+	indexing  IndexingRuntime
+	prober    ClusterProber
+	trust     TrustBundleSource
+	placement PlacementReevaluator
+	logger    *slog.Logger
+	now       func() time.Time
+	random    io.Reader
 
 	mu        sync.Mutex
 	verifiers map[string]PresentationVerifier
 	locks     map[string]*sync.Mutex
-	probes    map[string]*probeHistory
-	observers []func(clusterID string)
+	// bundleLocks serializes changes to one bundle record: revocation
+	// against use recording. An entry lives only while a caller holds
+	// or waits for it (see lockBundle).
+	bundleLocks map[string]*bundleLock
+	probes      map[string]*probeHistory
+	observers   []func(clusterID string)
 }
 
 // NewEnrollmentService builds the service. Store, Vault, Records,
@@ -101,18 +115,20 @@ func NewEnrollmentService(deps EnrollmentDeps) *EnrollmentService {
 		random = defaultRandom
 	}
 	return &EnrollmentService{
-		store:     deps.Store,
-		vault:     deps.Vault,
-		records:   deps.Records,
-		indexing:  deps.Indexing,
-		prober:    deps.Prober,
-		trust:     deps.Trust,
-		logger:    deps.Logger.With("component", "enrollment"),
-		now:       now,
-		random:    random,
-		verifiers: map[string]PresentationVerifier{},
-		locks:     map[string]*sync.Mutex{},
-		probes:    map[string]*probeHistory{},
+		store:       deps.Store,
+		vault:       deps.Vault,
+		records:     deps.Records,
+		indexing:    deps.Indexing,
+		prober:      deps.Prober,
+		trust:       deps.Trust,
+		placement:   deps.Placement,
+		logger:      deps.Logger.With("component", "enrollment"),
+		now:         now,
+		random:      random,
+		verifiers:   map[string]PresentationVerifier{},
+		locks:       map[string]*sync.Mutex{},
+		bundleLocks: map[string]*bundleLock{},
+		probes:      map[string]*probeHistory{},
 	}
 }
 
@@ -145,6 +161,23 @@ func (s *EnrollmentService) notify(clusterID string) {
 	s.mu.Unlock()
 	for _, fn := range observers {
 		fn(clusterID)
+	}
+}
+
+// reevaluatePlacement re-runs placement after a committed change to the
+// target fleet, so deployments whose placement matches the new fleet
+// deliver to a target that joined (or stop delivering to one that
+// left). The target write has already committed: a failure here is
+// logged rather than returned, because reporting the operation as
+// failed would misstate a target that exists, and the platform makes
+// the same comparison again on an interval.
+func (s *EnrollmentService) reevaluatePlacement(ctx context.Context, reason string) {
+	if s.placement == nil {
+		return
+	}
+	if err := s.placement.ReevaluatePlacement(ctx); err != nil {
+		s.logger.Warn("could not re-run placement after a target fleet change",
+			"reason", reason, "error", err)
 	}
 }
 
@@ -242,6 +275,10 @@ func (s *EnrollmentService) Enroll(ctx context.Context, req EnrollRequest) (Clus
 	default:
 		return ClusterRecord{}, fmt.Errorf("%w: unknown access profile %q", domain.ErrInvalidArgument, req.Profile)
 	}
+	profile := req.Profile
+	if profile == "" {
+		profile = AccessProfileWorkloads
+	}
 
 	conn := ClusterConnection{APIServer: apiServer, CACert: req.CACert, Token: req.Token}
 	probe, err := s.probe(ctx, conn)
@@ -273,9 +310,24 @@ func (s *EnrollmentService) Enroll(ctx context.Context, req EnrollRequest) (Clus
 		labels:       labels,
 		deliveryRule: rule,
 		grantBy:      req.Actor,
-		profile:      req.Profile,
+		profile:      profile,
 		applyChoices: true,
 	})
+}
+
+// bundlePredatesWithdrawal reports whether the cluster record holds a
+// withdrawal the bundle could not know about: the cluster was withdrawn
+// at or after the bundle was created.
+func bundlePredatesWithdrawal(obs ClusterObservation, bundle *BundleObservation) bool {
+	return bundle != nil && obs.State == ClusterStateWithdrawn && obs.WithdrawnAt != nil &&
+		!bundle.CreatedAt.After(*obs.WithdrawnAt)
+}
+
+// clusterWithdrawnErr refuses taking a cluster in with a bundle that
+// predates its withdrawal.
+func clusterWithdrawnErr(clusterID string) *EnrollmentError {
+	return enrollmentErr(ErrEnrollmentRefused, "cluster-withdrawn",
+		"cluster %q was withdrawn after this bundle was created; a new bundle, or forgetting the cluster, is needed to enroll it again", clusterID)
 }
 
 // Present takes a cluster in, or refreshes its credential, on the
@@ -345,10 +397,8 @@ func (s *EnrollmentService) Present(ctx context.Context, bearer string, req Pres
 	// A cluster that was withdrawn is not taken in again by a bundle
 	// that existed before the withdrawal.
 	if rec, err := s.GetCluster(ctx, a.clusterID); err == nil {
-		if rec.Observation.State == ClusterStateWithdrawn && rec.Observation.WithdrawnAt != nil &&
-			!bundle.CreatedAt.After(*rec.Observation.WithdrawnAt) {
-			return PresentResult{}, enrollmentErr(ErrEnrollmentRefused, "cluster-withdrawn",
-				"cluster %q was withdrawn after this bundle was created; a new bundle, or forgetting the cluster, is needed to enroll it again", a.clusterID)
+		if bundlePredatesWithdrawal(rec.Observation, a.bundle) {
+			return PresentResult{}, clusterWithdrawnErr(a.clusterID)
 		}
 	} else if !errors.Is(err, domain.ErrNotFound) {
 		return PresentResult{}, err
@@ -372,7 +422,7 @@ func (s *EnrollmentService) Present(ctx context.Context, bearer string, req Pres
 	if err != nil {
 		return PresentResult{}, err
 	}
-	s.noteBundleUse(ctx, bundle)
+	s.noteBundleUse(ctx, bundle.ID)
 
 	lifetime := bundle.TokenLifetime()
 	if !probe.TokenIssuedAt.IsZero() && probe.TokenExpiresAt.After(probe.TokenIssuedAt) {
@@ -390,13 +440,19 @@ func (s *EnrollmentService) probe(ctx context.Context, conn ClusterConnection) (
 	case err == nil:
 		return probe, nil
 	case errors.Is(err, ErrClusterRejectedCredential):
+		s.logger.Warn("cluster rejected the presented credential", "api_server", conn.APIServer, "error", err)
 		return ClusterProbeResult{}, enrollmentErr(ErrEnrollmentUnverified, "credential-rejected",
-			"the cluster at %s does not recognize the presented credential", conn.APIServer)
+			"the cluster does not recognize the presented credential")
 	case errors.Is(err, domain.ErrInvalidArgument):
 		return ClusterProbeResult{}, err
 	default:
+		// The presenter learns only that the check failed: the address
+		// dialed and the reason it failed stay in the server log, where
+		// an operator can read them and a holder of a bundle secret
+		// cannot.
+		s.logger.Warn("cluster could not be reached to verify the credential", "api_server", conn.APIServer, "error", err)
 		return ClusterProbeResult{}, enrollmentErr(ErrEnrollmentUnverified, "cluster-unreachable",
-			"the cluster at %s could not be verified with the presented CA: %v", conn.APIServer, err)
+			"the cluster could not be verified with the presented CA")
 	}
 }
 
@@ -427,6 +483,18 @@ func (s *EnrollmentService) admit(ctx context.Context, a admission) (ClusterReco
 	lock := s.lockCluster(a.clusterID)
 	defer lock.Unlock()
 
+	// A withdrawal that landed while the presentation was being verified
+	// wins over a bundle that predates it. Present checks this before the
+	// probe, which takes network time; this check runs under the
+	// cluster's lock, after which no withdrawal can interleave.
+	state, err := s.loadClusterState(ctx, a.clusterID)
+	if err != nil {
+		return ClusterRecord{}, err
+	}
+	if bundlePredatesWithdrawal(state.obs, a.bundle) {
+		return ClusterRecord{}, clusterWithdrawnErr(a.clusterID)
+	}
+
 	targetID := TargetIDForCluster(a.clusterID)
 	targets, err := s.listTargets(ctx)
 	if err != nil {
@@ -442,13 +510,22 @@ func (s *EnrollmentService) admit(ctx context.Context, a admission) (ClusterReco
 			existing = &targets[i]
 			continue
 		}
-		// One cluster, one target: the same API address with the same
-		// CA is the same cluster, whatever it is called here.
-		if t.Type() == TargetType &&
-			NormalizeAPIServerURL(t.Properties()[PropAPIServer]) == a.conn.APIServer &&
-			SameCA([]byte(t.Properties()[PropCACert]), a.conn.CACert) {
+		// One cluster, one target. The cluster's own identifier says so
+		// at whatever address the cluster is reached; where a side has
+		// none, the same API address with the same CA is the same
+		// cluster, whatever it is called here.
+		if t.Type() != TargetType {
+			continue
+		}
+		sameCluster := a.probe.ClusterUID != "" && t.Properties()[PropClusterUID] == a.probe.ClusterUID
+		sameAddress := NormalizeAPIServerURL(t.Properties()[PropAPIServer]) == a.conn.APIServer &&
+			SameCA([]byte(t.Properties()[PropCACert]), a.conn.CACert)
+		if sameCluster || sameAddress {
 			e := enrollmentErr(ErrEnrollmentConflict, "cluster-already-known",
 				"the cluster at %s is already known as target %q", a.conn.APIServer, t.ID())
+			if !sameAddress {
+				e.Message += fmt.Sprintf(", which reaches it at %s", t.Properties()[PropAPIServer])
+			}
 			e.Details = map[string]any{"target": string(t.ID())}
 			if id, ok := ClusterIDFromTarget(t); ok {
 				e.Details["cluster"] = id
@@ -478,6 +555,9 @@ func (s *EnrollmentService) admit(ctx context.Context, a admission) (ClusterReco
 	props[PropOrigin] = OriginEnrolled
 	props[PropAccessForm] = AccessFormDirect
 	props[PropServiceAccount] = a.probe.ServiceAccount.String()
+	if a.probe.ClusterUID != "" {
+		props[PropClusterUID] = a.probe.ClusterUID
+	}
 	if firstEnrollment || props[PropEnrolledAt] == "" {
 		props[PropEnrolledBy] = a.actor
 		props[PropEnrolledAt] = now.Format(time.RFC3339)
@@ -536,6 +616,14 @@ func (s *EnrollmentService) admit(ctx context.Context, a admission) (ClusterReco
 
 	labels := mergeLabels(labelsFromProperty(props[PropExternalLabels]), labelsFromProperty(props[PropEnrollmentLabels]))
 
+	// Placement gives new work only to targets in the ready state, and
+	// matches their labels: a first enrollment, a target coming back
+	// from a lapse or withdrawal, or changed labels is a fleet change.
+	// A plain credential refresh is not.
+	fleetChanged := existing == nil ||
+		existing.State() != domain.TargetStateReady ||
+		!labelsEqual(existing.Labels(), labels)
+
 	if err := s.vault.Put(ctx, tokenRef, []byte(a.conn.Token)); err != nil {
 		return ClusterRecord{}, fmt.Errorf("store cluster credential: %w", err)
 	}
@@ -547,8 +635,10 @@ func (s *EnrollmentService) admit(ctx context.Context, a admission) (ClusterReco
 		}
 		return ClusterRecord{}, err
 	}
+	if fleetChanged {
+		s.reevaluatePlacement(ctx, "cluster "+a.clusterID+" joined or changed")
+	}
 
-	state := s.loadClusterState(ctx, a.clusterID)
 	rights := a.probe.Rights
 	state.obs = observationFromTarget(target, state.obs)
 	state.obs.State = ClusterStateEnrolled
@@ -661,6 +751,64 @@ func (s *EnrollmentService) Withdraw(ctx context.Context, clusterID string, req 
 // The caller holds the cluster's lock.
 func (s *EnrollmentService) release(ctx context.Context, clusterID string, target domain.TargetInfo, actor, reason string) (ClusterRecord, error) {
 	now := s.now().UTC()
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return ClusterRecord{}, err
+	}
+	withdrawn := state.obs.State == ClusterStateWithdrawn && state.obs.WithdrawnAt != nil
+	state.obs = observationFromTarget(target, state.obs)
+	state.obs.State = ClusterStateWithdrawn
+	state.obs.Target = ""
+	if !withdrawn {
+		state.obs.WithdrawnAt = &now
+		state.obs.WithdrawnBy = actor
+		state.obs.WithdrawnReason = reason
+	}
+	// A retry keeps the first withdrawal's time, actor, and reason: the
+	// record tells when the cluster was withdrawn, not when its cleanup
+	// last ran.
+	withdrawnReason := state.obs.WithdrawnReason
+	state.obs.CredentialExpiresAt = nil
+	state.set(ClusterConditionEnrolled, domain.ConditionFalse, "Withdrawn", withdrawnReason, now)
+	state.set(ClusterConditionCredentialValid, domain.ConditionFalse, "Withdrawn", "the credential was removed", now)
+	state.set(ClusterConditionIndexing, domain.ConditionFalse, "Withdrawn", "the cluster is not indexed", now)
+	state.setReady(now)
+	// The target is marked terminated before the record is written: from
+	// then on placement selects it for nothing and nothing is dispatched
+	// to it, so a cleanup that fails midway leaves neither a withdrawn
+	// cluster that still receives deliveries nor one whose workloads a
+	// deployment placed by label goes on to remove. The placement of the
+	// deployments that held it is brought up to date without it.
+	if target.State() != domain.TargetStateTerminated {
+		left := domain.NewTargetInfo(target.ID(), target.Type(), target.Name(), domain.TargetStateTerminated,
+			target.Labels(), target.Properties(), target.AcceptedManifestTypes())
+		if err := s.putTarget(ctx, left, now); err != nil {
+			return ClusterRecord{}, err
+		}
+		s.reevaluatePlacement(ctx, "cluster "+clusterID+" was withdrawn")
+		target = left
+	}
+	// The record goes next: once the withdrawal is written, a cleanup
+	// that fails midway is retried against a record that already says so,
+	// and nobody observes an enrolled cluster whose credential is gone.
+	if err := s.writeClusterState(ctx, clusterID, target.Labels(), state, now); err != nil {
+		return ClusterRecord{}, err
+	}
+
+	purged, err := s.finishWithdrawal(ctx, clusterID, target)
+	if err != nil {
+		return ClusterRecord{}, err
+	}
+	s.logger.Info("cluster withdrawn", "cluster", clusterID, "by", actor, "reason", withdrawnReason, "objects_removed", purged)
+	s.notify(clusterID)
+	return ClusterRecord{ID: clusterID, Name: string(ClusterRecordName(clusterID)), Labels: target.Labels(), Observation: state.obs}, nil
+}
+
+// finishWithdrawal removes what a withdrawal leaves besides the record:
+// the indexer, the indexed objects, the stored credential, and the
+// target. Every step is idempotent, so running it again finishes a
+// cleanup that was interrupted. The caller holds the cluster's lock.
+func (s *EnrollmentService) finishWithdrawal(ctx context.Context, clusterID string, target domain.TargetInfo) (int64, error) {
 	if s.indexing != nil {
 		if err := s.indexing.StopIndexer(ctx, target.ID()); err != nil {
 			s.logger.Warn("could not stop indexer on withdrawal", "cluster", clusterID, "error", err)
@@ -668,36 +816,18 @@ func (s *EnrollmentService) release(ctx context.Context, clusterID string, targe
 	}
 	purged, err := s.records.PurgeCollectionPrefix(ctx, ObjectResourceType, clusterObjectPrefix(clusterID))
 	if err != nil {
-		return ClusterRecord{}, fmt.Errorf("remove indexed objects of cluster %q: %w", clusterID, err)
+		return 0, fmt.Errorf("remove indexed objects of cluster %q: %w", clusterID, err)
 	}
 	if ref := target.Properties()[PropServiceAccountTokenRef]; ref != "" {
 		if err := s.vault.Delete(ctx, domain.SecretRef(ref)); err != nil && !errors.Is(err, domain.ErrNotFound) {
-			return ClusterRecord{}, fmt.Errorf("remove credential of cluster %q: %w", clusterID, err)
+			return 0, fmt.Errorf("remove credential of cluster %q: %w", clusterID, err)
 		}
 	}
 	if err := s.deleteTarget(ctx, target.ID()); err != nil {
-		return ClusterRecord{}, err
-	}
-
-	state := s.loadClusterState(ctx, clusterID)
-	state.obs = observationFromTarget(target, state.obs)
-	state.obs.State = ClusterStateWithdrawn
-	state.obs.Target = ""
-	state.obs.WithdrawnAt = &now
-	state.obs.WithdrawnBy = actor
-	state.obs.WithdrawnReason = reason
-	state.obs.CredentialExpiresAt = nil
-	state.set(ClusterConditionEnrolled, domain.ConditionFalse, "Withdrawn", reason, now)
-	state.set(ClusterConditionCredentialValid, domain.ConditionFalse, "Withdrawn", "the credential was removed", now)
-	state.set(ClusterConditionIndexing, domain.ConditionFalse, "Withdrawn", "the cluster is not indexed", now)
-	state.setReady(now)
-	if err := s.writeClusterState(ctx, clusterID, target.Labels(), state, now); err != nil {
-		return ClusterRecord{}, err
+		return 0, err
 	}
 	s.forgetProbeHistory(clusterID)
-	s.logger.Info("cluster withdrawn", "cluster", clusterID, "by", actor, "reason", reason, "objects_removed", purged)
-	s.notify(clusterID)
-	return ClusterRecord{ID: clusterID, Name: string(ClusterRecordName(clusterID)), Labels: target.Labels(), Observation: state.obs}, nil
+	return purged, nil
 }
 
 // Forget removes the record of a cluster that is not enrolled. It is
@@ -736,6 +866,16 @@ func (s *EnrollmentService) RenewCredential(ctx context.Context, clusterID strin
 	}
 	lock := s.lockCluster(clusterID)
 	defer lock.Unlock()
+
+	// A withdrawn cluster is not enrolled, whatever an interrupted cleanup
+	// left behind.
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return ClusterRecord{}, err
+	}
+	if state.obs.State == ClusterStateWithdrawn && state.obs.WithdrawnAt != nil {
+		return ClusterRecord{}, fmt.Errorf("%w: cluster %q is not enrolled", domain.ErrNotFound, clusterID)
+	}
 
 	target, found, err := s.getTarget(ctx, TargetIDForCluster(clusterID))
 	if err != nil {
@@ -777,6 +917,16 @@ func (s *EnrollmentService) renew(ctx context.Context, clusterID string, target 
 	if lifetime < MinTokenLifetime {
 		lifetime = MinTokenLifetime
 	}
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	// A withdrawal is not overwritten by a renewal: the record stays
+	// withdrawn until a new presentation, or forgetting, says otherwise.
+	if state.obs.State == ClusterStateWithdrawn && state.obs.WithdrawnAt != nil {
+		return nil, fmt.Errorf("%w: cluster %q is withdrawn", domain.ErrNotFound, clusterID)
+	}
+
 	conn := ClusterConnection{APIServer: props[PropAPIServer], CACert: []byte(props[PropCACert]), Token: string(token)}
 	newToken, expiresAt, err := s.prober.RenewToken(ctx, conn, sa, lifetime)
 	if err != nil {
@@ -788,7 +938,6 @@ func (s *EnrollmentService) renew(ctx context.Context, clusterID string, target 
 	}
 
 	now := s.now().UTC()
-	state := s.loadClusterState(ctx, clusterID)
 	state.obs = observationFromTarget(target, state.obs)
 	state.obs.State = ClusterStateEnrolled
 	if _, exp := TokenLifetime(newToken); !exp.IsZero() {
@@ -840,7 +989,11 @@ func (s *EnrollmentService) SetExternalLabels(ctx context.Context, clusterID str
 	if err := s.putTarget(ctx, updated, now); err != nil {
 		return false, err
 	}
-	state := s.loadClusterState(ctx, clusterID)
+	s.reevaluatePlacement(ctx, "labels of cluster "+clusterID+" changed")
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return false, err
+	}
 	state.obs = observationFromTarget(updated, state.obs)
 	if err := s.writeClusterState(ctx, clusterID, merged, state, now); err != nil {
 		return false, err
@@ -858,6 +1011,42 @@ func labelsEqual(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// SetExternalCondition records, on an enrolled cluster's record, a
+// condition that an integration keeps: something the enrollment itself
+// cannot know, such as whether the facts a cluster registry supplied
+// about the cluster are still current. It stays on the record next to
+// the conditions the enrollment keeps, which it never replaces. It
+// reports whether the record changed.
+func (s *EnrollmentService) SetExternalCondition(ctx context.Context, clusterID string, t domain.ConditionType, status domain.ConditionStatus, reason, message string) (bool, error) {
+	switch t {
+	case ClusterConditionReady, ClusterConditionEnrolled, ClusterConditionReachable, ClusterConditionCredentialValid, ClusterConditionIndexing:
+		return false, fmt.Errorf("%w: condition %q is kept by the enrollment itself", domain.ErrInvalidArgument, t)
+	}
+	lock := s.lockCluster(clusterID)
+	defer lock.Unlock()
+
+	target, found, err := s.getTarget(ctx, TargetIDForCluster(clusterID))
+	if err != nil {
+		return false, err
+	}
+	if !found || !IsEnrolledTarget(target) {
+		return false, fmt.Errorf("%w: cluster %q is not enrolled", domain.ErrNotFound, clusterID)
+	}
+	state, err := s.loadClusterState(ctx, clusterID)
+	if err != nil {
+		return false, err
+	}
+	if prev, ok := state.conds[t]; ok && prev.Status() == status && prev.Reason() == reason && prev.Message() == message {
+		return false, nil
+	}
+	now := s.now().UTC()
+	state.set(t, status, reason, message, now)
+	if err := s.writeClusterState(ctx, clusterID, target.Labels(), state, now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // GetCluster returns the record of a cluster.

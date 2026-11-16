@@ -4,8 +4,11 @@ import {
   SkeletonTableHead,
 } from "@patternfly/react-component-groups";
 import {
+  Button,
   EmptyState,
+  EmptyStateActions,
   EmptyStateBody,
+  EmptyStateFooter,
   Label,
   Pagination,
 } from "@patternfly/react-core";
@@ -28,7 +31,11 @@ import {
 import { Tbody, Td, Tr } from "@patternfly/react-table";
 import { useMemo } from "react";
 
-import { formatAge, useClusterResources } from "./useClusterResources";
+import {
+  formatAge,
+  resourceEmptyMessage,
+  useClusterResources,
+} from "./useClusterResources";
 
 interface PodFilters {
   name: string;
@@ -227,8 +234,21 @@ export default function ClusterPodsTab({
                 <Td colSpan={columns.length}>
                   <EmptyState headingLevel="h3" titleText="No pods found">
                     <EmptyStateBody>
-                      No pods are currently indexed for this cluster.
+                      {resourceEmptyMessage(
+                        resources.length,
+                        clusterId,
+                        "pods",
+                      )}
                     </EmptyStateBody>
+                    {resources.length > 0 && (
+                      <EmptyStateFooter>
+                        <EmptyStateActions>
+                          <Button variant="link" onClick={clearAllFilters}>
+                            Clear filters
+                          </Button>
+                        </EmptyStateActions>
+                      </EmptyStateFooter>
+                    )}
                   </EmptyState>
                 </Td>
               </Tr>

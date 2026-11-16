@@ -210,6 +210,23 @@ func (f *Fulfillment) ApplyReconciliationResult(r ReconciliationResult) {
 	f.auth = r.Auth
 }
 
+// ApplySupersededReconciliationResult merges the result of a
+// reconciliation pass that a mutation overtook: the generation
+// advanced after the pass loaded the fulfillment, so the pass worked
+// from an older state than this one, and another pass follows.
+//
+// Only what the pass changed on the targets is recorded. Its lifecycle
+// state, its pause, and the credentials it ran with describe a
+// generation that is no longer current, and applying them would undo
+// the mutation: a fulfillment that [Fulfillment.TransitionToDeleting]
+// moved to [FulfillmentStateDeleting] would become active again and
+// never be deleted, and the credentials a delete or a resume brought
+// would be replaced by the ones they replaced. The pass that follows
+// reconciles the current generation and reports for it.
+func (f *Fulfillment) ApplySupersededReconciliationResult(r ReconciliationResult) {
+	f.resolvedTargets = r.ResolvedTargets
+}
+
 // CompleteReconciliation advances observedGeneration to reconciledGen
 // and stamps updatedAt. If generation has advanced past reconciledGen,
 // needsRestart is true, indicating the caller should loop. When

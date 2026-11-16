@@ -71,7 +71,7 @@ spec:
   hostAliases:
     - ip: "127.0.0.1"
       hostnames:
-        - %s
+        - %q
 `, hostname)
 	path := filepath.Join(dir, kubeadmIssuerHostPatchFile)
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {

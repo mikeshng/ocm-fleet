@@ -34,13 +34,14 @@ func newKubernetesEnrollment(deps AddonDeps) *kubernetesEnrollment {
 		indexed = deps.Indexing.Indexed
 	}
 	svc := kubernetesaddon.NewEnrollmentService(kubernetesaddon.EnrollmentDeps{
-		Store:    deps.Store,
-		Vault:    deps.Vault,
-		Records:  deps.InventoryRecords,
-		Indexing: indexing,
-		Prober:   kubernetesaddon.ClientGoClusterProber{},
-		Trust:    deps.TrustBundles,
-		Logger:   deps.Logger,
+		Store:     deps.Store,
+		Vault:     deps.Vault,
+		Records:   deps.InventoryRecords,
+		Indexing:  indexing,
+		Prober:    kubernetesaddon.ClientGoClusterProber{Egress: kubernetesaddon.EgressPolicy{Allow: deps.Config.ClusterEgressAllow}},
+		Trust:     deps.TrustBundles,
+		Placement: deps.Placement,
+		Logger:    deps.Logger,
 	})
 	endpoint := kubernetesaddon.EnrollmentEndpoint{
 		ServerURL:      deps.Config.EnrollmentServerURL,

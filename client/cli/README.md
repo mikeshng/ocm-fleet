@@ -174,6 +174,31 @@ fleetctl deployment list
 fleetctl resource query
 ```
 
+`deployment create --manifest-file` takes a JSON manifest or a YAML file. Every document of a YAML file becomes one manifest of the deployment.
+
+### OCM hubs
+
+`fleetctl hub` works with the Open Cluster Management hubs that OCM Fleet reads. OCM Fleet writes nothing to a hub: the hub's administrator applies what these commands print.
+
+```bash
+# The read-only account for OCM Fleet.
+fleetctl hub access-manifest | kubectl apply -f -
+
+# Connect the hub: its address, its CA certificate, and a token of that account.
+fleetctl hub connect --id hub1 --name "Team A" \
+  --api-server https://hub1.example.com:6443 --ca-file hub1-ca.crt \
+  --token "$(kubectl -n ocm-fleet-hub-connection create token ocm-fleet-hub-reader)"
+
+fleetctl hub list
+
+# The add-on that enrolls clusters of the hub.
+fleetctl hub enrollment-addon --id hub1 | kubectl apply -f -
+
+fleetctl hub disconnect --id hub1
+```
+
+`hub enrollment-addon` prints an add-on for the clusters the administrator enables it for. `--rollout every-cluster` makes it follow a Placement of every cluster of the hub, and `--placement NAMESPACE/NAME` a Placement that already exists. `--grant-platform-delivery` lets the stored credential of an enrolled cluster deliver deployments that are not signed. The manifest carries an enrollment secret and is printed once.
+
 ### Timing and debug output
 
 Measure total process time from CLI startup through command/render completion. Debug output goes to stderr so command stdout remains script-safe:
@@ -250,7 +275,7 @@ null/undefined command exports.
 
 ## Current Migration Surface
 
-Implemented command handlers cover auth setup/login/logout/inspect/enroll, deployment CRUD/resume/signing, resource CRUD/query, reflection-backed resource types/schema discovery, and explicit Node federation plugin execution (`plugin run`).
+Implemented command handlers cover auth setup/login/logout/inspect/enroll, deployment CRUD/resume/signing, resource CRUD/query, reflection-backed resource types/schema discovery, OCM hub access-manifest/connect/list/enrollment-addon/disconnect, and explicit Node federation plugin execution (`plugin run`).
 
 ## Cleanup
 

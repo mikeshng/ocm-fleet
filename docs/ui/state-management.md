@@ -6,7 +6,7 @@ Explicit state ownership keeps plugin consumers independent and makes shared sto
 
 The core resource hook fetches platform-held Kubernetes observations through `createResourceApi`. It keeps resources, loading state, and errors in React state and exposes a refetch function.
 
-Requests are keyed by cluster context and resource kind. A request counter prevents an older response from replacing newer state. Fetching occurs on mount or dependency change; this hook does not subscribe to WebSocket updates or deduplicate requests across component instances.
+Requests are keyed by cluster context and resource kind. A request counter prevents an older response from replacing newer state. A query that fails before it reaches the server (the browser reports a network failure) is tried once more; an answer from the server, a refusal included, is used as it is. Fetching occurs on mount or dependency change; this hook does not subscribe to WebSocket updates or deduplicate requests across component instances.
 
 Sources:
 

@@ -27,8 +27,19 @@ export type FleetClusterOrigin = "created" | "enrolled" | "observed";
 /** The parts of a query result that the helpers here read. */
 export interface ClusterRecord {
   resourceType: string;
-  resource: { name: string; observation?: unknown; conditions?: unknown };
+  resource: {
+    name: string;
+    observation?: unknown;
+    conditions?: unknown;
+    localLabels?: unknown;
+  };
 }
+
+/** Label on an enrolled cluster that names the hub whose facts it carries. */
+export const HUB_LABEL = "ocm.open-cluster-management.io/hub";
+
+/** Condition of a hub's record with which the hub says a cluster is available. */
+export const HUB_AVAILABLE_CONDITION = "ManagedClusterConditionAvailable";
 
 /** One cluster, whatever its origin, with the hub's record of it if any. */
 export interface FleetClusterRow<T extends ClusterRecord = ClusterRecord> {
@@ -40,10 +51,16 @@ export interface FleetClusterRow<T extends ClusterRecord = ClusterRecord> {
   origin: FleetClusterOrigin;
   /** The cluster's own record, or the hub's record when there is no other. */
   result: T;
-  /** The hub's record of the cluster, when a connected hub has one. */
+  /**
+   * The hub's record of the cluster, when a connected hub has one. When
+   * several hubs report the cluster, the record of the hub whose facts
+   * the cluster carries, or else of the first hub by id.
+   */
   observed?: T;
-  /** Id of the hub that reports the cluster, when one does. */
+  /** Id of the hub of `observed`. */
   hub?: string;
+  /** Ids of every connected hub that reports the cluster, `hub` first. */
+  hubs?: string[];
   /** Whether the resources inside the cluster are indexed. */
   indexed: boolean;
 }
@@ -130,9 +147,23 @@ export function observedClusterRouteId(observed: ClusterRecord): string {
 }
 
 /**
+ * Id of the hub whose facts a cluster's own record carries: the hub label
+ * the cluster was given at enrollment or by a later link. Empty for a
+ * cluster that carries no hub's facts.
+ */
+export function homeHubId(record: ClusterRecord): string {
+  const labels = record.resource.localLabels;
+  if (!labels || typeof labels !== "object") return "";
+  return text((labels as Record<string, unknown>)[HUB_LABEL]);
+}
+
+/**
  * Turns the records of clusters of every origin into one row per cluster.
  * A hub's record folds into the row of the cluster it is linked to, so a
  * cluster that is both known here and reported by a hub appears once.
+ * A cluster that several hubs report appears once as well: with the hub
+ * whose facts it carries, or else the first hub by id, whatever the order
+ * of the records.
  */
 export function mergeFleetClusters<T extends ClusterRecord>(
   results: T[],
@@ -163,7 +194,13 @@ export function mergeFleetClusters<T extends ClusterRecord>(
     const id = observedClusterId(result);
     const known = rows.get(linkedClusterId(result)) ?? rows.get(id);
     if (known) {
-      if (!known.observed) {
+      const home = homeHubId(known.result);
+      const hubs = [...new Set([...(known.hubs ?? []), hub])];
+      hubs.sort(
+        (a, b) => Number(b === home) - Number(a === home) || a.localeCompare(b),
+      );
+      known.hubs = hubs;
+      if (!known.observed || hubs[0] === hub) {
         known.observed = result;
         known.hub = hub;
       }
@@ -175,6 +212,7 @@ export function mergeFleetClusters<T extends ClusterRecord>(
       result,
       observed: result,
       hub,
+      hubs: [hub],
       indexed: false,
     });
   }
@@ -269,5 +307,29 @@ export function observedClusterStatus(
       attention: true,
     };
   }
+  // The hub says Unknown itself once it stops hearing from the cluster;
+  // a cluster it has no word about yet reads the same and is no alarm.
+  if (conditionStatus(record, HUB_AVAILABLE_CONDITION) === "Unknown") {
+    return {
+      text: "Unknown",
+      color: "orange",
+      healthy: false,
+      attention: true,
+    };
+  }
   return { text: "Unknown", color: "grey", healthy: false, attention: false };
+}
+
+/**
+ * What its hub says about a cluster that is also known here in its own
+ * right, when the hub does not report it as available: the state to
+ * show beside the cluster's own. Null while the hub reports the cluster
+ * available, and for a row that is only the hub's record.
+ */
+export function hubReportedProblem(
+  row: FleetClusterRow,
+): FleetClusterStatus | null {
+  if (row.origin === "observed" || !row.observed) return null;
+  const status = observedClusterStatus(row.observed);
+  return status.healthy ? null : status;
 }

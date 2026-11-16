@@ -3,13 +3,13 @@ package ocm
 import (
 	"encoding/base64"
 	"sort"
-	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	kubernetesaddon "github.com/stolostron/ocm-fleet/server/internal/addon/kubernetes"
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
+	"github.com/stolostron/ocm-fleet/server/internal/kubelabels"
 )
 
 // observedCluster is a hub's ManagedCluster as the integration reads
@@ -178,15 +178,12 @@ func (c observedCluster) observation(hubID string, link clusterLink) ManagedClus
 // targetLabels are the hub's facts about the cluster in the form they
 // are put on the target of the enrolled cluster: the hub's labels
 // (which include the cluster set), each claim as "claim.<name>", and
-// the two labels that name the hub and the cluster on it. Entries that
-// cannot be a target label are left out.
+// the labels that name the hub, the cluster on it, and the cluster's
+// set on it. Entries that cannot be a target label are left out.
 func (c observedCluster) targetLabels(hubID string) map[string]string {
 	out := map[string]string{}
 	add := func(k, v string) {
-		if k == "" || len(k) > 317 || strings.ContainsAny(k, " \t\n\r") {
-			return
-		}
-		if len(v) > 253 || strings.ContainsAny(v, "\n\r") {
+		if !kubelabels.Valid(k, v) {
 			return
 		}
 		out[k] = v
@@ -199,5 +196,8 @@ func (c observedCluster) targetLabels(hubID string) map[string]string {
 	}
 	add(LabelHub, hubID)
 	add(LabelManagedCluster, c.name)
+	if c.clusterSet != "" {
+		add(LabelHubClusterSet, hubID+"."+c.clusterSet)
+	}
 	return out
 }

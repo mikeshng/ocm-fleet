@@ -72,6 +72,10 @@ type AddonDeps struct {
 	// TrustBundles returns the trust settings of the configured identity
 	// providers, for targets an add-on registers itself. May be nil.
 	TrustBundles kubernetesaddon.TrustBundleSource
+	// Placement brings fulfillment placement up to date after an add-on
+	// changes the target fleet (a cluster joins, leaves, or changes
+	// labels). May be nil in assemblies without workflows.
+	Placement kubernetesaddon.PlacementReevaluator
 	// Caller returns the authenticated subject of a request context, or
 	// "" for an anonymous one. May be nil.
 	Caller kubernetesaddon.CallerFunc

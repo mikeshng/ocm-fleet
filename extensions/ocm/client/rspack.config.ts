@@ -12,6 +12,7 @@ import {
   getCommonDynamicModules,
   getDynamicModules,
 } from "@ocm-fleet/build-utils";
+import { HUB_TYPE } from "@ocm-fleet/common";
 import type { Configuration } from "@rspack/core";
 import rspack from "@rspack/core";
 import path from "path";
@@ -98,6 +99,7 @@ const OcmPlugin = new FleetPlugin({
       card: { $codeRef: "HubOnboarding.HubOnboardingCard" },
       form: { $codeRef: "HubOnboarding.HubOnboardingForm" },
       overviewCta: "Connect a hub",
+      completeWhenResourceExists: HUB_TYPE,
     }),
     createClusterDetailTab({
       id: "hub-tab",
@@ -110,7 +112,7 @@ const OcmPlugin = new FleetPlugin({
     }),
     createSearchResultRenderer({
       id: "observed-cluster-renderer",
-      label: "Hub cluster",
+      label: "Through a hub",
       resourceType: "ocm.open-cluster-management.io/ManagedCluster",
       resolve: {
         $codeRef: "ObservedClusterSearchResult.resolveObservedCluster",

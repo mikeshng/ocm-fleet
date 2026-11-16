@@ -42,6 +42,14 @@ Other contracts include route groups (`ocm-fleet.route-group`, built with `creat
 
 Sources: [extension types](../../sdk/build-utils/src/extensions/types.ts), [builders](../../sdk/build-utils/src/extensions/builders.ts), [FleetPlugin](../../sdk/build-utils/src/extensions/FleetPlugin.ts), [core plugin declarations](../../extensions/core/client/rspack.config.ts).
 
+## Onboarding actions and live completion
+
+An `ocm-fleet.onboarding-action` contributes a getting-started step: `icon`, `card`, and `form` CodeRefs, with optional `overviewCta` and `category`. A step may also declare `completeWhenResourceExists`, a resource type written as `<group>/<Kind>`. The builder validates the value as a resource type, so a malformed declaration fails the build rather than silently disabling the query.
+
+The getting-started checklist treats such a step as complete when the browser's stored progress says so **or** when a resource of the declared type exists — the OCM hub step, for example, is complete when a hub is connected outside the browser too. The checklist paints only once every existence query has settled; if a query fails, the stored progress alone decides that step. The two signals are ORed and evaluated when the checklist loads, so server presence completes a step only while the resource exists: disconnecting the last hub un-completes the hub step, which writes no stored progress. A step completed through the browser's own flow stays complete after the resource is removed, because its stored progress persists.
+
+Sources: [onboarding action extras](../../sdk/build-utils/src/extensions/types.ts), [property validation](../../sdk/build-utils/src/extensions/validate.ts), [live completion helper](../../extensions/core/client/src/plugins/overview-plugin/liveCompletion.ts), [getting-started checklist](../../extensions/core/client/src/plugins/overview-plugin/SetupChecklist.tsx).
+
 ## Page identity and route ownership
 
 The resource manager server projects route metadata into flat `pluginPages` entries containing `id`, `title`, `path`, `scope`, `module`, and `pluginKey`. The `module` field remains the exposed JavaScript module key, not the route ID.

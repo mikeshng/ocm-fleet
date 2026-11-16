@@ -48,12 +48,35 @@ func TestMain(m *testing.M) {
 }
 
 // recordStore adapts the application's inventory report service, as
-// server composition does.
+// server composition does. A test can make its writes fail.
 type recordStore struct {
 	reports *application.InventoryReportService
+
+	mu      sync.Mutex
+	failing bool
+}
+
+// failWrites makes every later record write fail until allowWrites.
+func (b *recordStore) failWrites() {
+	b.mu.Lock()
+	b.failing = true
+	b.mu.Unlock()
+}
+
+// allowWrites lets record writes through again.
+func (b *recordStore) allowWrites() {
+	b.mu.Lock()
+	b.failing = false
+	b.mu.Unlock()
 }
 
 func (b *recordStore) ReplaceBatch(ctx context.Context, rt domain.ResourceType, reports []kubernetesaddon.InventoryObjectReport) error {
+	b.mu.Lock()
+	failing := b.failing
+	b.mu.Unlock()
+	if failing {
+		return errors.New("records: storage unavailable")
+	}
 	in := application.InventoryReplacementBatchInput{Reports: make([]application.InventoryReplacementInput, len(reports))}
 	for i, r := range reports {
 		name := r.Name
@@ -73,6 +96,70 @@ func (b *recordStore) PurgeCollectionPrefix(ctx context.Context, rt domain.Resou
 	return b.reports.PurgeCollectionPrefix(ctx, rt, prefix)
 }
 
+// gatedVault holds one credential write in flight on demand. A held Put
+// waits regardless of its context: it models a write that has already
+// started and will commit, which stopping the watch cannot undo.
+type gatedVault struct {
+	*sqlite.VaultStore
+
+	mu       sync.Mutex
+	gate     *putGate
+	skip     int
+	failPuts int
+}
+
+// putGate is one held write: entered closes when the write is waiting,
+// release lets it through.
+type putGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (v *gatedVault) Put(ctx context.Context, ref domain.SecretRef, value []byte) error {
+	v.mu.Lock()
+	fail := v.failPuts > 0
+	if fail {
+		v.failPuts--
+	}
+	gate := v.gate
+	if gate != nil {
+		if v.skip > 0 {
+			v.skip--
+			gate = nil
+		} else {
+			v.gate = nil
+		}
+	}
+	v.mu.Unlock()
+	if fail {
+		return errors.New("vault: storage unavailable")
+	}
+	if gate != nil {
+		close(gate.entered)
+		<-gate.release
+	}
+	return v.VaultStore.Put(ctx, ref, value)
+}
+
+// failNextPut makes the next credential write fail.
+func (v *gatedVault) failNextPut() {
+	v.mu.Lock()
+	v.failPuts++
+	v.mu.Unlock()
+}
+
+// holdNextPut holds the Put that follows skip passing writes. The returned
+// channel is closed when the held write enters, and the returned function
+// lets it through.
+func (v *gatedVault) holdNextPut(skip int) (<-chan struct{}, func()) {
+	gate := &putGate{entered: make(chan struct{}), release: make(chan struct{})}
+	v.mu.Lock()
+	v.gate, v.skip = gate, skip
+	v.mu.Unlock()
+	var once sync.Once
+	return gate.entered, func() { once.Do(func() { close(gate.release) }) }
+}
+
 // fakeHub is one hub as the fake clients know it.
 type fakeHub struct {
 	ca      []byte
@@ -86,8 +173,111 @@ type fakeHub struct {
 }
 
 type fakeHubClients struct {
+	mu     sync.Mutex
+	hubs   map[string]*fakeHub
+	gate   *probeGate // when set, Probe blocks until the test releases it
+	badDyn map[string]bool
+}
+
+// failDynamicFor makes building a watch client with token fail, while
+// the hub still recognizes the token when it is probed.
+func (h *harness) failDynamicFor(token string) {
+	h.clients.mu.Lock()
+	if h.clients.badDyn == nil {
+		h.clients.badDyn = map[string]bool{}
+	}
+	h.clients.badDyn[token] = true
+	h.clients.mu.Unlock()
+}
+
+// probeGate holds the first Probe call open so that a test can interleave
+// a second lifecycle operation with it. Later Probe calls pass through: a
+// lifecycle operation that is not serialized behind the first one is then
+// free to run, so a test that asserts it waited really depends on the
+// lifecycle lock and not on the gate.
+type probeGate struct {
+	entered chan struct{}
+	release chan struct{}
+
 	mu   sync.Mutex
-	hubs map[string]*fakeHub
+	held bool
+}
+
+// enter reports whether this Probe call takes the gate. Only the first
+// caller does, and only it waits for release.
+func (g *probeGate) enter() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held {
+		return false
+	}
+	g.held = true
+	close(g.entered)
+	return true
+}
+
+// lifecycleRecorder counts every lifecycle lock attempt, per operation,
+// and wakes waiters on each. It never blocks the service, so a test can
+// install it for the life of the harness without attending to every
+// operation.
+type lifecycleRecorder struct {
+	mu     sync.Mutex
+	counts map[LifecycleOperation]int
+	notify chan struct{}
+}
+
+func newLifecycleRecorder() *lifecycleRecorder {
+	return &lifecycleRecorder{counts: map[LifecycleOperation]int{}, notify: make(chan struct{})}
+}
+
+func (r *lifecycleRecorder) Attempt(op LifecycleOperation) {
+	r.mu.Lock()
+	r.counts[op]++
+	close(r.notify)
+	r.notify = make(chan struct{})
+	r.mu.Unlock()
+}
+
+// waitAttempt waits until op has reached the lifecycle lock n times.
+func (r *lifecycleRecorder) waitAttempt(t *testing.T, op LifecycleOperation, n int) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		r.mu.Lock()
+		got, notify := r.counts[op], r.notify
+		r.mu.Unlock()
+		if got >= n {
+			return
+		}
+		select {
+		case <-notify:
+		case <-deadline:
+			t.Fatalf("only %d %s attempts reached the lifecycle lock, want %d", got, op, n)
+		}
+	}
+}
+
+// blockProbes makes the first Probe call wait. The returned channel is
+// closed when that Probe enters, and the returned function releases it.
+// Later Probe calls pass through; see [probeGate].
+func (h *harness) blockProbes() (<-chan struct{}, func()) {
+	gate := &probeGate{entered: make(chan struct{}), release: make(chan struct{})}
+	h.clients.mu.Lock()
+	h.clients.gate = gate
+	h.clients.mu.Unlock()
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			h.clients.mu.Lock()
+			if h.clients.gate == gate {
+				h.clients.gate = nil
+			}
+			h.clients.mu.Unlock()
+			close(gate.release)
+		})
+	}
+	h.t.Cleanup(release)
+	return gate.entered, release
 }
 
 func (f *fakeHubClients) lookup(conn HubConnection) (*fakeHub, error) {
@@ -103,7 +293,17 @@ func (f *fakeHubClients) lookup(conn HubConnection) (*fakeHub, error) {
 	return hub, nil
 }
 
-func (f *fakeHubClients) Probe(_ context.Context, conn HubConnection) (HubProbe, error) {
+func (f *fakeHubClients) Probe(ctx context.Context, conn HubConnection) (HubProbe, error) {
+	f.mu.Lock()
+	gate := f.gate
+	f.mu.Unlock()
+	if gate != nil && gate.enter() {
+		select {
+		case <-gate.release:
+		case <-ctx.Done():
+			return HubProbe{}, ctx.Err()
+		}
+	}
 	hub, err := f.lookup(conn)
 	if err != nil {
 		return HubProbe{}, err
@@ -119,6 +319,12 @@ func (f *fakeHubClients) Probe(_ context.Context, conn HubConnection) (HubProbe,
 }
 
 func (f *fakeHubClients) Dynamic(conn HubConnection, _ func() string) (dynamic.Interface, error) {
+	f.mu.Lock()
+	bad := f.badDyn[conn.Token]
+	f.mu.Unlock()
+	if bad {
+		return nil, errors.New("build hub client: the credential was refused")
+	}
 	hub, err := f.lookup(conn)
 	if err != nil {
 		return nil, err
@@ -155,24 +361,26 @@ type fakeProber struct {
 }
 
 type fakeCluster struct {
-	ca     []byte
+	ca []byte
+	// uid is what the cluster reports as its own identifier.
+	uid    string
 	tokens map[string]struct{}
 }
 
-func (p *fakeProber) check(conn kubernetesaddon.ClusterConnection) error {
+func (p *fakeProber) check(conn kubernetesaddon.ClusterConnection) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c, ok := p.clusters[conn.APIServer]
 	if !ok {
-		return fmt.Errorf("dial %s: no such host", conn.APIServer)
+		return "", fmt.Errorf("dial %s: no such host", conn.APIServer)
 	}
 	if !kubernetesaddon.SameCA(conn.CACert, c.ca) {
-		return errors.New("x509: certificate signed by unknown authority")
+		return "", errors.New("x509: certificate signed by unknown authority")
 	}
 	if _, ok := c.tokens[conn.Token]; !ok {
-		return fmt.Errorf("probe: %w", kubernetesaddon.ErrClusterRejectedCredential)
+		return "", fmt.Errorf("probe: %w", kubernetesaddon.ErrClusterRejectedCredential)
 	}
-	return nil
+	return c.uid, nil
 }
 
 var accessAccount = kubernetesaddon.ServiceAccountRef{
@@ -182,13 +390,15 @@ var accessAccount = kubernetesaddon.ServiceAccountRef{
 const accessUser = "system:serviceaccount:" + kubernetesaddon.AccessNamespace + ":" + kubernetesaddon.AccessServiceAccount
 
 func (p *fakeProber) Probe(_ context.Context, conn kubernetesaddon.ClusterConnection) (kubernetesaddon.ClusterProbeResult, error) {
-	if err := p.check(conn); err != nil {
+	uid, err := p.check(conn)
+	if err != nil {
 		return kubernetesaddon.ClusterProbeResult{}, err
 	}
 	out := kubernetesaddon.ClusterProbeResult{
 		Username:          accessUser,
 		ServiceAccount:    accessAccount,
 		KubernetesVersion: "v1.37.0",
+		ClusterUID:        uid,
 		Rights:            kubernetesaddon.ClusterRights{Workloads: true, Namespaces: true, ReadCluster: true, CanRenew: true},
 	}
 	out.TokenIssuedAt, out.TokenExpiresAt = kubernetesaddon.TokenLifetime(conn.Token)
@@ -196,7 +406,7 @@ func (p *fakeProber) Probe(_ context.Context, conn kubernetesaddon.ClusterConnec
 }
 
 func (p *fakeProber) Identity(_ context.Context, conn kubernetesaddon.ClusterConnection) (string, error) {
-	if err := p.check(conn); err != nil {
+	if _, err := p.check(conn); err != nil {
 		return "", err
 	}
 	return accessUser, nil
@@ -252,6 +462,7 @@ type harness struct {
 	ctx        context.Context
 	store      *sqlite.Store
 	vault      *sqlite.VaultStore
+	gated      *gatedVault
 	records    *recordStore
 	clients    *fakeHubClients
 	prober     *fakeProber
@@ -259,6 +470,7 @@ type harness struct {
 	svc        *Service
 	hub        *fakeHub
 	hubCA      []byte
+	attempts   *lifecycleRecorder
 }
 
 func newHarness(t *testing.T) *harness {
@@ -284,16 +496,18 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	h := &harness{
-		t:       t,
-		ctx:     ctx,
-		store:   store,
-		vault:   &sqlite.VaultStore{DB: db},
-		records: &recordStore{reports: application.NewInventoryReportService(store)},
-		clients: &fakeHubClients{hubs: map[string]*fakeHub{}},
-		prober:  &fakeProber{clusters: map[string]*fakeCluster{}},
-		hubCA:   testCA(t, "hub"),
+		t:        t,
+		ctx:      ctx,
+		store:    store,
+		vault:    &sqlite.VaultStore{DB: db},
+		records:  &recordStore{reports: application.NewInventoryReportService(store)},
+		clients:  &fakeHubClients{hubs: map[string]*fakeHub{}},
+		prober:   &fakeProber{clusters: map[string]*fakeCluster{}},
+		hubCA:    testCA(t, "hub"),
+		attempts: newLifecycleRecorder(),
 	}
 	h.hub = h.addHub(hubAPI, h.hubCA, hubToken)
+	h.gated = &gatedVault{VaultStore: h.vault}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h.enrollment = kubernetesaddon.NewEnrollmentService(kubernetesaddon.EnrollmentDeps{
 		Store: store, Vault: h.vault, Records: h.records, Prober: h.prober, Logger: logger,
@@ -311,8 +525,8 @@ func newHarness(t *testing.T) *harness {
 func (h *harness) newService() *Service {
 	h.t.Helper()
 	svc := NewService(Deps{
-		Store: h.store, Vault: h.vault, Records: h.records, Enrollment: h.enrollment, Clients: h.clients,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Store: h.store, Vault: h.gated, Records: h.records, Enrollment: h.enrollment, Clients: h.clients,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), LifecycleProbe: h.attempts,
 	})
 	if err := svc.Start(h.ctx); err != nil {
 		h.t.Fatalf("Start: %v", err)
@@ -328,6 +542,7 @@ func (h *harness) addHub(api string, ca []byte, token string) *fakeHub {
 		tokens: map[string]HubProbe{token: {
 			Username:       "system:serviceaccount:" + HubReaderNamespace + ":" + HubReaderServiceAccount,
 			ServiceAccount: hubReader,
+			ClusterUID:     "kube-system-of-" + api,
 			CanRead:        true,
 			CanRenew:       true,
 		}},
@@ -346,15 +561,40 @@ func (h *harness) addHub(api string, ca []byte, token string) *fakeHub {
 
 func (h *harness) connect(hubID string) HubRecord {
 	h.t.Helper()
-	rec, err := h.svc.Connect(h.ctx, ConnectRequest{
-		HubID:      hubID,
-		Connection: HubConnection{APIServer: hubAPI, CACert: string(h.hubCA), Token: hubToken},
-		Actor:      "ops@example.test",
-	})
+	rec, err := h.connectHub(hubID, hubAPI, h.hubCA, hubToken)
 	if err != nil {
 		h.t.Fatalf("Connect(%s): %v", hubID, err)
 	}
 	return rec
+}
+
+// connectHub connects the hub at api under hubID.
+func (h *harness) connectHub(hubID, api string, ca []byte, token string) (HubRecord, error) {
+	h.t.Helper()
+	return h.svc.Connect(h.ctx, ConnectRequest{
+		HubID:      hubID,
+		Connection: HubConnection{APIServer: api, CACert: string(ca), Token: token},
+		Actor:      "ops@example.test",
+	})
+}
+
+// alsoAt makes a hub answer at a second address as well: the same
+// cluster, with the same CA and the same accounts.
+func (h *harness) alsoAt(api string, hub *fakeHub) {
+	h.clients.mu.Lock()
+	h.clients.hubs[api] = hub
+	h.clients.mu.Unlock()
+}
+
+// withoutIdentifier makes the hub's accounts unable to read the hub's
+// identifier, as an account made from an earlier access manifest is.
+func (hub *fakeHub) withoutIdentifier() {
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	for token, probe := range hub.tokens {
+		probe.ClusterUID = ""
+		hub.tokens[token] = probe
+	}
 }
 
 // clusterOption changes a ManagedCluster object before it is created.
@@ -371,10 +611,27 @@ func withLabels(labels map[string]string) clusterOption {
 }
 
 func withClientConfig(url string, ca []byte) clusterOption {
+	return withClientConfigs(recordedAddress{url: url, ca: ca})
+}
+
+// recordedAddress is one client config of a ManagedCluster: an API
+// address and the CA bundle the hub recorded for it. A nil CA records
+// the address without one, as a registration agent that was given only
+// the address does.
+type recordedAddress struct {
+	url string
+	ca  []byte
+}
+
+func withClientConfigs(addresses ...recordedAddress) clusterOption {
 	return func(obj map[string]any) {
-		obj["spec"].(map[string]any)["managedClusterClientConfigs"] = []any{map[string]any{
-			"url": url, "caBundle": base64.StdEncoding.EncodeToString(ca),
-		}}
+		configs := make([]any, 0, len(addresses))
+		for _, a := range addresses {
+			configs = append(configs, map[string]any{
+				"url": a.url, "caBundle": base64.StdEncoding.EncodeToString(a.ca),
+			})
+		}
+		obj["spec"].(map[string]any)["managedClusterClientConfigs"] = configs
 	}
 }
 
@@ -416,7 +673,13 @@ func managedCluster(name string, opts ...clusterOption) *unstructured.Unstructur
 
 func (h *harness) createCluster(obj *unstructured.Unstructured) {
 	h.t.Helper()
-	if _, err := h.hub.client.Resource(managedClusterGVR).Create(h.ctx, obj, metav1.CreateOptions{}); err != nil {
+	h.createClusterOn(h.hub, obj)
+}
+
+// createClusterOn creates a ManagedCluster on the given hub.
+func (h *harness) createClusterOn(hub *fakeHub, obj *unstructured.Unstructured) {
+	h.t.Helper()
+	if _, err := hub.client.Resource(managedClusterGVR).Create(h.ctx, obj, metav1.CreateOptions{}); err != nil {
 		h.t.Fatalf("create ManagedCluster %s: %v", obj.GetName(), err)
 	}
 }
@@ -538,6 +801,7 @@ func (h *harness) addCreatedTarget(name, apiServer string, ca []byte) domain.Tar
 
 // addRealCluster makes a cluster exist for the enrollment prober and
 // returns its API address, its CA, and a token of its access account.
+// The cluster reports [clusterUIDOf] as its own identifier.
 func (h *harness) addRealCluster(name string) (apiServer string, ca []byte, token string) {
 	h.t.Helper()
 	apiServer = "https://" + name + ".test:6443"
@@ -545,9 +809,20 @@ func (h *harness) addRealCluster(name string) (apiServer string, ca []byte, toke
 	now := time.Now()
 	token = makeToken(name+"-access", now, now.Add(12*time.Hour))
 	h.prober.mu.Lock()
-	h.prober.clusters[apiServer] = &fakeCluster{ca: ca, tokens: map[string]struct{}{token: {}}}
+	h.prober.clusters[apiServer] = &fakeCluster{ca: ca, uid: clusterUIDOf(name), tokens: map[string]struct{}{token: {}}}
 	h.prober.mu.Unlock()
 	return apiServer, ca, token
+}
+
+// clusterUIDOf is the identifier the real cluster of that name reports.
+func clusterUIDOf(name string) string { return "kube-system-of-" + name }
+
+// clusterAlsoAt makes the real cluster at apiServer answer at a second
+// address as well.
+func (h *harness) clusterAlsoAt(second, apiServer string) {
+	h.prober.mu.Lock()
+	defer h.prober.mu.Unlock()
+	h.prober.clusters[second] = h.prober.clusters[apiServer]
 }
 
 // eventually polls cond until it holds or the test fails.

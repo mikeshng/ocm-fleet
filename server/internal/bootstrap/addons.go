@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -62,6 +63,9 @@ func assembleProductionAddons(
 		if deps.Indexing != nil {
 			kindOpts = append(kindOpts, kindaddon.WithIndexingRuntime(deps.Indexing.Runtime))
 		}
+		if deps.TrustBundles != nil {
+			kindOpts = append(kindOpts, kindaddon.WithTrustBundleSource(kindaddon.TrustBundleSource(deps.TrustBundles)))
+		}
 		if destination := strings.TrimSpace(os.Getenv(kindaddon.LoopbackForwardToEnv)); destination != "" {
 			fwd, err := kindaddon.NewLoopbackForward(destination)
 			if err != nil {
@@ -83,7 +87,7 @@ func assembleProductionAddons(
 		if kindAgent == nil {
 			return nil, fmt.Errorf("kind delivery agent is nil")
 		}
-		specs = append(specs, AddonSpec{
+		kindSpec := AddonSpec{
 			Descriptor: kindaddon.Descriptor(),
 			Connect: application.ConnectInput{
 				Agent: kindAgent,
@@ -98,12 +102,35 @@ func assembleProductionAddons(
 				)},
 				Schemas: []domain.ExtensionResourceSchema{kindaddon.Schema(), kindaddon.NodeSchema()},
 			},
-		})
+			Close: kindAgent.Close,
+		}
+		if deps.TrustBundles != nil {
+			// The platform records a trust-bundle delivery as delivered
+			// and does not repeat it, so a new process restores the
+			// configured identity providers before it can provision a
+			// cluster that must accept their tokens.
+			kindSpec.AfterConnect = func(ctx context.Context) error {
+				return kindAgent.RestoreTrustBundles(ctx)
+			}
+		}
+		if deps.Store != nil {
+			// A delivery acknowledged before a restart has no process
+			// left to report its outcome. Re-dispatch what is still
+			// non-terminal for this add-on's targets; cluster creation
+			// and applies are safe to repeat.
+			kindSpec.AfterConnectBestEffort = func(ctx context.Context) error {
+				return recoverDeliveryAgent(ctx, deps.DeliveryReporter,
+					storeTargetLister{store: deps.Store}, kindAgent, kindaddon.TargetType)
+			}
+		}
+		specs = append(specs, kindSpec)
 	}
 
 	// enrollment is the kubernetes add-on's capability to take existing
-	// clusters in. The OCM integration, assembled below, builds on it.
+	// clusters in, and deliveries its delivery agent. The OCM
+	// integration, assembled below, builds on both.
 	var enrollment *kubernetesEnrollment
+	var deliveries *kubernetesaddon.DeliveryAgent
 	if enabled[AddonKubernetes] {
 		kubeAgentOpts := []kubernetesaddon.DeliveryAgentOption{
 			kubernetesaddon.WithKeyResolver(keyResolver),
@@ -116,6 +143,7 @@ func assembleProductionAddons(
 		if kubeAgent == nil {
 			return nil, fmt.Errorf("kubernetes delivery agent is nil")
 		}
+		deliveries = kubeAgent
 		spec := AddonSpec{
 			Descriptor: kubernetesaddon.Descriptor(),
 			Connect: application.ConnectInput{
@@ -123,16 +151,36 @@ func assembleProductionAddons(
 				Schemas: kubernetesaddon.Schemas(),
 			},
 		}
+		if deps.Store != nil {
+			// A delivery acknowledged before a restart has no process
+			// left to report its outcome, and the platform waits for
+			// that signal. Re-dispatch what is still non-terminal for
+			// this add-on's targets; the applies and removals are safe
+			// to repeat.
+			spec.AfterConnectBestEffort = func(ctx context.Context) error {
+				return kubeAgent.RecoverActiveDeliveries(ctx, storeTargetLister{store: deps.Store})
+			}
+		}
+		// Stop new dispatches and join the deliveries already running
+		// before the enrollment worker's own close hook runs.
+		var enrollmentClose func(context.Context) error
+		spec.Close = func(ctx context.Context) error {
+			agentErr := kubeAgent.Close(ctx)
+			if enrollmentClose == nil {
+				return agentErr
+			}
+			return errors.Join(agentErr, enrollmentClose(ctx))
+		}
 		if enrollment = newKubernetesEnrollment(deps); enrollment != nil {
 			spec.AfterConnect = enrollment.start
-			spec.Close = enrollment.worker.Close
+			enrollmentClose = enrollment.worker.Close
 			spec.HTTPRoutes = enrollment.http.Register
 		}
 		specs = append(specs, spec)
 	}
 
 	if enabled[AddonOCM] {
-		if spec, ok := newOCMIntegration(deps, enrollment); ok {
+		if spec, ok := newOCMIntegration(deps, enrollment, deliveries); ok {
 			specs = append(specs, spec)
 		}
 	}
@@ -168,9 +216,65 @@ func assembleProductionAddons(
 			},
 			Close: scriptedAgent.Close,
 		})
+		if deps.Store != nil {
+			// A delivery acknowledged before a restart has no process
+			// left to report its outcome. Re-dispatch what is still
+			// non-terminal for this add-on's target; the planner and the
+			// per-resource dispatch slots make a replay safe.
+			specs[len(specs)-1].AfterConnectBestEffort = func(ctx context.Context) error {
+				return recoverDeliveryAgent(ctx, deps.DeliveryReporter,
+					storeTargetLister{store: deps.Store}, scriptedAgent, scripted.TargetType)
+			}
+		}
 	}
 
 	return specs, nil
+}
+
+// recoverDeliveryAgent re-dispatches the non-terminal deliveries of one
+// add-on's targets to its agent. It runs once after connect: a delivery
+// acknowledged before a restart has no process left to report its
+// outcome, and the fulfillment workflow waits for that report. Agents
+// deduplicate a re-dispatch of work they are already running, so a
+// delivery that also arrives through the normal dispatch path is safe.
+func recoverDeliveryAgent(
+	ctx context.Context,
+	reporter domain.DeliveryReporter,
+	lister storeTargetLister,
+	agent domain.DeliveryAgent,
+	targetType domain.TargetType,
+) error {
+	targets, err := lister.ListTargets(ctx)
+	if err != nil {
+		return fmt.Errorf("list targets: %w", err)
+	}
+	targetIDs := make([]domain.TargetID, 0, len(targets))
+	for _, t := range targets {
+		if t.Type() == targetType {
+			targetIDs = append(targetIDs, t.ID())
+		}
+	}
+	if len(targetIDs) == 0 {
+		return nil
+	}
+	active, err := reporter.ListActiveDeliveries(ctx, targetIDs)
+	if err != nil {
+		return fmt.Errorf("list active deliveries: %w", err)
+	}
+	var errs []error
+	for _, d := range active {
+		delivery := d.Delivery
+		var dispatchErr error
+		if delivery.Operation() == domain.DeliveryOperationRemove {
+			dispatchErr = agent.Remove(ctx, d.Target, delivery.ID(), delivery.Manifests(), d.Auth, d.Attestation, delivery.Generation())
+		} else {
+			dispatchErr = agent.Deliver(ctx, d.Target, delivery.ID(), delivery.Manifests(), d.Auth, d.Attestation, delivery.Generation())
+		}
+		if dispatchErr != nil {
+			errs = append(errs, fmt.Errorf("recover delivery %s: %w", delivery.ID(), dispatchErr))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // enableAndConnectAddons runs Enable/Connect and post-connect hooks for each

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash"
 	"slices"
+	"strings"
 )
 
 // Etag returns a weak domain-state concurrency token (RFC 9110 Section
@@ -71,6 +72,27 @@ func hashExtensionResourceFields(h hash.Hash, v ExtensionResourceView) {
 func hashDeploymentFields(h hash.Hash, v DeploymentView) {
 	hashString(h, string(v.Deployment.name))
 	hashString(h, v.Deployment.uid.String())
+
+	// Target delivery status is API-visible; hash it so clients observe
+	// a new etag when a delivery changes state, switches operation, or
+	// reports a failure.
+	// Sort by target ID first so the token does not depend on the order
+	// in which the repository returned the records.
+	deliveries := slices.Clone(v.Deliveries)
+	slices.SortFunc(deliveries, func(a, b Delivery) int {
+		return strings.Compare(string(a.targetID), string(b.targetID))
+	})
+	binary.Write(h, binary.BigEndian, int64(len(deliveries)))
+	for _, d := range deliveries {
+		hashString(h, string(d.targetID))
+		hashString(h, string(d.state))
+		hashString(h, string(d.operation))
+		hashString(h, d.message)
+		binary.Write(h, binary.BigEndian, int64(d.attempts))
+		// update_time is API-visible and changes on a same-generation retry
+		// that leaves state and attempts unchanged (Pending re-dispatch).
+		binary.Write(h, binary.BigEndian, d.updatedAt.UnixNano())
+	}
 }
 
 func hashFulfillmentFields(h hash.Hash, f Fulfillment) {

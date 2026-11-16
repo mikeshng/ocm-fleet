@@ -1,5 +1,14 @@
-import { Alert, Form, FormGroup, TextInput } from "@patternfly/react-core";
+import {
+  Alert,
+  Form,
+  FormGroup,
+  FormHelperText,
+  HelperText,
+  HelperTextItem,
+  TextInput,
+} from "@patternfly/react-core";
 
+import { kindClusterNameError } from "./api";
 import type { ClusterFormData } from "./CreateClusterWizard";
 
 interface ClusterDetailsStepProps {
@@ -14,6 +23,7 @@ export default function ClusterDetailsStep({
   formData,
   onChange,
 }: ClusterDetailsStepProps) {
+  const nameError = kindClusterNameError(formData.name.trim());
   return (
     <Form>
       <Alert variant="info" isInline isPlain title="">
@@ -28,8 +38,19 @@ export default function ClusterDetailsStep({
           value={formData.name}
           onChange={(_e, val) => onChange("name", val)}
           placeholder="my-cluster"
-          validated={formData.name.trim() ? "default" : "error"}
+          validated={formData.name.trim() && nameError ? "error" : "default"}
         />
+        {nameError && (
+          <FormHelperText>
+            <HelperText>
+              <HelperTextItem
+                variant={formData.name.trim() ? "error" : "indeterminate"}
+              >
+                {nameError}
+              </HelperTextItem>
+            </HelperText>
+          </FormHelperText>
+        )}
       </FormGroup>
 
       <FormGroup label="Node image" fieldId="node-image">

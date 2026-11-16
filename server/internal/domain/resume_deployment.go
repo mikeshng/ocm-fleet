@@ -57,7 +57,14 @@ func (s *ResumeDeploymentWorkflowSpec) MutateToResumed() Activity[ResumeDeployme
 
 		// Etag check: construct the view and compare against the client's
 		// token. This covers all domain-visible state, not just generation.
-		currentView := DeploymentView{Deployment: dep, Fulfillment: *f}
+		// Deliveries are part of the view (and its etag), so load them
+		// here; otherwise a client token computed from a full read never
+		// matches and every resume is rejected as stale.
+		deliveries, err := tx.Deliveries().ListByFulfillment(ctx, dep.FulfillmentID())
+		if err != nil {
+			return deploymentMutationResult{}, fmt.Errorf("list deliveries: %w", err)
+		}
+		currentView := DeploymentView{Deployment: dep, Fulfillment: *f, Deliveries: deliveries}
 		if in.Etag != "" && in.Etag != currentView.Etag() {
 			return deploymentMutationResult{}, TerminalError(fmt.Errorf(
 				"%w: etag mismatch (client sent %q, current is %q)",
@@ -109,7 +116,7 @@ func (s *ResumeDeploymentWorkflowSpec) MutateToResumed() Activity[ResumeDeployme
 			return deploymentMutationResult{}, fmt.Errorf("commit: %w", err)
 		}
 		return deploymentMutationResult{
-			View:          DeploymentView{Deployment: dep, Fulfillment: *f},
+			View:          DeploymentView{Deployment: dep, Fulfillment: *f, Deliveries: deliveries},
 			FulfillmentID: dep.FulfillmentID(),
 			MyGen:         f.Generation(),
 		}, nil

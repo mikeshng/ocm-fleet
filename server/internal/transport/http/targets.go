@@ -60,6 +60,9 @@ type targetJSON struct {
 // with its labels, state, and descriptive properties.
 func NewTargetsHandler(lister TargetLister, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set before the read so the failure answer carries it too: the
+		// document promises every answer on this route is uncached.
+		w.Header().Set("Cache-Control", "no-store")
 		targets, err := lister.List(r.Context())
 		if err != nil {
 			logger.ErrorContext(r.Context(), "list targets", "error", err)
@@ -105,7 +108,6 @@ func NewTargetsHandler(lister TargetLister, logger *slog.Logger) http.Handler {
 			})
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]any{"targets": out})
 	})
 }

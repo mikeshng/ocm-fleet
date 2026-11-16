@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -92,6 +93,104 @@ func TestDeploymentView_Etag_ChangesOnStateChange(t *testing.T) {
 		v.Fulfillment = fulfillmentValue(snap)
 		if v.Etag() == baseEtag {
 			t.Error("etag should change when resolved targets change")
+		}
+	})
+}
+
+func TestDeploymentView_Etag_ChangesOnDeliveryStatus(t *testing.T) {
+	deliveryWithOperation := func(target TargetID, state DeliveryState, operation DeliveryOperation, message string, attempts int) Delivery {
+		return DeliveryFromSnapshot(DeliverySnapshot{
+			ID:            DeliveryID("f-1:" + string(target)),
+			FulfillmentID: "f-1",
+			TargetID:      target,
+			Generation:    1,
+			State:         state,
+			Operation:     operation,
+			Message:       message,
+			Attempts:      attempts,
+		})
+	}
+	delivery := func(target TargetID, state DeliveryState, message string, attempts int) Delivery {
+		return deliveryWithOperation(target, state, DeliveryOperationDeliver, message, attempts)
+	}
+	base := DeploymentView{
+		Deployment:  DeploymentFromSnapshot(DeploymentSnapshot{Name: "deployments/dep-1", UID: NewDeploymentUID()}),
+		Fulfillment: fulfillmentValue(FulfillmentSnapshot{ID: "f-1", Generation: 1, State: FulfillmentStateActive}),
+		Deliveries:  []Delivery{delivery("t2", DeliveryStateProgressing, "", 0), delivery("t1", DeliveryStateDelivered, "", 0)},
+	}
+	baseEtag := base.Etag()
+
+	t.Run("state change", func(t *testing.T) {
+		v := base
+		v.Deliveries = []Delivery{delivery("t2", DeliveryStateFailed, "", 0), delivery("t1", DeliveryStateDelivered, "", 0)}
+		if v.Etag() == baseEtag {
+			t.Error("etag should change when a delivery state changes")
+		}
+	})
+
+	t.Run("failure message change", func(t *testing.T) {
+		v := base
+		v.Deliveries = []Delivery{
+			delivery("t2", DeliveryStateProgressing, "", 0),
+			delivery("t1", DeliveryStateDelivered, "", 0),
+		}
+		v.Deliveries[0] = delivery("t2", DeliveryStateProgressing, "apply failed", 0)
+		if v.Etag() == baseEtag {
+			t.Error("etag should change when a delivery reports a failure message")
+		}
+	})
+
+	t.Run("attempts change", func(t *testing.T) {
+		v := base
+		v.Deliveries = []Delivery{delivery("t2", DeliveryStateProgressing, "", 1), delivery("t1", DeliveryStateDelivered, "", 0)}
+		if v.Etag() == baseEtag {
+			t.Error("etag should change when a delivery attempt is counted")
+		}
+	})
+
+	t.Run("update time change", func(t *testing.T) {
+		v := base
+		v.Deliveries = []Delivery{
+			DeliveryFromSnapshot(DeliverySnapshot{
+				ID:            "f-1:t2",
+				FulfillmentID: "f-1",
+				TargetID:      "t2",
+				Generation:    1,
+				State:         DeliveryStateProgressing,
+				Operation:     DeliveryOperationDeliver,
+				UpdatedAt:     time.Unix(1, 0).UTC(),
+			}),
+			delivery("t1", DeliveryStateDelivered, "", 0),
+		}
+		if v.Etag() == baseEtag {
+			t.Error("etag should change when a delivery's update time changes")
+		}
+	})
+
+	t.Run("operation change", func(t *testing.T) {
+		v := base
+		v.Deliveries = []Delivery{
+			delivery("t2", DeliveryStateProgressing, "", 0),
+			deliveryWithOperation("t1", DeliveryStateDelivered, DeliveryOperationRemove, "", 0),
+		}
+		if v.Etag() == baseEtag {
+			t.Error("etag should change when a delivery operation changes")
+		}
+	})
+
+	t.Run("target added", func(t *testing.T) {
+		v := base
+		v.Deliveries = append(slices.Clone(base.Deliveries), delivery("t3", DeliveryStatePending, "", 0))
+		if v.Etag() == baseEtag {
+			t.Error("etag should change when a delivery target is added")
+		}
+	})
+
+	t.Run("order independent", func(t *testing.T) {
+		v := base
+		v.Deliveries = []Delivery{delivery("t1", DeliveryStateDelivered, "", 0), delivery("t2", DeliveryStateProgressing, "", 0)}
+		if v.Etag() != baseEtag {
+			t.Error("etag should be order-independent for the same delivery set")
 		}
 	})
 }

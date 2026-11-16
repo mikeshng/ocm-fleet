@@ -6,6 +6,7 @@ import (
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/authmethodrepotest"
+	"github.com/stolostron/ocm-fleet/server/internal/domain/deliverycompletionrepotest"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/deliveryrepotest"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/deploymentrepotest"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/extensionresourcerepotest"
@@ -68,6 +69,18 @@ func TestDeliveryRepo(t *testing.T) {
 		}
 		t.Cleanup(tx.RollbackOnExit)
 		return tx.Deliveries()
+	})
+}
+
+func TestDeliveryCompletionRepo(t *testing.T) {
+	deliverycompletionrepotest.Run(t, func(t *testing.T) domain.DeliveryCompletionRepository {
+		store := beginTestTx(t)
+		tx, err := store.Begin(context.Background())
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		t.Cleanup(tx.RollbackOnExit)
+		return tx.DeliveryCompletions()
 	})
 }
 

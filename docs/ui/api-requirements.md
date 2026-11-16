@@ -45,7 +45,9 @@ GET /apis/open-cluster-management.io/v1alpha/targets
 
 The OCM hubs plugin calls the operations that the resource manager's OCM add-on serves under `/apis/ocm.open-cluster-management.io/v1alpha`. It reads the manifest that a hub's administrator applies before connecting, connects and disconnects a hub, and asks for the manifests that enroll a hub's clusters. The console shows those manifests for an administrator to apply; it does not write to a hub or to a cluster. Connected hubs and their clusters are read through the resource query API, not through these operations.
 
-Sources: [targets client](../../extensions/core/client/src/plugins/management-plugin/api.ts), [hub operations client](../../extensions/ocm/client/src/api.ts).
+The core plugin calls the Kubernetes add-on's enrollment operations under `/apis/kubernetes.open-cluster-management.io/v1alpha`: renewing an enrolled cluster's credential (`POST clusters/{id}:renewCredential`), withdrawing one (`POST clusters/{id}:withdraw`, retried with `leaveDeployments` when deployments still resolve to it), forgetting a withdrawn record (`DELETE clusters/{id}`), and generating a manifest bundle for a cluster with no hub (`POST enrollmentBundles`, with `DELETE enrollmentBundles/{id}` to revoke it). These handlers answer a failure with the add-on's own envelope `{error, reason, details}`, not an RPC status. The shared client keeps that body, so a caller reads the server's sentence, the stable reason word, and the details — the deployment names and target of a withdrawal refusal, for example.
+
+Sources: [targets client](../../extensions/core/client/src/plugins/management-plugin/api.ts), [hub operations client](../../extensions/ocm/client/src/api.ts), [enrollment client](../../extensions/core/client/src/plugins/core-plugin/enrollmentApi.ts), [withdrawal dialog](../../extensions/core/client/src/plugins/core-plugin/WithdrawClusterModal.tsx), [manifest enrollment dialog](../../extensions/core/client/src/plugins/core-plugin/EnrollManifestModal.tsx).
 
 ## Live target access: established design direction
 

@@ -2,6 +2,7 @@ package kind_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"buf.build/go/protovalidate"
@@ -73,6 +74,23 @@ func TestSchema_IncludesInventory(t *testing.T) {
 	}
 	if s.Management == nil {
 		t.Fatal("Schema().Management is nil")
+	}
+}
+
+func TestSchema_ValidateIDMatchesProviderNames(t *testing.T) {
+	s := kindaddon.Schema()
+	if s.Management == nil || s.Management.ValidateID == nil {
+		t.Fatal("Schema().Management.ValidateID is nil")
+	}
+	for _, id := range []string{"demo", "my-cluster", "a.b"} {
+		if err := s.Management.ValidateID(id); err != nil {
+			t.Errorf("ValidateID(%q) = %v, want nil", id, err)
+		}
+	}
+	for _, id := range []string{"", "My_Cluster", strings.Repeat("a", 40)} {
+		if err := s.Management.ValidateID(id); err == nil {
+			t.Errorf("ValidateID(%q) = nil, want a refusal", id)
+		}
 	}
 }
 

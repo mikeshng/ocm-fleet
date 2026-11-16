@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -105,7 +106,6 @@ func TestBuildAccessPiece_ClusterRoleNeverReadsSecrets(t *testing.T) {
 				continue
 			}
 			rules, _ := obj["rules"].([]any)
-			writesNamespaces := false
 			for _, r := range rules {
 				rule, _ := r.(map[string]any)
 				groups, _ := rule["apiGroups"].([]any)
@@ -122,17 +122,60 @@ func TestBuildAccessPiece_ClusterRoleNeverReadsSecrets(t *testing.T) {
 					}
 				}
 				for _, v := range verbs {
-					if v == "create" {
-						writesNamespaces = true
-					}
-					if v == "delete" || v == "*" {
+					if v == "*" {
 						t.Errorf("profile %s: generated cluster role grants %v", profile, v)
 					}
 				}
 			}
-			if writesNamespaces != (profile == AccessProfileWorkloads) {
-				t.Errorf("profile %s: namespace creation granted = %v", profile, writesNamespaces)
+		}
+	}
+}
+
+// A deployment may bring its namespace, and removing a deployment
+// removes what it applied. So the generated cluster role of the
+// workloads profile may create, change, and delete namespaces, and
+// writes nothing else; without the right to delete, a namespace the
+// profile let a deployment create could never be removed again, and
+// the removal would stop at the cluster's refusal. The read-only
+// profile writes nothing at all.
+func TestBuildAccessPiece_NamespaceRights(t *testing.T) {
+	want := map[string]string{
+		AccessProfileWorkloads: "create,update,patch,delete",
+		AccessProfileReadOnly:  "",
+	}
+	for profile, wantVerbs := range want {
+		piece, err := BuildAccessPiece(agentOptions(profile))
+		if err != nil {
+			t.Fatalf("BuildAccessPiece: %v", err)
+		}
+		var written []string
+		for _, obj := range piece.Access {
+			if obj["kind"] != "ClusterRole" {
+				continue
 			}
+			rules, _ := obj["rules"].([]any)
+			for _, r := range rules {
+				rule, _ := r.(map[string]any)
+				verbs, _ := rule["verbs"].([]any)
+				var writes []string
+				for _, v := range verbs {
+					if v != "get" && v != "list" && v != "watch" {
+						writes = append(writes, fmt.Sprint(v))
+					}
+				}
+				if len(writes) == 0 {
+					continue
+				}
+				groups, _ := rule["apiGroups"].([]any)
+				resources, _ := rule["resources"].([]any)
+				if len(groups) != 1 || groups[0] != "" || len(resources) != 1 || resources[0] != "namespaces" {
+					t.Errorf("profile %s: generated cluster role grants %v on %v %v; only namespaces may be written", profile, writes, groups, resources)
+				}
+				written = append(written, writes...)
+			}
+		}
+		if got := strings.Join(written, ","); got != wantVerbs {
+			t.Errorf("profile %s: verbs that write namespaces = %q, want %q", profile, got, wantVerbs)
 		}
 	}
 }
@@ -340,6 +383,16 @@ func TestHelpers(t *testing.T) {
 		if SameCA(a, []byte("junk")) || SameCA(nil, nil) {
 			t.Error("SameCA matched unparseable input")
 		}
+		ab := append(append([]byte{}, b...), a...)
+		if !SameCASet(a, a) || !SameCASet(ab, append(append([]byte{}, a...), b...)) {
+			t.Error("SameCASet does not compare the certificate sets")
+		}
+		if SameCASet(a, ab) || SameCASet(ab, a) || SameCASet(a, b) {
+			t.Error("SameCASet matched a wider or different bundle")
+		}
+		if SameCASet(a, []byte("junk")) || SameCASet(nil, nil) {
+			t.Error("SameCASet matched unparseable input")
+		}
 		fps, err := CAFingerprints(append(append([]byte{}, a...), a...))
 		if err != nil || len(fps) != 1 || !strings.HasPrefix(fps[0], "sha256:") {
 			t.Errorf("CAFingerprints = %v, %v", fps, err)
@@ -383,6 +436,7 @@ func TestHelpers(t *testing.T) {
 
 type httpHarness struct {
 	*enrollHarness
+	api *EnrollmentHTTP
 	mux *http.ServeMux
 }
 
@@ -401,12 +455,12 @@ func newHTTPHarness(t *testing.T, endpoint EnrollmentEndpoint) *httpHarness {
 		func(pattern string, handler http.Handler) { mux.Handle(pattern, handler) },
 		func(pattern string, handler http.Handler) { mux.Handle(pattern, handler) },
 	)
-	return &httpHarness{enrollHarness: h, mux: mux}
+	return &httpHarness{enrollHarness: h, api: api, mux: mux}
 }
 
 var testEndpoint = EnrollmentEndpoint{ServerURL: "https://fleet.test:8085", AgentImage: "registry.test/agent:1"}
 
-func (h *httpHarness) do(method, path, bearer string, body any) (int, map[string]any) {
+func (h *httpHarness) request(method, path, bearer string, body any) *http.Request {
 	h.t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -420,8 +474,11 @@ func (h *httpHarness) do(method, path, bearer string, body any) (int, map[string
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	rr := httptest.NewRecorder()
-	h.mux.ServeHTTP(rr, req)
+	return req
+}
+
+func (h *httpHarness) parse(rr *httptest.ResponseRecorder) (int, map[string]any) {
+	h.t.Helper()
 	out := map[string]any{}
 	if rr.Body.Len() > 0 && strings.HasPrefix(rr.Header().Get("Content-Type"), "application/json") {
 		if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
@@ -429,6 +486,46 @@ func (h *httpHarness) do(method, path, bearer string, body any) (int, map[string
 		}
 	}
 	return rr.Code, out
+}
+
+func (h *httpHarness) do(method, path, bearer string, body any) (int, map[string]any) {
+	h.t.Helper()
+	rr := httptest.NewRecorder()
+	h.mux.ServeHTTP(rr, h.request(method, path, bearer, body))
+	return h.parse(rr)
+}
+
+// doFrom is do from a chosen client address, which is what the failure
+// limiter keys a failed presentation on. A reverse proxy would make
+// every request arrive from one address; a test can choose.
+func (h *httpHarness) doFrom(remoteAddr, method, path, bearer string, body any) (int, map[string]any) {
+	h.t.Helper()
+	req := h.request(method, path, bearer, body)
+	req.RemoteAddr = remoteAddr
+	rr := httptest.NewRecorder()
+	h.mux.ServeHTTP(rr, req)
+	return h.parse(rr)
+}
+
+// doWithin is do bounded by limit: it fails the test when the handler
+// does not answer in time. Without the bound, a handler that waits on
+// a peer with no budget would hang the test instead of failing it.
+func (h *httpHarness) doWithin(limit time.Duration, method, path, bearer string, body any) (int, map[string]any) {
+	h.t.Helper()
+	req := h.request(method, path, bearer, body)
+	rr := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		h.mux.ServeHTTP(rr, req)
+	}()
+	select {
+	case <-served:
+	case <-time.After(limit):
+		h.t.Fatalf("%s %s did not answer within %s", method, path, limit)
+		return 0, nil
+	}
+	return h.parse(rr)
 }
 
 func TestHTTP_RoutesCoexistWithTheDynamicAPI(t *testing.T) {
@@ -500,6 +597,10 @@ func TestHTTP_EnrollWithdrawForget(t *testing.T) {
 	if code != http.StatusConflict || body["reason"] != "deployments-resolve-to-target" {
 		t.Fatalf("withdraw with deployments = %d %v", code, body)
 	}
+	code, body = h.do(http.MethodPost, "/clusters/ext:withdraw", "", map[string]any{"reason": strings.Repeat("x", maxWithdrawReasonBytes+1)})
+	if code != http.StatusBadRequest || body["reason"] != "invalid-argument" {
+		t.Errorf("oversized withdraw reason = %d %v", code, body)
+	}
 	if code, body = h.do(http.MethodPost, "/clusters/nobody:withdraw", "", map[string]any{"reason": "x"}); code != http.StatusNotFound {
 		t.Errorf("withdraw unknown = %d %v", code, body)
 	}
@@ -507,6 +608,27 @@ func TestHTTP_EnrollWithdrawForget(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("withdraw leaving deployments = %d %v", code, body)
 	}
+}
+
+// manifestBearer returns the bundle secret inside the generated
+// manifest's Secret, which is the only place a create answer carries
+// it.
+func manifestBearer(t *testing.T, manifest string) string {
+	t.Helper()
+	for _, doc := range strings.Split(manifest, "\n---\n") {
+		var obj map[string]any
+		if err := yaml.Unmarshal([]byte(doc), &obj); err != nil {
+			t.Fatalf("manifest document does not parse: %v", err)
+		}
+		if obj["kind"] == "Secret" {
+			data, _ := obj["stringData"].(map[string]any)
+			if token, _ := data["token"].(string); token != "" {
+				return token
+			}
+		}
+	}
+	t.Fatal("the manifest holds no Secret with a token")
+	return ""
 }
 
 func TestHTTP_BundleManifestAndPresent(t *testing.T) {
@@ -526,17 +648,7 @@ func TestHTTP_BundleManifestAndPresent(t *testing.T) {
 		t.Fatalf("create bundle response: name %q, manifest %d bytes", name, len(manifest))
 	}
 	// The bearer value is in the manifest and nowhere else in the response.
-	var bearer string
-	for _, doc := range strings.Split(manifest, "\n---\n") {
-		var obj map[string]any
-		if err := yaml.Unmarshal([]byte(doc), &obj); err != nil {
-			t.Fatalf("manifest document does not parse: %v", err)
-		}
-		if obj["kind"] == "Secret" {
-			data, _ := obj["stringData"].(map[string]any)
-			bearer, _ = data["token"].(string)
-		}
-	}
+	bearer := manifestBearer(t, manifest)
 	if !strings.HasPrefix(bearer, id+".") {
 		t.Fatalf("the manifest's secret holds %q", bearer)
 	}
@@ -566,6 +678,110 @@ func TestHTTP_BundleManifestAndPresent(t *testing.T) {
 	}
 	if code, _ = h.do(http.MethodPost, "/enrollments:present", bearer, present); code != http.StatusUnauthorized {
 		t.Errorf("present with a revoked bundle = %d, want 401", code)
+	}
+}
+
+// A create may choose its bundle id with the bundleId query parameter
+// (AIP-133's management-plane form), in the API's camelCase spelling
+// (AIP-127). A repeat answers the conflict naming the existing bundle,
+// and an id outside the shape the bundle routes accept answers 400: a
+// bundle with such an id could never be presented or revoked.
+func TestHTTP_BundleCreateWithAChosenID(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, ca, token := h.addCluster("ext3", time.Hour)
+	const id = "eb-0123456789ab"
+	body := map[string]any{"clusterId": "ext3", "apiServer": api, "profile": "read-only"}
+
+	code, resp := h.do(http.MethodPost, "/enrollmentBundles?bundleId="+id, "", body)
+	if code != http.StatusOK || resp["name"] != "enrollmentBundles/"+id {
+		t.Fatalf("create with a chosen id = %d %v", code, resp)
+	}
+	bearer := manifestBearer(t, resp["manifest"].(string))
+	if !strings.HasPrefix(bearer, id+".") {
+		t.Fatalf("the manifest's secret holds %q, want the chosen id", bearer)
+	}
+
+	code, resp = h.do(http.MethodPost, "/enrollmentBundles?bundleId="+id, "", body)
+	if code != http.StatusConflict || resp["reason"] != "bundle-id-in-use" {
+		t.Fatalf("second create with the same id = %d %v, want 409 bundle-id-in-use", code, resp)
+	}
+	details, _ := resp["details"].(map[string]any)
+	if details["name"] != "enrollmentBundles/"+id {
+		t.Errorf("conflict details = %v, want the existing bundle's name", resp["details"])
+	}
+
+	// The refused retry left the first secret in place.
+	present := map[string]any{"caCert": string(ca), "token": token, "serviceAccount": map[string]string{"namespace": AccessNamespace, "name": AccessServiceAccount}}
+	if code, resp = h.do(http.MethodPost, "/enrollments:present", bearer, present); code != http.StatusOK || resp["cluster"] != "clusters/ext3" {
+		t.Fatalf("present with the first secret = %d %v", code, resp)
+	}
+
+	// The snake_case spelling is refused rather than ignored: a client
+	// that sent one would get a generated id and, on a retry, a second
+	// working secret.
+	if code, resp = h.do(http.MethodPost, "/enrollmentBundles?bundle_id="+id, "", map[string]any{"clusterId": "ext4", "apiServer": api}); code != http.StatusBadRequest || resp["reason"] != "invalid-argument" {
+		t.Errorf("create with bundle_id = %d %v, want 400 invalid-argument", code, resp)
+	}
+	for _, bad := range []string{"bundle", "eb-0123456789AB", "eb-0123456789abc"} {
+		if code, resp = h.do(http.MethodPost, "/enrollmentBundles?bundleId="+bad, "", map[string]any{"clusterId": "ext4", "apiServer": api}); code != http.StatusBadRequest || resp["reason"] != "invalid-argument" {
+			t.Errorf("create with bundleId %q = %d %v, want 400 invalid-argument", bad, code, resp)
+		}
+	}
+}
+
+// A cluster that accepts the connection and then never answers must
+// not hold a handler past the server's write deadline: the request
+// budget ends the wait, and the route answers with the error it
+// documents for a cluster that does not answer.
+func TestHTTP_EnrollAgainstAStalledClusterAnswersWithinTheBudget(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, ca, token := h.addCluster("slow", time.Hour)
+	h.prober.probeUntilContext = true
+	h.api.requestBudget = 50 * time.Millisecond
+
+	code, body := h.doWithin(5*time.Second, http.MethodPost, "/clusters:enroll", "", map[string]any{
+		"clusterId": "slow", "apiServer": api, "caCert": string(ca), "token": token,
+	})
+	if code != http.StatusUnprocessableEntity || body["reason"] != "cluster-unreachable" {
+		t.Fatalf("enroll against a cluster that does not answer = %d %v, want 422 cluster-unreachable", code, body)
+	}
+}
+
+func TestHTTP_PresentFromAStalledClusterAnswersWithinTheBudget(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, ca, token := h.addCluster("slow", time.Hour)
+	_, bearer, err := h.svc.CreateBundle(context.Background(), CreateBundleRequest{
+		Route: BundleRouteManifest,
+		Scope: BundleScope{ClusterID: "slow", APIServer: api},
+	})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	h.prober.probeUntilContext = true
+	h.api.requestBudget = 50 * time.Millisecond
+
+	code, body := h.doWithin(5*time.Second, http.MethodPost, "/enrollments:present", bearer, map[string]any{
+		"clusterName": "slow", "caCert": string(ca), "token": token,
+	})
+	if code != http.StatusUnprocessableEntity || body["reason"] != "cluster-unreachable" {
+		t.Fatalf("present from a cluster that does not answer = %d %v, want 422 cluster-unreachable", code, body)
+	}
+}
+
+func TestHTTP_RenewFromAStalledClusterAnswersWithinTheBudget(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, ca, token := h.addCluster("ext", time.Hour)
+	if code, body := h.do(http.MethodPost, "/clusters:enroll", "", map[string]any{
+		"clusterId": "ext", "apiServer": api, "caCert": string(ca), "token": token,
+	}); code != http.StatusOK {
+		t.Fatalf("enroll = %d %v", code, body)
+	}
+	h.prober.renewUntilContext = true
+	h.api.requestBudget = 50 * time.Millisecond
+
+	code, body := h.doWithin(5*time.Second, http.MethodPost, "/clusters/ext:renewCredential", "", nil)
+	if code != http.StatusGatewayTimeout || body["reason"] != "timeout" {
+		t.Fatalf("renew against a cluster that does not answer = %d %v, want 504 timeout", code, body)
 	}
 }
 
@@ -606,22 +822,73 @@ func TestHTTP_AccessManifest(t *testing.T) {
 	}
 }
 
-func TestHTTP_PresentIsRateLimitedPerBundle(t *testing.T) {
+func TestHTTP_PresentIsRateLimitedPerSource(t *testing.T) {
 	h := newHTTPHarness(t, testEndpoint)
-	present := map[string]any{"caCert": "x", "token": "y"}
-	bad := "eb-0123456789ab.wrong"
+	present := map[string]any{"clusterName": "ext", "caCert": "x", "token": "y"}
+	bad := "not-a-bundle-secret"
 	for i := 0; i < 20; i++ {
-		if code, _ := h.do(http.MethodPost, "/enrollments:present", bad, present); code != http.StatusUnauthorized {
-			t.Fatalf("attempt %d = %d, want 401", i, code)
+		if code, body := h.doFrom("192.0.2.10:1234", http.MethodPost, "/enrollments:present", bad, present); code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d %v, want 401", i, code, body)
 		}
 	}
-	code, body := h.do(http.MethodPost, "/enrollments:present", bad, present)
-	if code != http.StatusTooManyRequests || body["reason"] != "rate-limited" {
-		t.Fatalf("attempt after the limit = %d %v", code, body)
+	// The failing address is refused before the request is looked at,
+	// even one without a secret at all.
+	req := h.request(http.MethodPost, "/enrollments:present", "", nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	rr := httptest.NewRecorder()
+	h.mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests || rr.Header().Get("Retry-After") != "60" {
+		t.Fatalf("attempt after the limit = %d, retry after %q", rr.Code, rr.Header().Get("Retry-After"))
 	}
-	// Another bundle id is not affected.
-	if code, _ := h.do(http.MethodPost, "/enrollments:present", "eb-ffffffffffff.wrong", present); code != http.StatusUnauthorized {
-		t.Errorf("another bundle = %d, want 401", code)
+	// No other address is: a missing or malformed secret has no shared
+	// key that one address could fill for everyone.
+	code, body := h.doFrom("192.0.2.20:1234", http.MethodPost, "/enrollments:present", bad, present)
+	if code != http.StatusUnauthorized {
+		t.Errorf("another address = %d %v, want 401", code, body)
+	}
+	code, body = h.doFrom("192.0.2.20:1234", http.MethodPost, "/enrollments:present", "", present)
+	if code != http.StatusUnauthorized || body["reason"] != "bundle-missing" {
+		t.Errorf("another address without a secret = %d %v, want 401 bundle-missing", code, body)
+	}
+}
+
+// TestHTTP_WrongSecretsUnderOneBundleAreCountedButDoNotDenyPresentations
+// pins both halves of the bundle-id trade: guessing at a real bundle is
+// worth a log line, and is not a lever one caller can pull to stop the
+// cluster that bundle is for.
+func TestHTTP_WrongSecretsUnderOneBundleAreCountedButDoNotDenyPresentations(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, ca, token := h.addCluster("ext", time.Hour)
+	h.svc.RegisterVerifier("registry", &fakeVerifier{clusters: map[string]VerifiedCluster{
+		"hub1/ext": {ClusterID: "hub1.ext", APIServer: api, CACert: ca},
+	}})
+	_, bearer, err := h.svc.CreateBundle(context.Background(), CreateBundleRequest{
+		Scope: BundleScope{Verifier: "registry", VerifierScope: "hub1"}, Actor: "ops",
+	})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	id, _, _ := strings.Cut(bearer, ".")
+	var logs bytes.Buffer
+	h.api.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	present := map[string]any{"clusterName": "ext", "caCert": string(ca), "token": token}
+	wrong := id + ".not-the-secret"
+	for i := 0; i < 20; i++ {
+		code, body := h.doFrom("192.0.2.10:1234", http.MethodPost, "/enrollments:present", wrong, present)
+		if code != http.StatusUnauthorized || body["reason"] != "bundle-secret-mismatch" {
+			t.Fatalf("wrong secret %d = %d %v, want 401 bundle-secret-mismatch", i, code, body)
+		}
+	}
+	if got := logs.String(); !strings.Contains(got, "bundle="+id) || !strings.Contains(got, "failing repeatedly") {
+		t.Errorf("wrong secrets under a real bundle are not reported: %s", got)
+	}
+	// The guessing address is now limited, but the bundle is not: the
+	// cluster the bundle is for presents from its own address and is
+	// enrolled.
+	code, body := h.doFrom("192.0.2.20:1234", http.MethodPost, "/enrollments:present", bearer, present)
+	if code != http.StatusOK || body["cluster"] != "clusters/hub1.ext" {
+		t.Fatalf("the bundle's own cluster = %d %v, want it enrolled", code, body)
 	}
 }
 
@@ -699,11 +966,224 @@ func TestFailureLimiter_WindowExpires(t *testing.T) {
 	}
 }
 
+func TestFailureLimiter_BlockedKeySurvivesSizeBound(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l := newFailureLimiter(2, time.Minute)
+	l.now = func() time.Time { return now }
+	l.fail("victim")
+	l.fail("victim")
+	if !l.blocked("victim") {
+		t.Fatal("limiter does not block the failing key")
+	}
+
+	// Made-up keys cross the size bound; the eviction they force must
+	// not lift the lockout that is already in place.
+	for i := 0; i < failureLimiterMaxKeys+1; i++ {
+		l.fail(fmt.Sprintf("fake-%d", i))
+	}
+	if !l.blocked("victim") {
+		t.Fatal("a burst of new keys lifted an active lockout")
+	}
+	if len(l.fails) > failureLimiterMaxKeys {
+		t.Fatalf("failure map grew past its bound: %d keys", len(l.fails))
+	}
+}
+
+// Crossing the size bound evicts down to a low-water mark in one
+// pass, so a stream of fresh keys pays for the scan and sort once per
+// batch instead of on every failure while the map stays full.
+func TestFailureLimiter_EvictsInBatches(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l := newFailureLimiter(2, time.Minute)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < failureLimiterMaxKeys; i++ {
+		l.fail(fmt.Sprintf("fake-%d", i))
+	}
+	if got := len(l.fails); got != failureLimiterMaxKeys {
+		t.Fatalf("map at the bound holds %d keys, want %d", got, failureLimiterMaxKeys)
+	}
+	l.fail("one-more")
+	if got := len(l.fails); got != failureLimiterLowWater {
+		t.Fatalf("after crossing the bound the map holds %d keys, want the low-water mark %d", got, failureLimiterLowWater)
+	}
+}
+
+func TestFailureLimiter_KeepsTheNewestFailuresAndACappedCount(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l := newFailureLimiter(2, time.Minute)
+	l.now = func() time.Time { return now }
+	if n := l.fail("k"); n != 1 {
+		t.Fatalf("first failure count = %d, want 1", n)
+	}
+	now = now.Add(10 * time.Second)
+	if n := l.fail("k"); n != 2 {
+		t.Fatalf("failure reaching the limit = %d, want 2", n)
+	}
+	now = now.Add(10 * time.Second)
+	if n := l.fail("k"); n != 3 {
+		t.Fatalf("failure past the limit = %d, want it to saturate at 3", n)
+	}
+	if got := len(l.fails["k"]); got != 2 {
+		t.Fatalf("stored failures = %d, want at most the limit", got)
+	}
+	// The stored failures are the newest, so the key is still blocked
+	// while they are within the window...
+	now = now.Add(45 * time.Second)
+	if !l.blocked("k") {
+		t.Fatal("the key released before its newest failures aged out")
+	}
+	// ...and releases once they leave it.
+	now = now.Add(16 * time.Second)
+	if l.blocked("k") {
+		t.Fatal("the key is still blocked after its newest failures left the window")
+	}
+}
+
 func TestWriteEnrollmentError_InternalErrorsAreNotDetailed(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/x", nil)
 	WriteEnrollmentError(rr, req, slog.New(slog.NewTextHandler(io.Discard, nil)), errors.New("sql: connection refused at 10.0.0.1"))
 	if rr.Code != http.StatusInternalServerError || strings.Contains(rr.Body.String(), "10.0.0.1") {
 		t.Errorf("internal error response = %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBuildAccessPiece_AgentContainerIsHardened(t *testing.T) {
+	for _, mode := range []AgentMode{AgentModeJob, AgentModeDeployment} {
+		t.Run(string(mode), func(t *testing.T) {
+			opts := agentOptions(AccessProfileReadOnly)
+			opts.Mode = mode
+			piece, err := BuildAccessPiece(opts)
+			if err != nil {
+				t.Fatalf("BuildAccessPiece: %v", err)
+			}
+			spec := agentPodSpec(t, piece.Agent)
+			if spec["serviceAccountName"] != enrollmentAgentName {
+				t.Errorf("serviceAccountName = %v, want %q", spec["serviceAccountName"], enrollmentAgentName)
+			}
+			containers, _ := spec["containers"].([]any)
+			if len(containers) != 1 {
+				t.Fatalf("containers = %v", containers)
+			}
+			container, _ := containers[0].(map[string]any)
+			sc, _ := container["securityContext"].(map[string]any)
+			for field, want := range map[string]any{
+				"runAsNonRoot":             true,
+				"readOnlyRootFilesystem":   true,
+				"allowPrivilegeEscalation": false,
+			} {
+				if sc[field] != want {
+					t.Errorf("securityContext.%s = %v, want %v", field, sc[field], want)
+				}
+			}
+			caps, _ := sc["capabilities"].(map[string]any)
+			if got := toStrings(caps["drop"]); len(got) != 1 || got[0] != "ALL" {
+				t.Errorf("capabilities.drop = %v, want [ALL]", got)
+			}
+			seccomp, _ := sc["seccompProfile"].(map[string]any)
+			if seccomp["type"] != "RuntimeDefault" {
+				t.Errorf("seccompProfile.type = %v, want RuntimeDefault", seccomp["type"])
+			}
+			resources, _ := container["resources"].(map[string]any)
+			requests, _ := resources["requests"].(map[string]any)
+			if requests["cpu"] == nil || requests["memory"] == nil {
+				t.Errorf("resources.requests = %v, want cpu and memory", requests)
+			}
+			limits, _ := resources["limits"].(map[string]any)
+			if limits["memory"] == nil {
+				t.Errorf("resources.limits = %v, want a memory limit", limits)
+			}
+		})
+	}
+}
+
+// agentPodSpec returns the pod spec of the Job or Deployment in a
+// rendered agent piece.
+func agentPodSpec(t *testing.T, objects []map[string]any) map[string]any {
+	t.Helper()
+	for _, obj := range objects {
+		kind, _ := obj["kind"].(string)
+		if kind != "Job" && kind != "Deployment" {
+			continue
+		}
+		spec, _ := obj["spec"].(map[string]any)
+		template, _ := spec["template"].(map[string]any)
+		podSpec, _ := template["spec"].(map[string]any)
+		if podSpec == nil {
+			t.Fatalf("%s carries no pod spec", kind)
+		}
+		return podSpec
+	}
+	t.Fatalf("the agent objects carry no Job or Deployment: %v", objectKeys(objects))
+	return nil
+}
+
+func TestHTTP_BundleSecondsAreBounded(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, _, _ := h.addCluster("ext2", time.Hour)
+	base := func() map[string]any {
+		return map[string]any{"clusterId": "ext2", "apiServer": api}
+	}
+	cases := map[string]map[string]any{
+		// 2^55+600 seconds wraps to 600 seconds when it is converted
+		// to a duration; a bound on the seconds catches it.
+		"token lifetime that overflows":    {"tokenLifetimeSeconds": int64(1)<<55 + 600},
+		"token lifetime above the maximum": {"tokenLifetimeSeconds": int64(MaxTokenLifetime/time.Second) + 1},
+		"ttl that overflows":               {"ttlSeconds": int64(1)<<55 + 1},
+		"ttl above the maximum":            {"ttlSeconds": int64(MaxBundleTTL/time.Second) + 1},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := base()
+			for k, v := range extra {
+				body[k] = v
+			}
+			if code, resp := h.do(http.MethodPost, "/enrollmentBundles", "", body); code != http.StatusBadRequest {
+				t.Fatalf("create bundle = %d %v, want 400", code, resp)
+			}
+		})
+	}
+	body := base()
+	body["tokenLifetimeSeconds"] = int64(MaxTokenLifetime / time.Second)
+	body["ttlSeconds"] = int64(MaxBundleTTL / time.Second)
+	if code, resp := h.do(http.MethodPost, "/enrollmentBundles", "", body); code != http.StatusOK {
+		t.Fatalf("the longest allowed lifetimes = %d %v, want 200", code, resp)
+	}
+}
+
+func TestHTTP_PresentRejectsAnInvalidClusterName(t *testing.T) {
+	h := newHTTPHarness(t, testEndpoint)
+	api, ca, token := h.addCluster("ext", time.Hour)
+	h.svc.RegisterVerifier("registry", &fakeVerifier{clusters: map[string]VerifiedCluster{
+		"hub1/ext": {ClusterID: "hub1.ext", APIServer: api, CACert: ca},
+	}})
+	_, bearer, err := h.svc.CreateBundle(context.Background(), CreateBundleRequest{
+		Scope: BundleScope{Verifier: "registry", VerifierScope: "hub1"}, Actor: "ops",
+	})
+	if err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	present := func(clusterName string) map[string]any {
+		return map[string]any{"clusterName": clusterName, "caCert": string(ca), "token": token}
+	}
+	for name, clusterName := range map[string]string{
+		"space":          "bad name",
+		"too long":       strings.Repeat("x", maxClusterIDLength+1),
+		"label too long": strings.Repeat("x", 64),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for i := 0; i < 25; i++ {
+				if code, body := h.do(http.MethodPost, "/enrollments:present", bearer, present(clusterName)); code != http.StatusBadRequest {
+					t.Fatalf("attempt %d = %d %v, want 400", i, code, body)
+				}
+			}
+		})
+	}
+	// The rejected names were not charged against the bundle or any
+	// cluster once they were refused.
+	code, body := h.do(http.MethodPost, "/enrollments:present", bearer, present("ext"))
+	if code != http.StatusOK || body["cluster"] != "clusters/hub1.ext" {
+		t.Fatalf("present after rejected names = %d %v, want it enrolled", code, body)
 	}
 }

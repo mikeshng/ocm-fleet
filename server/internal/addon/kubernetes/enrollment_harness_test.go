@@ -47,8 +47,11 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 // fakeCluster is one cluster as the fake prober knows it.
 type fakeCluster struct {
-	ca          []byte
-	version     string
+	ca      []byte
+	version string
+	// uid is what the cluster reports as its own identifier; empty for
+	// a cluster whose access account may not read it.
+	uid         string
 	tokens      map[string]ClusterProbeResult
 	unreachable error
 	denyRenew   bool
@@ -59,6 +62,20 @@ type fakeProber struct {
 	clock    *fakeClock
 	clusters map[string]*fakeCluster
 	minted   int
+
+	// probeEntered and probeRelease, when set, let a test hold a
+	// presentation inside its probe window.
+	probeEntered chan<- struct{}
+	probeRelease <-chan struct{}
+
+	// probeUntilContext makes Probe stand in for a cluster that accepts
+	// the connection and then never answers: it waits until the
+	// request's context ends and reports why.
+	probeUntilContext bool
+
+	// renewUntilContext makes RenewToken stand in for a cluster that
+	// accepts the renewal and then never answers.
+	renewUntilContext bool
 }
 
 func (p *fakeProber) lookup(conn ClusterConnection) (*fakeCluster, ClusterProbeResult, error) {
@@ -82,7 +99,15 @@ func (p *fakeProber) lookup(conn ClusterConnection) (*fakeCluster, ClusterProbeR
 	return c, res, nil
 }
 
-func (p *fakeProber) Probe(_ context.Context, conn ClusterConnection) (ClusterProbeResult, error) {
+func (p *fakeProber) Probe(ctx context.Context, conn ClusterConnection) (ClusterProbeResult, error) {
+	if p.probeEntered != nil {
+		p.probeEntered <- struct{}{}
+		<-p.probeRelease
+	}
+	if p.probeUntilContext {
+		<-ctx.Done()
+		return ClusterProbeResult{}, ctx.Err()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c, res, err := p.lookup(conn)
@@ -90,6 +115,7 @@ func (p *fakeProber) Probe(_ context.Context, conn ClusterConnection) (ClusterPr
 		return ClusterProbeResult{}, err
 	}
 	res.KubernetesVersion = c.version
+	res.ClusterUID = c.uid
 	res.TokenIssuedAt, res.TokenExpiresAt = TokenLifetime(conn.Token)
 	return res, nil
 }
@@ -104,7 +130,11 @@ func (p *fakeProber) Identity(_ context.Context, conn ClusterConnection) (string
 	return res.Username, nil
 }
 
-func (p *fakeProber) RenewToken(_ context.Context, conn ClusterConnection, sa ServiceAccountRef, lifetime time.Duration) (string, time.Time, error) {
+func (p *fakeProber) RenewToken(ctx context.Context, conn ClusterConnection, sa ServiceAccountRef, lifetime time.Duration) (string, time.Time, error) {
+	if p.renewUntilContext {
+		<-ctx.Done()
+		return "", time.Time{}, ctx.Err()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c, res, err := p.lookup(conn)
@@ -223,15 +253,36 @@ func (b *storeRecordStore) PurgeCollectionPrefix(ctx context.Context, rt domain.
 	return b.reports.PurgeCollectionPrefix(ctx, rt, prefix)
 }
 
+// recordingPlacement records placement re-evaluation calls.
+type recordingPlacement struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (p *recordingPlacement) ReevaluatePlacement(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return p.err
+}
+
+func (p *recordingPlacement) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
 type enrollHarness struct {
-	t        *testing.T
-	store    *sqlite.Store
-	vault    *sqlite.VaultStore
-	records  *storeRecordStore
-	prober   *fakeProber
-	indexing *fakeIndexing
-	clock    *fakeClock
-	svc      *EnrollmentService
+	t         *testing.T
+	store     *sqlite.Store
+	vault     *sqlite.VaultStore
+	records   *storeRecordStore
+	prober    *fakeProber
+	indexing  *fakeIndexing
+	clock     *fakeClock
+	placement *recordingPlacement
+	svc       *EnrollmentService
 }
 
 const testAccessUser = "system:serviceaccount:" + AccessNamespace + ":" + AccessServiceAccount
@@ -268,12 +319,14 @@ func newEnrollHarness(t *testing.T) *enrollHarness {
 		indexing: newFakeIndexing(),
 		clock:    clock,
 	}
+	h.placement = &recordingPlacement{}
 	h.svc = NewEnrollmentService(EnrollmentDeps{
-		Store:    store,
-		Vault:    h.vault,
-		Records:  h.records,
-		Indexing: h.indexing,
-		Prober:   h.prober,
+		Store:     store,
+		Vault:     h.vault,
+		Records:   h.records,
+		Indexing:  h.indexing,
+		Prober:    h.prober,
+		Placement: h.placement,
 		Trust: func(context.Context) ([]domain.TrustBundleEntry, error) {
 			return []domain.TrustBundleEntry{{IssuerURL: "https://issuer.test", JWKSURI: "https://issuer.test/keys"}}, nil
 		},
@@ -281,6 +334,42 @@ func newEnrollHarness(t *testing.T) *enrollHarness {
 		Now:    clock.Now,
 	})
 	return h
+}
+
+// serviceWithRecords returns a service like svc but reading its records
+// through the given store, for tests that inject record failures.
+func (h *enrollHarness) serviceWithRecords(records InventoryRecordStore) *EnrollmentService {
+	return h.serviceWith(h.store, records)
+}
+
+// serviceWithStore returns a service like svc but using the given
+// resource store, for tests that inject read failures.
+func (h *enrollHarness) serviceWithStore(store domain.Store) *EnrollmentService {
+	return h.serviceWith(store, h.records)
+}
+
+func (h *enrollHarness) serviceWith(store domain.Store, records InventoryRecordStore) *EnrollmentService {
+	return NewEnrollmentService(EnrollmentDeps{
+		Store:     store,
+		Vault:     h.vault,
+		Records:   records,
+		Indexing:  h.indexing,
+		Prober:    h.prober,
+		Placement: h.placement,
+		Trust: func(context.Context) ([]domain.TrustBundleEntry, error) {
+			return []domain.TrustBundleEntry{{IssuerURL: "https://issuer.test", JWKSURI: "https://issuer.test/keys"}}, nil
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:    h.clock.Now,
+	})
+}
+
+// serviceWithPlacement returns a service like svc but followed by the
+// given placement re-evaluator, for tests that run the real one.
+func (h *enrollHarness) serviceWithPlacement(placement PlacementReevaluator) *EnrollmentService {
+	svc := h.serviceWith(h.store, h.records)
+	svc.placement = placement
+	return svc
 }
 
 // addCluster registers a cluster with the fake prober and returns its
@@ -297,6 +386,7 @@ func (h *enrollHarness) addCluster(name string, lifetime time.Duration) (apiServ
 	h.prober.clusters[apiServer] = &fakeCluster{
 		ca:      ca,
 		version: "v1.37.0",
+		uid:     "kube-system-of-" + name,
 		tokens: map[string]ClusterProbeResult{token: {
 			Username:       testAccessUser,
 			ServiceAccount: sa,
@@ -328,6 +418,14 @@ func (h *enrollHarness) cluster(apiServer string) *fakeCluster {
 	return h.prober.clusters[apiServer]
 }
 
+// alsoAt makes the cluster at apiServer answer at a second address as
+// well: the same cluster, with the same CA and the same accounts.
+func (h *enrollHarness) alsoAt(second, apiServer string) {
+	h.prober.mu.Lock()
+	defer h.prober.mu.Unlock()
+	h.prober.clusters[second] = h.prober.clusters[apiServer]
+}
+
 func (h *enrollHarness) target(id string) (domain.TargetInfo, bool) {
 	h.t.Helper()
 	target, found, err := h.svc.getTarget(context.Background(), TargetIDForCluster(id))
@@ -351,7 +449,11 @@ func (h *enrollHarness) vaultToken(id string) (string, bool) {
 
 func (h *enrollHarness) conditions(id string) map[domain.ConditionType]domain.Condition {
 	h.t.Helper()
-	return h.svc.loadClusterState(context.Background(), id).conds
+	state, err := h.svc.loadClusterState(context.Background(), id)
+	if err != nil {
+		h.t.Fatalf("load cluster state: %v", err)
+	}
+	return state.conds
 }
 
 // seedObjects reports indexed objects under a cluster id.
@@ -398,7 +500,7 @@ func (h *enrollHarness) seedDeployment(name string, placement domain.PlacementSt
 	})
 	f.AdvanceManifestStrategy(domain.ManifestStrategySpec{
 		Type:      domain.ManifestStrategyInline,
-		Manifests: []domain.Manifest{{Raw: json.RawMessage(`{"kind":"ConfigMap"}`)}},
+		Manifests: []domain.Manifest{{ManifestType: ManifestManifestType, Raw: json.RawMessage(`{"kind":"ConfigMap"}`)}},
 	}, now)
 	f.AdvancePlacementStrategy(placement, now)
 	tx, err := h.store.Begin(ctx)

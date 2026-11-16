@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -573,6 +575,108 @@ func Run(t *testing.T, infraFactory InfraFactory, registryFactory RegistryFactor
 		awaitObservedGeneration(ctx, t, infra, "deployments/d1", 2)
 	})
 
+	// The agent refuses the dispatch itself with the auth-expired
+	// sentinel, as a fleetlet gateway that cannot use the stored
+	// credentials does. The engine must carry that answer back through
+	// its activity boundary as the sentinel so the orchestration pauses
+	// for fresh credentials instead of failing or retrying for ever;
+	// this is the synchronous path, distinct from the asynchronous
+	// auth_failed report the resume test above exercises.
+	t.Run("AuthExpiredDelivery_Pauses", func(t *testing.T) {
+		infra := infraFactory(t)
+		wfs := registerWorkflows(t, infra, registryFactory)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		createTargets(ctx, t, infra,
+			domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "ae1", Type: AuthExpiredTargetType, Name: "auth-expired-1"}),
+		)
+
+		_, err := runCreateDeployment(ctx, t, wfs, domain.CreateDeploymentInput{
+			Name: "deployments/d1",
+			ManifestStrategy: domain.ManifestStrategySpec{
+				Type:      domain.ManifestStrategyInline,
+				Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+			},
+			PlacementStrategy: domain.PlacementStrategySpec{
+				Type:    domain.PlacementStrategyStatic,
+				Targets: []domain.TargetID{"ae1"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		view := awaitDeploymentPaused(ctx, t, infra, "deployments/d1")
+		reason := view.Fulfillment.PauseReason()
+		if reason == "" {
+			t.Fatal("delivery paused without a reason")
+		}
+		if !strings.Contains(reason, "delivery auth expired") {
+			t.Errorf("PauseReason = %q, want it to carry the auth-expired answer", reason)
+		}
+		if !strings.Contains(reason, "ae1") {
+			t.Errorf("PauseReason = %q, want it to name target ae1", reason)
+		}
+		if view.Fulfillment.State() != domain.FulfillmentStateCreating {
+			t.Errorf("State = %q, want creating (a pause must preserve lifecycle state)", view.Fulfillment.State())
+		}
+	})
+
+	// The same answer from a removal: the delivery succeeded, and the
+	// delete pipeline's removal dispatch is refused with the
+	// auth-expired sentinel. The fulfillment must pause in deleting, not
+	// fail, and not continue as new.
+	t.Run("AuthExpiredRemoval_Pauses", func(t *testing.T) {
+		infra := infraFactory(t)
+		wfs := registerWorkflows(t, infra, registryFactory)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		createTargets(ctx, t, infra,
+			domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "ar1", Type: AuthExpiredRemoveTargetType, Name: "auth-expired-remove-1"}),
+		)
+
+		_, err := runCreateDeployment(ctx, t, wfs, domain.CreateDeploymentInput{
+			Name: "deployments/d1",
+			ManifestStrategy: domain.ManifestStrategySpec{
+				Type:      domain.ManifestStrategyInline,
+				Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+			},
+			PlacementStrategy: domain.PlacementStrategySpec{
+				Type:    domain.PlacementStrategyStatic,
+				Targets: []domain.TargetID{"ar1"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		awaitDeploymentState(ctx, t, infra, "deployments/d1", domain.FulfillmentStateActive)
+
+		exec, err := wfs.DeleteDeployment.Start(ctx, domain.DeleteDeploymentInput{Name: "deployments/d1"}, 1)
+		if err != nil {
+			t.Fatalf("Start delete workflow: %v", err)
+		}
+		if _, err := exec.AwaitResult(ctx); err != nil {
+			t.Fatalf("Delete workflow: %v", err)
+		}
+
+		view := awaitDeploymentPaused(ctx, t, infra, "deployments/d1")
+		reason := view.Fulfillment.PauseReason()
+		if reason == "" {
+			t.Fatal("removal paused without a reason")
+		}
+		if !strings.Contains(reason, "delivery auth expired") {
+			t.Errorf("PauseReason = %q, want it to carry the auth-expired answer", reason)
+		}
+		if !strings.Contains(reason, "ar1") {
+			t.Errorf("PauseReason = %q, want it to name target ar1", reason)
+		}
+		if view.Fulfillment.State() != domain.FulfillmentStateDeleting {
+			t.Errorf("State = %q, want deleting (a pause must preserve lifecycle state)", view.Fulfillment.State())
+		}
+	})
+
 	t.Run("StartOrchestration_AlreadyRunning", func(t *testing.T) {
 		infra := infraFactory(t)
 		wfs := registerWorkflows(t, infra, registryFactory)
@@ -806,19 +910,184 @@ func Run(t *testing.T, infraFactory InfraFactory, registryFactory RegistryFactor
 			t.Fatalf("lock should be released: ActiveWorkflowGen = %v, want nil", f.ActiveWorkflowGen())
 		}
 		assertResolvedTargets(t, f, "af1")
+
+		// The delivery record survives the retry: the API keeps showing
+		// that the target needed one failed attempt, minus the stale
+		// reason once an attempt delivered.
+		records := queryDeliveries(ctx, t, infra, "deployments/d-async-fail")
+		if len(records) != 1 {
+			t.Fatalf("expected 1 delivery record, got %d", len(records))
+		}
+		if records[0].State() != domain.DeliveryStateDelivered {
+			t.Errorf("delivery State = %q, want %q", records[0].State(), domain.DeliveryStateDelivered)
+		}
+		if records[0].Attempts() != 1 {
+			t.Errorf("delivery Attempts = %d, want 1 (the failed attempt is retained)", records[0].Attempts())
+		}
+		if records[0].Message() != "" {
+			t.Errorf("delivery Message = %q, want empty after a successful delivery", records[0].Message())
+		}
+	})
+
+	t.Run("AsyncDeliveryFailure_ExposesReasonInView", func(t *testing.T) {
+		const reason = `apply object 1: conflict with "work-agent": .data.owner`
+		infra := infraFactory(t)
+		wfs := registerWorkflowsWithAgents(t, infra, registryFactory, func(reporter domain.DeliveryReporter) {
+			if infra.AgentRegistrar != nil {
+				infra.AgentRegistrar.Register(AlwaysFailTargetType, &alwaysFailAgent{reporter: reporter, reason: reason})
+			}
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		createTargets(ctx, t, infra,
+			domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "xf1", Type: AlwaysFailTargetType, Name: "always-fail-1"}),
+		)
+
+		_, err := runCreateDeployment(ctx, t, wfs, domain.CreateDeploymentInput{
+			Name: "deployments/d-fail-view",
+			ManifestStrategy: domain.ManifestStrategySpec{
+				Type:      domain.ManifestStrategyInline,
+				Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+			},
+			PlacementStrategy: domain.PlacementStrategySpec{
+				Type:    domain.PlacementStrategyStatic,
+				Targets: []domain.TargetID{"xf1"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		// The workflow retries the delivery indefinitely. Wait until the
+		// reason reported by the failing attempt is visible in the
+		// deployment read model; the retry may already have reset the
+		// delivery to pending, which must not erase the reason.
+		var view domain.DeploymentView
+		for {
+			view, err = queryDeploymentView(ctx, t, infra, "deployments/d-fail-view")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			if len(view.Deliveries) == 1 && view.Deliveries[0].Message() != "" {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for the failure reason to appear in the deployment view")
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+
+		d := view.Deliveries[0]
+		if d.TargetID() != "xf1" {
+			t.Errorf("delivery TargetID = %q, want %q", d.TargetID(), "xf1")
+		}
+		if d.Message() != reason {
+			t.Errorf("delivery Message = %q, want %q", d.Message(), reason)
+		}
+		if d.Attempts() < 1 {
+			t.Errorf("delivery Attempts = %d, want >= 1", d.Attempts())
+		}
+		if got := view.Fulfillment.State(); got != domain.FulfillmentStateCreating {
+			t.Errorf("State = %q, want %q while the delivery is retried", got, domain.FulfillmentStateCreating)
+		}
+	})
+
+	t.Run("AsyncDeliveryFailure_BacksOffAcrossAttempts", func(t *testing.T) {
+		infra := infraFactory(t)
+		obs := &backoffObserver{}
+		wfs := registerWorkflowsWithOptions(t, infra, registryFactory,
+			[]domain.OrchestrationWorkflowOption{domain.WithFulfillmentObserver(obs)},
+			func(reporter domain.DeliveryReporter) {
+				if infra.AgentRegistrar != nil {
+					infra.AgentRegistrar.Register(AlwaysFailTargetType, &alwaysFailAgent{reporter: reporter, reason: "still failing"})
+				}
+			})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		createTargets(ctx, t, infra,
+			domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "bf1", Type: AlwaysFailTargetType, Name: "always-fail-1"}),
+		)
+
+		_, err := runCreateDeployment(ctx, t, wfs, domain.CreateDeploymentInput{
+			Name: "deployments/d-backoff",
+			ManifestStrategy: domain.ManifestStrategySpec{
+				Type:      domain.ManifestStrategyInline,
+				Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+			},
+			PlacementStrategy: domain.PlacementStrategySpec{
+				Type:    domain.PlacementStrategyStatic,
+				Targets: []domain.TargetID{"bf1"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		// A failed delivery increments the attempt count, and the retry
+		// delay doubles with it: 10ms, 20ms, 40ms for the base delay used
+		// by this contract. A constant sequence means the delay activity
+		// never ran (for example because the engine did not register it)
+		// and the backoff is inert.
+		var delays []time.Duration
+		for len(delays) < 3 {
+			delays = obs.snapshot()
+			select {
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for three retry delays; got %v", delays)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		if delays[len(delays)-1] < 2*delays[0] {
+			t.Fatalf("retry delays do not back off: %v (want the wait to grow with each failed attempt)", delays)
+		}
 	})
 
 }
 
+// backoffObserver records the retry delays the orchestration computes,
+// so a test can verify that a failing delivery waits longer each time.
+type backoffObserver struct {
+	domain.NoOpFulfillmentObserver
+	mu     sync.Mutex
+	delays []time.Duration
+}
+
+func (o *backoffObserver) RunStarted(ctx context.Context, _ domain.FulfillmentID) (context.Context, domain.FulfillmentRunProbe) {
+	return ctx, &backoffProbe{observer: o}
+}
+
+func (o *backoffObserver) snapshot() []time.Duration {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]time.Duration(nil), o.delays...)
+}
+
+type backoffProbe struct {
+	domain.NoOpFulfillmentRunProbe
+	observer *backoffObserver
+}
+
+func (p *backoffProbe) RetryDelayStarted(delay time.Duration) {
+	p.observer.mu.Lock()
+	p.observer.delays = append(p.observer.delays, delay)
+	p.observer.mu.Unlock()
+}
+
 // registerWorkflows builds workflow specs from infra, registers the
-// default test agents ([outputAgent] and [authFailThenSucceedAgent]),
-// and returns the registered workflow interfaces.
+// default test agents ([outputAgent], [authFailThenSucceedAgent],
+// [authExpiredDeliverAgent], and [authExpiredRemoveAgent]), and returns
+// the registered workflow interfaces.
 func registerWorkflows(t *testing.T, infra Infra, registryFactory RegistryFactory) workflows {
 	t.Helper()
 	return registerWorkflowsWithAgents(t, infra, registryFactory, func(reporter domain.DeliveryReporter) {
 		if infra.AgentRegistrar != nil {
 			infra.AgentRegistrar.Register(OutputTargetType, &outputAgent{reporter: reporter})
 			infra.AgentRegistrar.Register(AuthFailTargetType, &authFailThenSucceedAgent{reporter: reporter})
+			infra.AgentRegistrar.Register(AuthExpiredTargetType, &authExpiredDeliverAgent{})
+			infra.AgentRegistrar.Register(AuthExpiredRemoveTargetType, &authExpiredRemoveAgent{reporter: reporter})
 		}
 	})
 }
@@ -844,6 +1113,24 @@ const OutputTargetType domain.TargetType = "output-test"
 // first delivery with [domain.DeliveryStateAuthFailed], then succeeds
 // on all subsequent attempts. Used by the Resume contract test.
 const AuthFailTargetType domain.TargetType = "auth-fail-test"
+
+// AuthExpiredTargetType is a target type whose delivery agent refuses
+// the dispatch synchronously with [domain.ErrAuthExpired], as a
+// gateway that cannot use the stored credentials does. Used by the
+// synchronous auth-expiry contract test.
+const AuthExpiredTargetType domain.TargetType = "auth-expired-test"
+
+// AuthExpiredRemoveTargetType is a target type whose delivery agent
+// delivers normally and refuses a removal dispatch synchronously with
+// [domain.ErrAuthExpired]. Used by the synchronous auth-expiry contract
+// test for the delete pipeline.
+const AuthExpiredRemoveTargetType domain.TargetType = "auth-expired-remove-test"
+
+// AlwaysFailTargetType is a target type whose delivery agent reports a
+// terminal failure, with a reason, on every attempt. Used to observe the
+// failure reason in the deployment read model while the orchestration
+// retries.
+const AlwaysFailTargetType domain.TargetType = "always-fail-test"
 
 func registerTargets(ctx context.Context, t *testing.T, infra Infra, ids ...string) {
 	t.Helper()
@@ -1076,7 +1363,8 @@ func (a *outputAgent) Deliver(_ context.Context, _ domain.TargetInfo, deliveryID
 
 	go func() {
 		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
-			State: domain.DeliveryStateDelivered,
+			Operation: domain.DeliveryOperationDeliver,
+			State:     domain.DeliveryStateDelivered,
 			ProvisionedTargets: []domain.ProvisionedTarget{{
 				ID:   targetID,
 				Type: "kubernetes",
@@ -1097,7 +1385,7 @@ func (a *outputAgent) Deliver(_ context.Context, _ domain.TargetInfo, deliveryID
 
 func (a *outputAgent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
@@ -1121,23 +1409,55 @@ func (a *authFailThenSucceedAgent) Deliver(_ context.Context, _ domain.TargetInf
 	if n == 1 {
 		go func() {
 			_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
-				State:   domain.DeliveryStateAuthFailed,
-				Message: "401 Unauthorized",
+				Operation: domain.DeliveryOperationDeliver,
+				State:     domain.DeliveryStateAuthFailed,
+				Message:   "401 Unauthorized",
 			})
 		}()
 		return nil
 	}
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
 
 func (a *authFailThenSucceedAgent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
+}
+
+// authExpiredDeliverAgent refuses every dispatch with the auth-expired
+// sentinel instead of taking the work. Its answer is synchronous, so
+// the engine must carry the sentinel back through its activity
+// boundary for the orchestration to recognize the pause.
+type authExpiredDeliverAgent struct{}
+
+func (a *authExpiredDeliverAgent) Deliver(_ context.Context, _ domain.TargetInfo, _ domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, _ domain.Generation) error {
+	return fmt.Errorf("%w: the addon could not use the stored credentials", domain.ErrAuthExpired)
+}
+
+func (a *authExpiredDeliverAgent) Remove(_ context.Context, _ domain.TargetInfo, _ domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, _ domain.Generation) error {
+	return fmt.Errorf("%w: the addon could not use the stored credentials", domain.ErrAuthExpired)
+}
+
+// authExpiredRemoveAgent delivers normally, then refuses every removal
+// dispatch with the auth-expired sentinel, synchronously.
+type authExpiredRemoveAgent struct {
+	reporter domain.DeliveryReporter
+}
+
+func (a *authExpiredRemoveAgent) Deliver(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
+	go func() {
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered})
+	}()
+	return nil
+}
+
+func (a *authExpiredRemoveAgent) Remove(_ context.Context, _ domain.TargetInfo, _ domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, _ domain.Generation) error {
+	return fmt.Errorf("%w: the addon could not use the stored credentials", domain.ErrAuthExpired)
 }
 
 // TransientFailTargetType is a target type whose delivery agent
@@ -1182,14 +1502,14 @@ func (a *transientFailAgent) Deliver(_ context.Context, _ domain.TargetInfo, del
 	}
 	a.mu.Unlock()
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
 
 func (a *transientFailAgent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
@@ -1220,7 +1540,7 @@ func (a *terminalFailAgent) Remove(_ context.Context, _ domain.TargetInfo, deliv
 		return errors.New("terminalFailAgent: reporter is nil")
 	}
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
@@ -1235,7 +1555,7 @@ type transientRemoveAgent struct {
 
 func (a *transientRemoveAgent) Deliver(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
@@ -1249,7 +1569,7 @@ func (a *transientRemoveAgent) Remove(_ context.Context, _ domain.TargetInfo, de
 	}
 	a.mu.Unlock()
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
@@ -1275,21 +1595,48 @@ func (a *asyncFailThenSucceedAgent) Deliver(_ context.Context, _ domain.TargetIn
 	if n == 1 {
 		go func() {
 			_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
-				State:   domain.DeliveryStateFailed,
-				Message: "async delivery failed: cluster name conflict",
+				Operation: domain.DeliveryOperationDeliver,
+				State:     domain.DeliveryStateFailed,
+				Message:   "async delivery failed: cluster name conflict",
 			})
 		}()
 		return nil
 	}
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
 
 func (a *asyncFailThenSucceedAgent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
+	}()
+	return nil
+}
+
+// alwaysFailAgent reports the same terminal failure, with its reason, on
+// every delivery attempt. Used to observe a failure reason in the
+// deployment read model while the orchestration keeps retrying.
+type alwaysFailAgent struct {
+	reporter domain.DeliveryReporter
+	reason   string
+}
+
+func (a *alwaysFailAgent) Deliver(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
+	go func() {
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+			Operation: domain.DeliveryOperationDeliver,
+			State:     domain.DeliveryStateFailed,
+			Message:   a.reason,
+		})
+	}()
+	return nil
+}
+
+func (a *alwaysFailAgent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
+	go func() {
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationRemove, State: domain.DeliveryStateDelivered})
 	}()
 	return nil
 }
@@ -1298,6 +1645,13 @@ func (a *asyncFailThenSucceedAgent) Remove(_ context.Context, _ domain.TargetInf
 // default agent registration, allowing the caller to register custom
 // agents before calling this.
 func registerWorkflowsWithAgents(t *testing.T, infra Infra, registryFactory RegistryFactory, agentSetup ...func(domain.DeliveryReporter)) workflows {
+	t.Helper()
+	return registerWorkflowsWithOptions(t, infra, registryFactory, nil, agentSetup...)
+}
+
+// registerWorkflowsWithOptions is registerWorkflowsWithAgents with
+// additional orchestration workflow options (e.g. an observer).
+func registerWorkflowsWithOptions(t *testing.T, infra Infra, registryFactory RegistryFactory, specOpts []domain.OrchestrationWorkflowOption, agentSetup ...func(domain.DeliveryReporter)) workflows {
 	t.Helper()
 	reg := registryFactory(t)
 
@@ -1308,11 +1662,14 @@ func registerWorkflowsWithAgents(t *testing.T, infra Infra, registryFactory Regi
 		}
 	}
 
+	opts := append([]domain.OrchestrationWorkflowOption{
+		domain.WithVault(infra.Vault),
+		domain.WithAckRetryInterval(5 * time.Second),
+		domain.WithRetryDelay(10 * time.Millisecond),
+	}, specOpts...)
 	orchSpec := domain.NewOrchestrationWorkflowSpec(
 		infra.Store, infra.Delivery, domain.StrategyFactory{Store: infra.Store}, reg,
-		domain.WithVault(infra.Vault),
-		domain.WithAckRetryInterval(5*time.Second),
-		domain.WithRetryDelay(10*time.Millisecond),
+		opts...,
 	)
 	orchWf, err := reg.RegisterOrchestration(orchSpec)
 	if err != nil {

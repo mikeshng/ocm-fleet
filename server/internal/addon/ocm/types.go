@@ -21,10 +21,19 @@ const (
 	LabelHub = "ocm.open-cluster-management.io/hub"
 	// LabelManagedCluster is the cluster's name on that hub.
 	LabelManagedCluster = "ocm.open-cluster-management.io/managed-cluster"
+	// LabelHubClusterSet names the cluster's set on that hub as
+	// "{hub}.{set}". The hub's own cluster set label carries the set's
+	// name alone, and two hubs can each have a set of one name; this
+	// label selects the set of one hub. It is left out when the two
+	// names together are longer than a label value may be.
+	LabelHubClusterSet = "ocm.open-cluster-management.io/hub-clusterset"
 	// ClaimLabelPrefix prefixes a cluster claim's name.
 	ClaimLabelPrefix = "claim."
 
 	clusterSetLabel = "cluster.open-cluster-management.io/clusterset"
+	// clusterIDClaim is the cluster claim that carries a cluster's own
+	// identifier, where a hub's clusters publish one.
+	clusterIDClaim = "id.k8s.io"
 )
 
 // Conditions of a hub record.
@@ -39,6 +48,22 @@ const (
 // hub cannot be reached: everything else in the record is then the
 // last state seen, not the current one.
 const ConditionStale domain.ConditionType = "Stale"
+
+// ClusterConditionHubFacts is kept on the record of an enrolled cluster
+// that carries a hub's facts (its labels, its cluster set, its claims).
+// It is true while the hub that supplied them is connected, answers,
+// and still reports the cluster. Otherwise the facts are the last ones
+// seen: they still select the cluster, and nobody keeps them up to
+// date. The reason says which of the three it is.
+const ClusterConditionHubFacts domain.ConditionType = "HubFactsCurrent"
+
+// Reasons of [ClusterConditionHubFacts].
+const (
+	HubFactsCurrent          = "Current"
+	HubFactsHubUnreachable   = "HubUnreachable"
+	HubFactsHubDisconnected  = "HubDisconnected"
+	HubFactsNotReportedByHub = "NotReportedByHub"
+)
 
 // Link states: what the resource manager itself has to do with a
 // cluster a hub knows.
@@ -58,22 +83,59 @@ const (
 const (
 	// BasisEnrollment: the cluster was enrolled through this hub.
 	BasisEnrollment = "enrollment"
+	// BasisClusterID: the hub publishes the cluster's own identifier
+	// (the cluster claim "id.k8s.io"), and it is the identifier a
+	// cluster the resource manager knows reported when it was enrolled.
+	// It holds at whatever address either side reaches the cluster.
+	BasisClusterID = "cluster-id"
 	// BasisAddressAndCA: the hub records the same API address and CA
 	// as a cluster the resource manager knows.
 	BasisAddressAndCA = "address-and-ca"
 	// BasisName: only the name agrees, the hub records no address for
-	// the cluster, and exactly one candidate exists. A weak basis; it
-	// is shown so that a person can judge it.
+	// the cluster, exactly one candidate exists, and no other connected
+	// hub has a cluster of that name without an address. A weak basis;
+	// it is shown so that a person can judge it.
 	BasisName = "name"
 )
+
+// Rollout modes: how a hub's enrollment add-on reaches the hub's
+// clusters.
+const (
+	// RolloutManual: the hub's administrator enables the add-on for
+	// one cluster at a time.
+	RolloutManual = "manual"
+	// RolloutEveryCluster: the hub enables the add-on for every cluster
+	// it has, its own cluster included when that is registered with
+	// the hub, and for every cluster that joins later.
+	RolloutEveryCluster = "every-cluster"
+	// RolloutPlacement: the hub enables the add-on for the clusters a
+	// Placement of the hub administrator's selects.
+	RolloutPlacement = "placement"
+)
+
+// EnrollmentRollout says how an enrollment add-on reaches a hub's
+// clusters.
+type EnrollmentRollout struct {
+	Mode string `json:"mode"`
+	// PlacementNamespace and PlacementName name the Placement the
+	// add-on follows. They are set by the caller for the mode
+	// "placement" and name the generated Placement for the mode
+	// "every-cluster".
+	PlacementNamespace string `json:"placementNamespace,omitempty"`
+	PlacementName      string `json:"placementName,omitempty"`
+}
 
 // HubObservation is the observation payload of a hub record. It holds
 // nothing secret: the connection is kept in the vault.
 type HubObservation struct {
-	ID                  string     `json:"id"`
-	DisplayName         string     `json:"displayName,omitempty"`
-	APIServer           string     `json:"apiServer"`
-	CAFingerprint       string     `json:"caFingerprint,omitempty"`
+	ID            string `json:"id"`
+	DisplayName   string `json:"displayName,omitempty"`
+	APIServer     string `json:"apiServer"`
+	CAFingerprint string `json:"caFingerprint,omitempty"`
+	// ClusterUID identifies the cluster the hub runs on, whatever
+	// address it is reached at: the UID of its kube-system namespace.
+	// Empty for a hub whose credential may not read it.
+	ClusterUID          string     `json:"clusterUID,omitempty"`
 	ServiceAccount      string     `json:"serviceAccount,omitempty"`
 	ConnectedBy         string     `json:"connectedBy,omitempty"`
 	ConnectedAt         *time.Time `json:"connectedAt,omitempty"`
@@ -87,6 +149,24 @@ type HubObservation struct {
 	AcceptedCount    int  `json:"acceptedCount"`
 	AvailableCount   int  `json:"availableCount"`
 	EnrolledCount    int  `json:"enrolledCount"`
+	// EnrolledThroughHubCount counts the hub's clusters that were
+	// enrolled through the hub's own add-on. They are the ones that
+	// depend on a valid enrollment secret of the hub: their agents
+	// present it again from time to time, which repairs an enrollment.
+	EnrolledThroughHubCount int `json:"enrolledThroughHubCount"`
+	// EnrollmentRollout is how the enrollment add-on last generated
+	// for the hub reaches its clusters; nil until one was generated
+	// for this connection. The integration does not read the add-on on
+	// the hub: this is what the generated manifest says, not what the
+	// hub's administrator applied.
+	EnrollmentRollout *EnrollmentRollout `json:"enrollmentRollout,omitempty"`
+	// EnrollmentSecrets counts the valid enrollment secrets that cover
+	// the hub's clusters. With none, an add-on on the hub carries a
+	// secret that is not accepted any more: no cluster of the hub can
+	// enroll through it, and the clusters counted by
+	// EnrolledThroughHubCount cannot repair their enrollment, until an
+	// add-on is generated and applied again.
+	EnrollmentSecrets int `json:"enrollmentSecrets"`
 	// SearchTerms lists the exact words plain search matches on.
 	SearchTerms []string `json:"searchTerms"`
 }

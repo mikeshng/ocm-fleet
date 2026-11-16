@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
@@ -249,14 +251,14 @@ func TestDeleteManifests_PropagatesDeleteError(t *testing.T) {
 	t.Parallel()
 	a := NewDeliveryAgent(nopReporterForInternal{})
 	cfg := &rest.Config{Host: "https://127.0.0.1:1", BearerToken: "tok"}
-	err := a.deleteManifests(context.Background(), cfg, []domain.Manifest{{
+	_, err := a.deleteManifests(context.Background(), cfg, []domain.Manifest{{
 		ManifestType: ManifestManifestType,
 		Raw:          json.RawMessage(jsonRawCM("doomed")),
-	}})
+	}}, nil)
 	if err == nil {
 		t.Fatal("expected delete error against unreachable API")
 	}
-	if !strings.Contains(err.Error(), "delete manifest") {
+	if !strings.Contains(err.Error(), "remove manifest") {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -265,10 +267,10 @@ func TestDeleteManifests_InvalidManifestJSON(t *testing.T) {
 	t.Parallel()
 	a := NewDeliveryAgent(nopReporterForInternal{})
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443", BearerToken: "tok"}
-	err := a.deleteManifests(context.Background(), cfg, []domain.Manifest{{
+	_, err := a.deleteManifests(context.Background(), cfg, []domain.Manifest{{
 		ManifestType: ManifestManifestType,
 		Raw:          json.RawMessage(`{not-json`),
-	}})
+	}}, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid manifest JSON")
 	}
@@ -341,7 +343,7 @@ func TestApplyManifests_ReportsProgress(t *testing.T) {
 		ManifestType: ManifestManifestType,
 		Raw:          json.RawMessage(jsonRawCM("progress-cm")),
 	}}
-	a.applyManifests(context.Background(), target, "d1", 1, cfg, manifests)
+	a.applyManifests(context.Background(), target, "d1", 1, cfg, manifests, false)
 	if len(reporter.events) == 0 {
 		t.Fatal("expected at least one progress event")
 	}
@@ -358,7 +360,7 @@ func TestDeleteManifests_EmptyManifestsSucceeds(t *testing.T) {
 	a := NewDeliveryAgent(nopReporterForInternal{})
 	// Invalid host still builds clients; empty manifests succeed.
 	cfg := &rest.Config{Host: "https://127.0.0.1:6443", BearerToken: "tok"}
-	if err := a.deleteManifests(context.Background(), cfg, nil); err != nil {
+	if _, err := a.deleteManifests(context.Background(), cfg, nil, nil); err != nil {
 		t.Fatalf("empty deleteManifests: %v", err)
 	}
 }
@@ -413,4 +415,42 @@ func (r *deliveryRecordingReporter) ReportResult(_ context.Context, _ domain.Del
 }
 func (r *deliveryRecordingReporter) ListActiveDeliveries(context.Context, []domain.TargetID) ([]domain.ActiveDelivery, error) {
 	return nil, nil
+}
+
+// TestFailureForErrorWording pins what a refused call says about the
+// credential that was used. A refusal of the caller's own token names
+// why that token was used (unsigned intent, no grant for it) and both
+// ways out; a refusal of the stored credential keeps its own wording and
+// does not borrow the caller's.
+func TestFailureForErrorWording(t *testing.T) {
+	unauthorized := apierrors.NewUnauthorized("Unauthorized")
+	forbidden := apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, "test", errors.New("denied"))
+	cases := []struct {
+		name         string
+		err          error
+		stored       bool
+		wantState    domain.DeliveryState
+		wantUnsigned bool
+		wantStored   bool
+	}{
+		{"caller's token refused", unauthorized, false, domain.DeliveryStateAuthFailed, true, false},
+		{"caller's token forbidden", forbidden, false, domain.DeliveryStateAuthFailed, true, false},
+		{"stored credential refused", unauthorized, true, domain.DeliveryStateFailed, false, true},
+		{"stored credential forbidden", forbidden, true, domain.DeliveryStateAuthFailed, false, false},
+		{"another failure", errors.New("boom"), false, domain.DeliveryStateFailed, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state, message := failureForError(tc.err, tc.stored)
+			if state != tc.wantState {
+				t.Fatalf("state = %q, want %q; message: %s", state, tc.wantState, message)
+			}
+			if got := strings.Contains(message, unsignedWithoutGrant); got != tc.wantUnsigned {
+				t.Errorf("message names the unsigned deployment = %v, want %v; message: %s", got, tc.wantUnsigned, message)
+			}
+			if got := strings.Contains(message, storedCredentialNotRecognized); got != tc.wantStored {
+				t.Errorf("message names the stored credential = %v, want %v; message: %s", got, tc.wantStored, message)
+			}
+		})
+	}
 }

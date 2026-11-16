@@ -67,6 +67,7 @@ func loadServeConfig(f *serveFlags, sel serveSelections) (bootstrap.Config, erro
 		EnrollmentCABundle:            enrollmentCA,
 		EnrollmentConnectAddress:      f.enrollmentConnectAddress,
 		EnrollmentAgentImage:          f.enrollmentAgentImage,
+		ClusterEgressAllow:            f.clusterEgressAllow,
 	})
 }
 

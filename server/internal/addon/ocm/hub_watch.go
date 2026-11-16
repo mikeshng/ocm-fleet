@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,23 +62,33 @@ type hubWatch struct {
 	// writeMu serializes writes of the hub's own record.
 	writeMu sync.Mutex
 
-	mu         sync.Mutex
-	conn       HubConnection
-	obs        HubObservation
-	conds      map[domain.ConditionType]domain.Condition
-	dirty      map[string]struct{}
-	written    map[string][sha256.Size]byte
-	links      map[string]clusterLink
+	mu      sync.Mutex
+	conn    HubConnection
+	obs     HubObservation
+	conds   map[domain.ConditionType]domain.Condition
+	dirty   map[string]struct{}
+	written map[string][sha256.Size]byte
+	links   map[string]clusterLink
+	// linked holds the targets the hub's records are linked to.
+	linked map[domain.TargetID]struct{}
+	// facts holds, per enrolled cluster that carries this hub's facts,
+	// the reason last written to its record (see
+	// [ClusterConditionHubFacts]), so that an unchanged answer is not
+	// written again.
+	facts      map[string]string
 	linksDirty bool
 	synced     bool
 	// staleSince is when the hub stopped answering; zero while it answers.
 	staleSince time.Time
-	failures   int
-	lastProbe  time.Time
-	lastLinks  time.Time
-	lastRenew  time.Time
-	lastWrite  time.Time
-	hubHash    [sha256.Size]byte
+	// storedStale says the records of an earlier run were marked stale
+	// because the hub stopped answering before it was read in this one.
+	storedStale bool
+	failures    int
+	lastProbe   time.Time
+	lastLinks   time.Time
+	lastRenew   time.Time
+	lastWrite   time.Time
+	hubHash     [sha256.Size]byte
 }
 
 func newHubWatch(svc *Service, hubID string, conn HubConnection, obs HubObservation) *hubWatch {
@@ -90,6 +102,7 @@ func newHubWatch(svc *Service, hubID string, conn HubConnection, obs HubObservat
 		dirty:      map[string]struct{}{},
 		written:    map[string][sha256.Size]byte{},
 		links:      map[string]clusterLink{},
+		facts:      map[string]string{},
 		linksDirty: true,
 	}
 }
@@ -112,6 +125,14 @@ func (hw *hubWatch) observation() HubObservation {
 	return hw.obs
 }
 
+// snapshot returns the hub's observation and its conditions as the
+// hub's record carries them now.
+func (hw *hubWatch) snapshot(now time.Time) (HubObservation, []domain.Condition) {
+	hw.mu.Lock()
+	defer hw.mu.Unlock()
+	return hw.snapshotLocked(now)
+}
+
 func (hw *hubWatch) isSynced() bool {
 	hw.mu.Lock()
 	defer hw.mu.Unlock()
@@ -122,6 +143,18 @@ func (hw *hubWatch) markLinksDirty() {
 	hw.mu.Lock()
 	hw.linksDirty = true
 	hw.mu.Unlock()
+}
+
+// noteEnrollmentAddon records that an enrollment add-on was generated
+// for the hub: its rollout, and how many valid enrollment secrets the
+// hub has now (a negative count is not recorded).
+func (hw *hubWatch) noteEnrollmentAddon(rollout EnrollmentRollout, secrets int) {
+	hw.mu.Lock()
+	defer hw.mu.Unlock()
+	hw.obs.EnrollmentRollout = &rollout
+	if secrets >= 0 {
+		hw.obs.EnrollmentSecrets = secrets
+	}
 }
 
 func (hw *hubWatch) linkOf(name string) clusterLink {
@@ -240,12 +273,31 @@ func (hw *hubWatch) tick(ctx context.Context) {
 			hw.svc.logger.Warn("could not reconcile the hub's observed clusters; will retry", "hub", hw.id, "error", err)
 			return
 		}
+		// What this hub knows can change what a name means on another.
+		hw.svc.markLinksDirty()
 	}
 
 	hw.mu.Lock()
 	synced := hw.synced
 	linksDue := synced && (hw.linksDirty || now.Sub(hw.lastLinks) >= hubLinkInterval)
+	staleSince := hw.staleSince
+	storedStaleDue := !synced && !staleSince.IsZero() && !hw.storedStale
 	hw.mu.Unlock()
+	if storedStaleDue {
+		err := hw.markStoredStale(ctx, staleSince, now)
+		if err == nil {
+			err = hw.markFactsUnreachable(ctx)
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				hw.svc.logger.Warn("could not mark the hub's recorded clusters stale; will retry", "hub", hw.id, "error", err)
+			}
+		} else {
+			hw.mu.Lock()
+			hw.storedStale = true
+			hw.mu.Unlock()
+		}
+	}
 	if linksDue {
 		if err := hw.recomputeLinks(ctx, now); err != nil {
 			hw.svc.logger.Warn("could not match the hub's clusters with the resource manager's; will retry", "hub", hw.id, "error", err)
@@ -312,6 +364,8 @@ func (hw *hubWatch) probe(ctx context.Context, now time.Time) {
 		}
 		if !hw.staleSince.IsZero() {
 			hw.staleSince = time.Time{}
+			hw.storedStale = false
+			hw.linksDirty = true
 			hw.markAllDirtyLocked()
 			hw.svc.logger.Info("hub answers again; observed clusters are current", "hub", hw.id)
 		}
@@ -329,6 +383,7 @@ func (hw *hubWatch) probe(ctx context.Context, now time.Time) {
 	hw.failures++
 	if hw.failures >= hubFailuresBeforeStale && hw.staleSince.IsZero() {
 		hw.staleSince = now
+		hw.linksDirty = true
 		hw.markAllDirtyLocked()
 		hw.svc.logger.Warn("hub does not answer; its observed clusters are marked stale", "hub", hw.id, "error", err)
 	}
@@ -338,6 +393,50 @@ func (hw *hubWatch) markAllDirtyLocked() {
 	for _, key := range hw.informer.GetStore().ListKeys() {
 		hw.dirty[key] = struct{}{}
 	}
+}
+
+// markStoredStale adds the Stale condition to the records the hub's
+// clusters already have. It serves a hub that stops answering before
+// its clusters have been read, as after a restart of the resource
+// manager during an outage of the hub: the watch then holds no cluster
+// to write a record from, and the records of the earlier run would
+// read as current. Once the hub has been read, every record is written
+// again from what the hub says.
+func (hw *hubWatch) markStoredStale(ctx context.Context, since, now time.Time) error {
+	records, err := hw.svc.listRecords(ctx, ManagedClusterResourceType)
+	if err != nil {
+		return fmt.Errorf("list observed clusters: %w", err)
+	}
+	stale, _ := domain.NewCondition(ConditionStale, domain.ConditionTrue, "HubUnreachable",
+		"the hub does not answer; this is the last state seen", since)
+	prefix := string(ManagedClusterRecordName(hw.id, ""))
+	var reports []kubernetesaddon.InventoryObjectReport
+	for _, res := range records {
+		inv := res.Inventory()
+		if !strings.HasPrefix(string(res.Name()), prefix) || inv == nil || inv.Observation() == nil {
+			continue
+		}
+		conds := inv.Conditions()
+		if slices.ContainsFunc(conds, func(c domain.Condition) bool { return c.Type() == ConditionStale }) {
+			continue
+		}
+		reports = append(reports, kubernetesaddon.InventoryObjectReport{
+			Name:        res.Name(),
+			Labels:      inv.Labels(),
+			Observation: inv.Observation(),
+			Conditions:  append(append([]domain.Condition{}, conds...), stale),
+			ObservedAt:  now,
+		})
+	}
+	for len(reports) > 0 {
+		n := min(len(reports), hubFlushBatch)
+		if err := hw.svc.records.ReplaceBatch(ctx, ManagedClusterResourceType, reports[:n]); err != nil {
+			return err
+		}
+		reports = reports[n:]
+	}
+	hw.svc.logger.Warn("hub has not answered since this process started; its recorded clusters are marked stale", "hub", hw.id)
+	return nil
 }
 
 // renewIfDue asks the hub for a new credential when a third of the
@@ -389,6 +488,13 @@ func (hw *hubWatch) renewIfDue(ctx context.Context, now time.Time) {
 		return
 	}
 	conn.Token = newToken
+	if !hw.svc.isCurrentWatch(hw) {
+		// The watch was replaced while the hub was answering. Its
+		// successor renews with its own connection; storing this token
+		// would overwrite the credential of the connection that replaced
+		// it.
+		return
+	}
 	if err := hw.svc.storeConnection(ctx, hw.id, conn); err != nil {
 		hw.svc.logger.Warn("could not store the renewed hub credential; will retry", "hub", hw.id, "error", err)
 		return
@@ -429,6 +535,13 @@ func (hw *hubWatch) recomputeLinks(ctx context.Context, now time.Time) error {
 		return fail(err)
 	}
 	idx := newTargetIndex(targets)
+	idx.nameElsewhere = func(name string) []string { return hw.svc.hubsWithUnaddressed(name, hw.id) }
+	secrets := hw.svc.enrollmentSecrets(ctx, hw.id)
+	withdrawnIdx := newWithdrawnIndex(withdrawn)
+	withdrawnIDs := make(map[string]struct{}, len(withdrawn))
+	for _, w := range withdrawn {
+		withdrawnIDs[w.id] = struct{}{}
+	}
 	byID := make(map[domain.TargetID]domain.TargetInfo, len(targets))
 	for _, t := range targets {
 		byID[t.ID()] = t
@@ -439,8 +552,12 @@ func (hw *hubWatch) recomputeLinks(ctx context.Context, now time.Time) error {
 		labels    map[string]string
 	}
 	var updates []labelUpdate
+	// backed holds the enrolled clusters whose hub facts this hub keeps:
+	// a record of the hub is linked to the cluster, and the facts on
+	// the cluster's target are this hub's or nobody's yet.
+	backed := map[string]struct{}{}
 	links := map[string]clusterLink{}
-	var accepted, available, enrolled int
+	var accepted, available, enrolled, throughHub int
 	objects := hw.informer.GetStore().List()
 	for _, raw := range objects {
 		obj, ok := raw.(*unstructured.Unstructured)
@@ -450,11 +567,17 @@ func (hw *hubWatch) recomputeLinks(ctx context.Context, now time.Time) error {
 		c := parseManagedCluster(obj)
 		link := idx.match(hw.id, c)
 		if link.link.State == LinkObserved && link.conflict == "" {
-			if _, was := withdrawn[ClusterIDFor(hw.id, c.name)]; was {
-				link.link = EnrollmentLink{
-					State:   LinkWithdrawn,
-					Cluster: string(kubernetesaddon.ClusterRecordName(ClusterIDFor(hw.id, c.name))),
-				}
+			clusterID := ClusterIDFor(hw.id, c.name)
+			_, withdrawnByID := withdrawnIDs[clusterID]
+			id, matched := withdrawnIdx.match(c)
+			switch {
+			case matched:
+				link = withdrawnLink(id)
+			case withdrawnByID:
+				// The hub's names lead to a withdrawn record, and the
+				// address and CA it records either are missing or are
+				// shared by several withdrawn records.
+				link = withdrawnLink(clusterID)
 			}
 		}
 		links[c.name] = link
@@ -468,6 +591,9 @@ func (hw *hubWatch) recomputeLinks(ctx context.Context, now time.Time) error {
 			continue
 		}
 		enrolled++
+		if link.link.Basis == BasisEnrollment {
+			throughHub++
+		}
 		target := byID[link.target]
 		clusterID, ok := kubernetesaddon.ClusterIDFromTarget(target)
 		if !ok || link.link.Basis == BasisName {
@@ -479,22 +605,32 @@ func (hw *hubWatch) recomputeLinks(ctx context.Context, now time.Time) error {
 		if owner := current[LabelHub]; owner != "" && owner != hw.id {
 			continue
 		}
+		backed[clusterID] = struct{}{}
 		if desired := c.targetLabels(hw.id); !sameLabels(current, desired) {
 			updates = append(updates, labelUpdate{clusterID: clusterID, labels: desired})
 		}
 	}
 
 	hw.mu.Lock()
+	linked := map[domain.TargetID]struct{}{}
 	for name, link := range links {
 		if prev, ok := hw.links[name]; !ok || prev != link {
 			hw.dirty[name] = struct{}{}
 		}
+		if link.target != "" {
+			linked[link.target] = struct{}{}
+		}
 	}
 	hw.links = links
+	hw.linked = linked
 	hw.obs.ClusterCount = len(objects)
 	hw.obs.AcceptedCount = accepted
 	hw.obs.AvailableCount = available
 	hw.obs.EnrolledCount = enrolled
+	hw.obs.EnrolledThroughHubCount = throughHub
+	if secrets >= 0 {
+		hw.obs.EnrollmentSecrets = secrets
+	}
 	hw.mu.Unlock()
 
 	if hw.svc.enrollment == nil {
@@ -512,7 +648,82 @@ func (hw *hubWatch) recomputeLinks(ctx context.Context, now time.Time) error {
 			hw.svc.logger.Info("hub facts applied to enrolled cluster", "hub", hw.id, "cluster", u.clusterID, "labels", len(u.labels))
 		}
 	}
+	if err := hw.writeFacts(ctx, targets, backed); err != nil {
+		return fail(err)
+	}
 	return nil
+}
+
+// writeFacts says, on the record of every enrolled cluster that carries
+// this hub's facts, whether those facts are current (see
+// [ClusterConditionHubFacts]). backed holds the clusters the hub still
+// reports; nil means the hub has not been read, so that nothing is
+// known about that.
+func (hw *hubWatch) writeFacts(ctx context.Context, targets []domain.TargetInfo, backed map[string]struct{}) error {
+	hw.mu.Lock()
+	stale := !hw.staleSince.IsZero()
+	hw.mu.Unlock()
+	seen := map[string]struct{}{}
+	for _, t := range targets {
+		if !kubernetesaddon.IsEnrolledTarget(t) {
+			continue
+		}
+		clusterID, ok := kubernetesaddon.ClusterIDFromTarget(t)
+		if !ok {
+			continue
+		}
+		_, isBacked := backed[clusterID]
+		if externalLabelsOf(t)[LabelHub] != hw.id && !isBacked {
+			continue
+		}
+		seen[clusterID] = struct{}{}
+		status, reason, message := domain.ConditionTrue, HubFactsCurrent, fmt.Sprintf("the labels from hub %q are current", hw.id)
+		switch {
+		case stale:
+			status, reason = domain.ConditionFalse, HubFactsHubUnreachable
+			message = fmt.Sprintf("hub %q does not answer; the labels it supplied are the last ones seen", hw.id)
+		case backed != nil && !isBacked:
+			status, reason = domain.ConditionFalse, HubFactsNotReportedByHub
+			message = fmt.Sprintf("hub %q no longer reports this cluster; the labels it supplied are the last ones seen and are no longer updated", hw.id)
+		}
+		hw.mu.Lock()
+		unchanged := hw.facts[clusterID] == reason
+		hw.mu.Unlock()
+		if unchanged {
+			continue
+		}
+		if _, err := hw.svc.enrollment.SetExternalCondition(ctx, clusterID, ClusterConditionHubFacts, status, reason, message); err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("record the state of the hub facts of cluster %q: %w", clusterID, err)
+		}
+		hw.mu.Lock()
+		hw.facts[clusterID] = reason
+		hw.mu.Unlock()
+	}
+	hw.mu.Lock()
+	for clusterID := range hw.facts {
+		if _, ok := seen[clusterID]; !ok {
+			delete(hw.facts, clusterID)
+		}
+	}
+	hw.mu.Unlock()
+	return nil
+}
+
+// markFactsUnreachable is writeFacts for a hub that has not answered
+// since this process started: what its clusters carry of it is the last
+// state seen.
+func (hw *hubWatch) markFactsUnreachable(ctx context.Context) error {
+	if hw.svc.enrollment == nil {
+		return nil
+	}
+	targets, err := hw.svc.listTargets(ctx)
+	if err != nil {
+		return err
+	}
+	return hw.writeFacts(ctx, targets, nil)
 }
 
 // flush writes the records of clusters that changed, a batch at a
@@ -673,6 +884,13 @@ func (hw *hubWatch) snapshotLocked(now time.Time) (HubObservation, []domain.Cond
 			break
 		}
 	}
+	// A hub that was asked and did not answer is not starting, whatever
+	// else is still unknown about it.
+	if ready == domain.ConditionUnknown {
+		if c, ok := hw.conds[HubConditionConnected]; ok && c.Status() == domain.ConditionFalse {
+			ready, reason, message = domain.ConditionFalse, c.Reason(), c.Message()
+		}
+	}
 	hw.setCondLocked(HubConditionReady, ready, reason, message, now)
 
 	obs := hw.obs
@@ -717,16 +935,54 @@ func (hw *hubWatch) writeHubRecord(ctx context.Context, now time.Time, force boo
 	lastWrite, lastHash := hw.lastWrite, hw.hubHash
 	hw.mu.Unlock()
 
-	raw, err := json.Marshal(obs)
+	raw, hash, err := hubRecordPayload(obs, conds)
 	if err != nil {
 		return fmt.Errorf("encode record of hub %q: %w", hw.id, err)
 	}
-	// The last-seen time alone does not make the record different.
+	if !force && hash == lastHash && now.Sub(lastWrite) < hubRecordInterval {
+		return nil
+	}
+	if !hw.svc.isCurrentWatch(hw) {
+		// A replaced watch must not write the hub's record: its
+		// successor owns it, and a disconnected hub has no record left
+		// to write.
+		return nil
+	}
+	return hw.persistRecord(ctx, now, raw, conds, hash)
+}
+
+// writeInitialHubRecord writes the record of a watch that is not
+// registered yet, as Connect does before it stores the credential and
+// starts the watch. Connect serializes with every other hub operation,
+// and the watch it replaces is already stopped, so the id has no other
+// writer at this point.
+func (hw *hubWatch) writeInitialHubRecord(ctx context.Context, now time.Time) error {
+	hw.writeMu.Lock()
+	defer hw.writeMu.Unlock()
+
+	hw.mu.Lock()
+	obs, conds := hw.snapshotLocked(now)
+	hw.mu.Unlock()
+
+	raw, hash, err := hubRecordPayload(obs, conds)
+	if err != nil {
+		return fmt.Errorf("encode record of hub %q: %w", hw.id, err)
+	}
+	return hw.persistRecord(ctx, now, raw, conds, hash)
+}
+
+// hubRecordPayload encodes a hub's record and hashes its content. The
+// last-seen time alone does not make the record different.
+func hubRecordPayload(obs HubObservation, conds []domain.Condition) (json.RawMessage, [sha256.Size]byte, error) {
+	raw, err := json.Marshal(obs)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, err
+	}
 	stable := obs
 	stable.LastSeenAt = nil
 	stableRaw, err := json.Marshal(stable)
 	if err != nil {
-		return fmt.Errorf("encode record of hub %q: %w", hw.id, err)
+		return nil, [sha256.Size]byte{}, err
 	}
 	h := sha256.New()
 	h.Write(stableRaw)
@@ -735,20 +991,14 @@ func (hw *hubWatch) writeHubRecord(ctx context.Context, now time.Time, force boo
 	}
 	var hash [sha256.Size]byte
 	copy(hash[:], h.Sum(nil))
-	if !force && hash == lastHash && now.Sub(lastWrite) < hubRecordInterval {
-		return nil
-	}
+	return raw, hash, nil
+}
 
-	msg := json.RawMessage(raw)
-	labels := map[string]string{}
-	if err := hw.svc.records.ReplaceBatch(ctx, HubResourceType, []kubernetesaddon.InventoryObjectReport{{
-		Name:        HubRecordName(hw.id),
-		Labels:      labels,
-		Observation: &msg,
-		Conditions:  conds,
-		ObservedAt:  now,
-	}}); err != nil {
-		return fmt.Errorf("write record of hub %q: %w", hw.id, err)
+// persistRecord stores the hub's record and remembers what was written,
+// so that an unchanged record is not written again.
+func (hw *hubWatch) persistRecord(ctx context.Context, now time.Time, raw json.RawMessage, conds []domain.Condition, hash [sha256.Size]byte) error {
+	if err := hw.svc.storeHubRecord(ctx, hw.id, raw, conds, now); err != nil {
+		return err
 	}
 	hw.mu.Lock()
 	hw.lastWrite, hw.hubHash = now, hash

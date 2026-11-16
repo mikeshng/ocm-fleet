@@ -10,30 +10,30 @@ The core management API for a fleet becomes a **standalone server API**: the res
 
 Today an OCM-io hub's Kubernetes API and etcd are both the management API and its store. A dedicated management API with its own datastore is the conventional shape of managed, multitenant cluster services, and this design moves toward it.
 
-It gets there beside OCM-io, not through it. Someone who already runs a hub and many managed clusters installs the management plane, connects the hub, and sees every cluster. The clusters they choose are then *enrolled*: each gets a small, declared access piece, stays registered with its hub, and keeps its agent untouched. From then on the resource manager deploys to those clusters, indexes them, and shows them with its own machinery, in its own API and console. OCM-io keeps doing what it does on the same clusters, and a workload moves from one system to the other only when its owner moves it. The resource manager never asks a hub to deliver or store anything for it. It replaces the *essential* need for Kubernetes controllers and Kubernetes-stored state in fleet management, and stays compatible with their *supplemental* use.
+It gets there beside OCM-io, not through it. Someone who already runs a hub and many managed clusters installs the management plane, connects the hub, and sees every cluster. The clusters they choose are then _enrolled_: each gets a small, declared access piece, stays registered with its hub, and keeps its agent untouched. From then on the resource manager deploys to those clusters, indexes them, and shows them with its own machinery, in its own API and console. OCM-io keeps doing what it does on the same clusters, and a workload moves from one system to the other only when its owner moves it. The resource manager never asks a hub to deliver or store anything for it. It replaces the _essential_ need for Kubernetes controllers and Kubernetes-stored state in fleet management, and stays compatible with their _supplemental_ use.
 
 The price is one more service and one more database to operate. The return is six things an extension of the Kubernetes API does not provide efficiently.
 
 ## Why
 
-| | Motivation | The requirement in one line |
-|---|---|---|
-| MO-1 | Scale | Management state grows in a database that scales independently of any Kubernetes control plane. The design target is 10,000 clusters. |
-| MO-2 | Multitenancy | One management plane with its own tenancy model, hard isolation, and per-tenant quality of service, instead of a hub per tenant. |
-| MO-3 | Security and attribution | Every change is attributable to an end user or a workload identity, a user's token is passed through without being stored, and access is fine-grained. |
-| MO-4 | Inventory, search, and history | Durable fleet-wide inventory and search, and a record of who changed what, and when. |
-| MO-5 | Reliability and recovery | Management state is backed up, restored, and failed over with database procedures against declared objectives. |
-| MO-6 | Independence from Kubernetes | The management plane runs without Kubernetes, from one process on a laptop to a replicated deployment. |
+|      | Motivation                     | The requirement in one line                                                                                                                            |
+| ---- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| MO-1 | Scale                          | Management state grows in a database that scales independently of any Kubernetes control plane. The design target is 10,000 clusters.                  |
+| MO-2 | Multitenancy                   | One management plane with its own tenancy model, hard isolation, and per-tenant quality of service, instead of a hub per tenant.                       |
+| MO-3 | Security and attribution       | Every change is attributable to an end user or a workload identity, a user's token is passed through without being stored, and access is fine-grained. |
+| MO-4 | Inventory, search, and history | Durable fleet-wide inventory and search, and a record of who changed what, and when.                                                                   |
+| MO-5 | Reliability and recovery       | Management state is backed up, restored, and failed over with database procedures against declared objectives.                                         |
+| MO-6 | Independence from Kubernetes   | The management plane runs without Kubernetes, from one process on a laptop to a replicated deployment.                                                 |
 
 The evidence for each, the alternatives considered, and the costs accepted are in [analysis.md](analysis.md).
 
 ## How it is introduced
 
-| Phase | Who leads | What OCM-io users notice |
-|---|---|---|
-| **1. Alongside** | OCM-io. The management plane connects to one or more hubs and shows every cluster, with its labels, cluster sets, and state. It changes nothing on a hub or on a cluster. | Nothing. |
-| **2. Leading** | The resource manager, for the clusters that enroll and for the intent it holds. It delivers through its own API and its own delivery, indexes those clusters, and keeps every record in its database. OCM-io leads for everything else, on the same clusters. | Their hub, agents, objects, and pipelines work as before. An enrolled cluster carries a small access piece. A hub stores nothing for what the resource manager delivers. |
-| **3. Standalone** | The resource manager. No hub is required. | A hub is optional, kept only for what they still choose to run on it. |
+| Phase             | Who leads                                                                                                                                                                                                                                                     | What OCM-io users notice                                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **1. Alongside**  | OCM-io. The management plane connects to one or more hubs and shows every cluster, with its labels, cluster sets, and state. It changes nothing on a hub or on a cluster.                                                                                     | Nothing.                                                                                                                                                                 |
+| **2. Leading**    | The resource manager, for the clusters that enroll and for the intent it holds. It delivers through its own API and its own delivery, indexes those clusters, and keeps every record in its database. OCM-io leads for everything else, on the same clusters. | Their hub, agents, objects, and pipelines work as before. An enrolled cluster carries a small access piece. A hub stores nothing for what the resource manager delivers. |
+| **3. Standalone** | The resource manager. No hub is required.                                                                                                                                                                                                                     | A hub is optional, kept only for what they still choose to run on it.                                                                                                    |
 
 Every step is opt-in: a hub to connect, a cluster to enroll, a workload to move. Each has a way back, and each phase is useful without the next.
 
@@ -82,17 +82,17 @@ The first increment, which is still to be built, brings that experience to a fir
 
 ## Document map
 
-| Document | Contains | Normative |
-|---|---|---|
-| **README.md** | Orientation and glossary | No |
-| **[requirements.md](requirements.md)** | The decision, motivations MO, principles AD, outcomes F, phases Z, and the requirement families A, K, GO, X, I, M, EN, W, T, S, IS, R, N, U, O, V, C, and non-goals G | **Yes** |
-| **[use-cases.md](use-cases.md)** | Personas and user stories UC | No |
-| **[analysis.md](analysis.md)** | Evidence for each motivation, alternatives, tradeoffs, what both systems do today, compatibility analysis, and sources | No |
-| **[topologies.md](topologies.md)** | Deployment shapes, datastore arrangements, what runs where, and the first supported combination | No |
-| **[decisions.md](decisions.md)** | Recorded directions DR, open questions OQ, and tensions | No |
-| **[baseline-hypotheses.md](baseline-hypotheses.md)** | Candidate mechanisms BH | No |
-| **[enhancements.md](enhancements.md)** | OCM-io options E, resource manager capabilities FC, and rejected solutions RS | No |
-| **[coverage.md](coverage.md)** | What exists, what is hypothesis, and the declared gaps GAP | No |
+| Document                                             | Contains                                                                                                                                                              | Normative |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| **README.md**                                        | Orientation and glossary                                                                                                                                              | No        |
+| **[requirements.md](requirements.md)**               | The decision, motivations MO, principles AD, outcomes F, phases Z, and the requirement families A, K, GO, X, I, M, EN, W, T, S, IS, R, N, U, O, V, C, and non-goals G | **Yes**   |
+| **[use-cases.md](use-cases.md)**                     | Personas and user stories UC                                                                                                                                          | No        |
+| **[analysis.md](analysis.md)**                       | Evidence for each motivation, alternatives, tradeoffs, what both systems do today, compatibility analysis, and sources                                                | No        |
+| **[topologies.md](topologies.md)**                   | Deployment shapes, datastore arrangements, what runs where, and the first supported combination                                                                       | No        |
+| **[decisions.md](decisions.md)**                     | Recorded directions DR, open questions OQ, and tensions                                                                                                               | No        |
+| **[baseline-hypotheses.md](baseline-hypotheses.md)** | Candidate mechanisms BH                                                                                                                                               | No        |
+| **[enhancements.md](enhancements.md)**               | OCM-io options E, resource manager capabilities FC, and rejected solutions RS                                                                                         | No        |
+| **[coverage.md](coverage.md)**                       | What exists, what is hypothesis, and the declared gaps GAP                                                                                                            | No        |
 
 Requirements are the only normative document. No other document can relax one.
 
@@ -106,13 +106,13 @@ Normative terms are defined in requirements.md section 1.3. The most used are re
 - **Integration**: everything that connects OCM-io and the resource manager. It is an extension of the resource manager: a server add-on and a console plugin.
 - **Hub connection**: one OCM-io hub the management plane is configured to read.
 - **Observed cluster**: a cluster the management plane knows through a hub connection. Nothing has been added to it.
-- **Enrollment**: the opt-in step that gives the management plane access to one cluster, by adding a declared access piece to it. The cluster stays registered with its hub. **Withdrawal** reverses it.
-- **Access form**: how the management plane reaches an enrolled cluster. *Direct*: the resource manager calls the cluster's API. *Agent*: the resource manager's own agent on the cluster connects out and acts locally.
-- **Delivery path**: how intent reaches a cluster: *direct* or *agent*, following the access form, or optionally *work agent*, where the management plane serves OCM-io's work agent. Writing a `ManifestWork` to a hub is not one of them.
+- **Enrollment**: the opt-in step that gives the management plane access to one cluster, by adding a declared access piece to it. The cluster stays registered with its hub. **Withdrawal** removes the target, credential, and indexing; the access piece stays on the cluster until the cluster's administrator or the declared route removes it.
+- **Access form**: how the management plane reaches an enrolled cluster. _Direct_: the resource manager calls the cluster's API. _Agent_: the resource manager's own agent on the cluster connects out and acts locally.
+- **Delivery path**: how intent reaches a cluster: _direct_ or _agent_, following the access form, or optionally _work agent_, where the management plane serves OCM-io's work agent. Writing a `ManifestWork` to a hub is not one of them.
 - **Aspect**: a set of management facts with one owner at a time, such as cluster membership or workload intent.
 - **System of record**: the one place whose value for an aspect is authoritative.
 - **Cutover**: the explicit operation that moves the system of record for an aspect from a hub to the resource manager. The smallest is the **move** of one workload.
-- **Compatibility mode**: how an OCM-io API kind is offered. *Native*: OCM-io's controllers act on it. *Driven*: its objects drive the management API. *Projected*: the integration writes it, read-only, from management-plane state. On a hub everything is native unless a deployment selects otherwise.
+- **Compatibility mode**: how an OCM-io API kind is offered. _Native_: OCM-io's controllers act on it. _Driven_: its objects drive the management API. _Projected_: the integration writes it, read-only, from management-plane state. _Not offered_: the integration does not serve it. On a hub every kind is native unless a deployment selects otherwise. An agent protocol is offered or not offered as a whole.
 - **Kubernetes-facing surface**: an optional Kubernetes API that holds driving objects and projections.
 
 **OCM-io terms**

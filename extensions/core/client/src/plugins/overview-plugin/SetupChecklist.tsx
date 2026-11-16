@@ -1,6 +1,6 @@
 import "./setup-checklist.scss";
 
-import { PluginLink } from "@ocm-fleet/common";
+import { createResourceApi, PluginLink } from "@ocm-fleet/common";
 import type { Extension } from "@openshift/dynamic-plugin-sdk";
 import {
   useExtensions,
@@ -21,9 +21,14 @@ import {
   CircleIcon,
   TimesIcon,
 } from "@patternfly/react-icons";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { getSetupProgressStore } from "../setup-plugin/setupProgress";
+import {
+  celResourceTypeFilter,
+  completionOf,
+  resourceTypesToCheck,
+} from "./liveCompletion";
 
 const DISMISS_KEY = "ocm-fleet:setup-checklist-dismissed";
 
@@ -44,6 +49,7 @@ type OnboardingActionExtension = Extension<
     label: string;
     overviewCta?: string;
     category?: string;
+    completeWhenResourceExists?: string;
   }
 >;
 
@@ -102,6 +108,46 @@ export default function SetupChecklist() {
   const [dismissed, setDismissed] = useState(
     () => localStorage.getItem(DISMISS_KEY) === "true",
   );
+  const [present, setPresent] = useState<Record<string, boolean>>({});
+  const [liveLoaded, setLiveLoaded] = useState(false);
+
+  const liveTypes = useMemo(
+    () => resourceTypesToCheck(extensions.map((ext) => ext.properties)),
+    [extensions],
+  );
+  const liveTypesKey = JSON.stringify(liveTypes);
+  const checkedTypesKey = useRef<string | null>(null);
+
+  // Steps that can be completed outside this browser ask the server
+  // whether their resource exists. Until every answer is in, the
+  // checklist does not paint, so a live hub never shows as missing.
+  // Resolution hands back a fresh extensions array, so the same set of
+  // types must not be searched twice.
+  useEffect(() => {
+    if (!extensionsLoaded || checkedTypesKey.current === liveTypesKey) return;
+    checkedTypesKey.current = liveTypesKey;
+    if (liveTypes.length === 0) {
+      setLiveLoaded(true);
+      return;
+    }
+    const api = createResourceApi("-");
+    Promise.allSettled(
+      liveTypes.map((type) =>
+        api.search({ filter: celResourceTypeFilter(type), pageSize: 1 }),
+      ),
+    ).then((results) => {
+      // A newer set of types supersedes this answer.
+      if (checkedTypesKey.current !== liveTypesKey) return;
+      const found: Record<string, boolean> = {};
+      results.forEach((result, i) => {
+        if (result.status === "fulfilled") {
+          found[liveTypes[i]] = result.value.resources.length > 0;
+        }
+      });
+      setPresent(found);
+      setLiveLoaded(true);
+    });
+  }, [extensionsLoaded, liveTypes, liveTypesKey]);
 
   const items = useMemo<ChecklistItem[]>(() => {
     const setupItems: ChecklistItem[] = [];
@@ -128,7 +174,9 @@ export default function SetupChecklist() {
     for (const [category, exts] of grouped) {
       if (HIDDEN_CATEGORIES.has(category)) continue;
 
-      const anyComplete = exts.some((e) => !!progress[e.properties.id]);
+      const anyComplete = exts.some((e) =>
+        completionOf(e.properties, progress, present),
+      );
       actionItems.push({
         id: `category:${category}`,
         label: CATEGORY_LABELS[category] ?? category,
@@ -144,7 +192,7 @@ export default function SetupChecklist() {
       actionItems.push({
         id: ext.properties.id,
         label: ext.properties.label,
-        completed: !!progress[ext.properties.id],
+        completed: completionOf(ext.properties, progress, present),
         scope: "settings-plugin",
         module: "ExtensionsPage",
         search: `?action=${ext.properties.id}`,
@@ -154,7 +202,7 @@ export default function SetupChecklist() {
     }
 
     return [...setupItems, ...actionItems];
-  }, [progress, extensions]);
+  }, [progress, present, extensions]);
 
   const completedCount = items.filter((i) => i.completed).length;
   const allComplete = items.length > 0 && completedCount === items.length;
@@ -164,7 +212,13 @@ export default function SetupChecklist() {
     setDismissed(true);
   }, []);
 
-  if (!progressLoaded || !extensionsLoaded || dismissed || allComplete) {
+  if (
+    !progressLoaded ||
+    !extensionsLoaded ||
+    !liveLoaded ||
+    dismissed ||
+    allComplete
+  ) {
     return null;
   }
 

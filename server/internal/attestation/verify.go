@@ -83,8 +83,10 @@ func (v *Verifier) TrustedIssuers() map[domain.IssuerURL]TrustedIssuer {
 
 // Verify verifies the full attestation bundle: signed input, output
 // verification, and generation consistency. The deliveryGen parameter
-// is the generation carried by the delivery protocol — Verify asserts
-// it matches the signed expected_generation when the latter is non-zero.
+// is the generation carried by the delivery protocol. For a put, Verify
+// asserts it matches the signed expected_generation when the latter is
+// non-zero; a removal is not generation-bound (see
+// [verifyGenerationConsistency]).
 func (v *Verifier) Verify(ctx context.Context, att *domain.Attestation, deliveryGen domain.Generation) error {
 	if err := v.verifySignedInput(ctx, &att.Input); err != nil {
 		return fmt.Errorf("signed input verification: %w", err)
@@ -92,7 +94,7 @@ func (v *Verifier) Verify(ctx context.Context, att *domain.Attestation, delivery
 	if err := verifyOutput(&att.Input, att.Output); err != nil {
 		return fmt.Errorf("output verification: %w", err)
 	}
-	if err := verifyGenerationConsistency(att.Input.Provenance.ExpectedGeneration, deliveryGen); err != nil {
+	if err := verifyGenerationConsistency(att.Input.Provenance.ExpectedGeneration, att.Output, deliveryGen); err != nil {
 		return err
 	}
 	return nil
@@ -100,9 +102,18 @@ func (v *Verifier) Verify(ctx context.Context, att *domain.Attestation, delivery
 
 // verifyGenerationConsistency asserts that the delivery-level generation
 // matches the signed expected_generation. Skipped when the signed value
-// is zero (unsigned / no replay protection).
-func verifyGenerationConsistency(signed domain.Generation, delivery domain.Generation) error {
+// is zero (unsigned / no replay protection). A removal is skipped as
+// well: deleting a deployment advances the fulfillment generation
+// without a new signed intent (no API accepts a signature for a delete),
+// so the stored expected_generation necessarily lags the removal's
+// delivery generation. The signed name binding still fixes what may be
+// removed, and the platform fences stale removals by the delivery cycle
+// identity (generation, operation), not by this equality.
+func verifyGenerationConsistency(signed domain.Generation, output domain.DeliveryOutput, delivery domain.Generation) error {
 	if signed == 0 {
+		return nil
+	}
+	if _, ok := output.(*domain.RemoveByDeploymentName); ok {
 		return nil
 	}
 	if signed != delivery {

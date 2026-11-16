@@ -40,12 +40,15 @@ import { useCallback, useEffect, useState } from "react";
 
 import {
   disconnectHub,
+  hubIdOf,
   type HubResult,
   listHubClusters,
   listHubs,
   type ObservedClusterResult,
+  unavailableClusterCount,
 } from "./api";
 import EnrollClustersModal from "./EnrollClustersModal";
+import { enrollmentState } from "./enrollmentRollout";
 import HubConnectForm from "./HubConnectForm";
 
 type LabelColor = "blue" | "green" | "orange" | "red" | "grey";
@@ -56,12 +59,6 @@ const ENROLLMENT_LABELS: Record<string, { text: string; color: LabelColor }> = {
   created: { text: "Created here", color: "blue" },
   withdrawn: { text: "Withdrawn", color: "orange" },
 };
-
-function hubIdOf(hub: HubResult): string {
-  return (
-    hub.resource.observation?.id ?? hub.resource.name.replace(/^hubs\//, "")
-  );
-}
 
 function hubStatus(hub: HubResult): { text: string; color: LabelColor } {
   const conditions = hub.resource.conditions ?? {};
@@ -169,6 +166,7 @@ export default function HubsPage() {
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [connectBusy, setConnectBusy] = useState(false);
   const [enrollHubId, setEnrollHubId] = useState<string | null>(null);
   const [disconnectId, setDisconnectId] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -179,9 +177,9 @@ export default function HubsPage() {
       setHubs(await listHubs());
       setError(null);
     } catch (e) {
-      if (!silent) {
-        setError(e instanceof Error ? e.message : "The hubs did not load");
-      }
+      // A failed refresh leaves the table as it was; say so instead of
+      // letting the stale rows look current.
+      setError(e instanceof Error ? e.message : "The hubs did not load");
     } finally {
       if (!silent) setLoading(false);
     }
@@ -224,6 +222,11 @@ export default function HubsPage() {
     );
   }
 
+  const someAway = hubs.some((hub) => {
+    const status = hubStatus(hub).text;
+    return status === "Not reachable" || status === "Credential not valid";
+  });
+
   return (
     <div>
       <Flex
@@ -245,7 +248,7 @@ export default function HubsPage() {
         </FlexItem>
       </Flex>
 
-      {error && (
+      {error && hubs.length > 0 && (
         <Alert
           variant="warning"
           title={error}
@@ -254,7 +257,27 @@ export default function HubsPage() {
         />
       )}
 
-      {hubs.length === 0 ? (
+      {someAway && (
+        <Alert
+          variant="info"
+          title="The numbers beside a hub that does not answer are the ones it last reported."
+          isInline
+          className="pf-v6-u-mb-md"
+        />
+      )}
+
+      {error && hubs.length === 0 ? (
+        <EmptyState titleText="The hubs did not load" headingLevel="h2">
+          <EmptyStateBody>{error}</EmptyStateBody>
+          <EmptyStateFooter>
+            <EmptyStateActions>
+              <Button variant="primary" onClick={() => void fetchHubs()}>
+                Retry
+              </Button>
+            </EmptyStateActions>
+          </EmptyStateFooter>
+        </EmptyState>
+      ) : hubs.length === 0 ? (
         <EmptyState titleText="No hub is connected" headingLevel="h2">
           <EmptyStateBody>
             Connect a hub to see its clusters next to the ones created here, and
@@ -287,6 +310,7 @@ export default function HubsPage() {
             const id = hubIdOf(hub);
             const observation = hub.resource.observation;
             const status = hubStatus(hub);
+            const enrollment = enrollmentState(observation);
             const isExpanded = expandedId === id;
             return (
               <Tbody key={id} isExpanded={isExpanded}>
@@ -316,7 +340,13 @@ export default function HubsPage() {
                   </Td>
                   <Td dataLabel="Clusters">{observation?.clusterCount ?? 0}</Td>
                   <Td dataLabel="Available">
-                    {observation?.availableCount ?? 0}
+                    {unavailableClusterCount(observation) > 0 ? (
+                      <Label color="orange" isCompact>
+                        {observation?.availableCount ?? 0}
+                      </Label>
+                    ) : (
+                      (observation?.availableCount ?? 0)
+                    )}
                   </Td>
                   <Td dataLabel="Enrolled">
                     {observation?.enrolledCount ?? 0}
@@ -366,6 +396,16 @@ export default function HubsPage() {
                           the read-only role of the access manifest.
                         </Alert>
                       )}
+                      {enrollment.warning && (
+                        <Alert
+                          variant="warning"
+                          isInline
+                          title="The add-on on this hub has to be made again"
+                          className="pf-v6-u-mb-md"
+                        >
+                          {enrollment.warning}
+                        </Alert>
+                      )}
                       <DescriptionList
                         isHorizontal
                         isCompact
@@ -391,6 +431,14 @@ export default function HubsPage() {
                             {formatTime(observation?.connectedAt)}
                           </DescriptionListDescription>
                         </DescriptionListGroup>
+                        <DescriptionListGroup>
+                          <DescriptionListTerm>
+                            Enrollment add-on reaches
+                          </DescriptionListTerm>
+                          <DescriptionListDescription>
+                            {enrollment.summary}
+                          </DescriptionListDescription>
+                        </DescriptionListGroup>
                       </DescriptionList>
                       {isExpanded && <HubClusters hubId={id} />}
                     </ExpandableRowContent>
@@ -403,7 +451,12 @@ export default function HubsPage() {
       )}
 
       {connectOpen && (
-        <Modal isOpen onClose={() => setConnectOpen(false)} variant="large">
+        <Modal
+          isOpen
+          // Closing in flight would discard the answer, including its error.
+          onClose={connectBusy ? undefined : () => setConnectOpen(false)}
+          variant="large"
+        >
           <ModalHeader title="Connect an OCM hub" />
           <ModalBody>
             <HubConnectForm
@@ -412,6 +465,7 @@ export default function HubsPage() {
                 void fetchHubs(true);
               }}
               onCancel={() => setConnectOpen(false)}
+              onBusyChange={setConnectBusy}
             />
           </ModalBody>
         </Modal>
@@ -420,6 +474,10 @@ export default function HubsPage() {
       {enrollHubId && (
         <EnrollClustersModal
           hubId={enrollHubId}
+          lastRollout={
+            hubs.find((hub) => hubIdOf(hub) === enrollHubId)?.resource
+              .observation?.enrollmentRollout
+          }
           onClose={() => {
             setEnrollHubId(null);
             void fetchHubs(true);

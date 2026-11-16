@@ -14,7 +14,7 @@ import {
 } from "@patternfly/react-core";
 import { useEffect, useState } from "react";
 
-import { findObservedCluster, type ObservedClusterResult } from "./api";
+import { findObservedClusters, type ObservedClusterResult } from "./api";
 
 const ENROLLMENT_TEXT: Record<string, string> = {
   observed: "Observed: known through the hub, not enrolled",
@@ -27,9 +27,15 @@ function pairs(map: Record<string, string> | undefined): [string, string][] {
   return Object.entries(map ?? {}).sort(([a], [b]) => a.localeCompare(b));
 }
 
-/** What a connected hub reports about the cluster. */
-export default function HubClusterTab({ clusterId }: ClusterDetailTabProps) {
-  const [record, setRecord] = useState<ObservedClusterResult | null>(null);
+/**
+ * What the connected hubs report about the cluster: one card per hub that
+ * knows it, the hub shown for the cluster first.
+ */
+export default function HubClusterTab({
+  clusterId,
+  hub,
+}: ClusterDetailTabProps) {
+  const [records, setRecords] = useState<ObservedClusterResult[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,10 +43,10 @@ export default function HubClusterTab({ clusterId }: ClusterDetailTabProps) {
     if (!clusterId) return;
     let cancelled = false;
     setLoading(true);
-    findObservedCluster(clusterId)
+    findObservedClusters(clusterId, hub)
       .then((found) => {
         if (cancelled) return;
-        setRecord(found ?? null);
+        setRecords(found);
         setError(null);
       })
       .catch((e: unknown) => {
@@ -55,12 +61,12 @@ export default function HubClusterTab({ clusterId }: ClusterDetailTabProps) {
     return () => {
       cancelled = true;
     };
-  }, [clusterId]);
+  }, [clusterId, hub]);
 
   if (loading) return <Spinner aria-label="Loading the hub's record" />;
   if (error) return <Alert variant="warning" isInline title={error} />;
-  const observation = record?.resource.observation;
-  if (!record || !observation) {
+  const shown = records.filter((record) => record.resource.observation);
+  if (shown.length === 0) {
     return (
       <Alert
         variant="info"
@@ -70,6 +76,29 @@ export default function HubClusterTab({ clusterId }: ClusterDetailTabProps) {
     );
   }
 
+  return (
+    <>
+      {shown.length > 1 && (
+        <Alert
+          variant="info"
+          isInline
+          title={`${shown.length} connected hubs report this cluster`}
+          className="pf-v6-u-mb-md"
+        >
+          It is one cluster here, with one deployment target. The labels it
+          carries come from one hub: the first one below.
+        </Alert>
+      )}
+      {shown.map((record) => (
+        <HubRecordCard key={record.resource.name} record={record} />
+      ))}
+    </>
+  );
+}
+
+function HubRecordCard({ record }: { record: ObservedClusterResult }) {
+  const observation = record.resource.observation;
+  if (!observation) return null;
   const labels = pairs(record.resource.localLabels);
   const claims = pairs(observation.claims);
   const enrollment = observation.enrollment;
@@ -97,7 +126,7 @@ export default function HubClusterTab({ clusterId }: ClusterDetailTabProps) {
   ];
 
   return (
-    <Card>
+    <Card className="pf-v6-u-mb-md">
       <CardBody>
         {observation.conflict && (
           <Alert

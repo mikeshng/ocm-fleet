@@ -93,6 +93,51 @@ func enrolledVia(hubID, cluster string) map[string]string {
 	}
 }
 
+func TestWithdrawnIndexMatch(t *testing.T) {
+	caA, caB := testCA(t, "a"), testCA(t, "b")
+	fingerprint := func(ca []byte) string {
+		t.Helper()
+		fps, err := kubernetesaddon.CAFingerprints(ca)
+		if err != nil {
+			t.Fatalf("CAFingerprints: %v", err)
+		}
+		return fps[0]
+	}
+	bundle := append(append([]byte{}, caA...), caB...)
+	idx := newWithdrawnIndex([]withdrawnCluster{
+		{id: "one", apiServer: "https://one.test:6443", caFingerprint: fingerprint(caA)},
+		{id: "twin-1", apiServer: "https://twin.test:6443", caFingerprint: fingerprint(caA)},
+		{id: "twin-2", apiServer: "https://twin.test:6443", caFingerprint: fingerprint(caA)},
+		{id: "no-address", caFingerprint: fingerprint(caA)},
+		{id: "no-fingerprint", apiServer: "https://nofp.test:6443"},
+	})
+	cluster := func(url string, ca []byte) observedCluster {
+		return observedCluster{name: "c", configs: []clientConfig{{url: url, ca: ca}}}
+	}
+	cases := map[string]struct {
+		c    observedCluster
+		id   string
+		want bool
+	}{
+		"one record with the address and CA":       {cluster("https://one.test:6443", caA), "one", true},
+		"the CA is one certificate of a bundle":    {cluster("https://one.test:6443", bundle), "one", true},
+		"another CA":                               {cluster("https://one.test:6443", caB), "", false},
+		"several records share the address and CA": {cluster("https://twin.test:6443", caA), "", false},
+		"a record with no address":                 {cluster("https://missing.test:6443", caA), "", false},
+		"a record with no fingerprint":             {cluster("https://nofp.test:6443", caA), "", false},
+		"the hub records no address":               {observedCluster{name: "c"}, "", false},
+		"an unparseable CA":                        {cluster("https://one.test:6443", []byte("not a CA")), "", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			id, found := idx.match(tc.c)
+			if id != tc.id || found != tc.want {
+				t.Errorf("match = %q, %v; want %q, %v", id, found, tc.id, tc.want)
+			}
+		})
+	}
+}
+
 func TestTargetIndexMatch(t *testing.T) {
 	caA, caB, caC := testCA(t, "a"), testCA(t, "b"), testCA(t, "c")
 	idx := newTargetIndex([]domain.TargetInfo{
@@ -101,7 +146,7 @@ func TestTargetIndexMatch(t *testing.T) {
 		kubeTarget("k8s-hand", "hand", "https://c.test:6443", caC, map[string]string{kubernetesaddon.PropOrigin: kubernetesaddon.OriginEnrolled}),
 		kubeTarget("k8s-twin-1", "twin", "https://twin.test:6443", caA, nil),
 		kubeTarget("k8s-twin-2", "twin", "https://twin.test:6443", caA, nil),
-		kubeTarget("k8s-nameonly", "nameonly", "https://nameonly.internal:6443", caB, nil),
+		kubeTarget("k8s-nameonly", "nameonly", "https://nameonly.test:6443", caB, nil),
 		domain.NewTargetInfo("kind-local", "kind", "b", domain.TargetStateReady, nil, nil, nil),
 	})
 	cluster := func(name, url string, ca []byte) observedCluster {

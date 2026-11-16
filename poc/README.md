@@ -17,3 +17,6 @@ Current POCs include:
     identity read model
 - `ocm-work-agent-adapter/`: a standalone Go prototype showing how platform delivery could be materialized as OCM `ManifestWork` and consumed through a simplified spoke-side reconcile loop
 - `resource-manager-controller-runtime/`: adapt sig-multicluster controller-runtime so reconcilers run against platform delivery targets (via a custom `cluster.Cluster` + Provider) instead of kube-apiserver, reporting through the delivery contract
+- `shim/`: OCM Fleet beside the OCM hubs you already run, as a demo to follow by hand: two
+  hubs with two managed clusters each on one machine, with a step-by-step guide, the
+  manifests it applies, and scripts that set the environment up and put it back

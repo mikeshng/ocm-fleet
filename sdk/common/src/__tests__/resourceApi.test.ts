@@ -398,7 +398,7 @@ describe("createApiClient", () => {
       ok: false,
       status: 500,
       statusText: "Internal Server Error",
-      json: () => Promise.reject(new SyntaxError("Unexpected token")),
+      text: () => Promise.resolve('{"code": 5, "mess'),
     } as unknown as Response);
 
     const client = createApiClient("/v1alpha");
@@ -407,5 +407,129 @@ describe("createApiClient", () => {
     expect(err).toBeInstanceOf(ResourceApiError);
     expect((err as ResourceApiError).status).toBe(500);
     expect((err as ResourceApiError).rpcStatus).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error envelope
+// ---------------------------------------------------------------------------
+
+describe("ResourceApiError", () => {
+  it("keeps an enrollment refusal's sentence, reason, and details", async () => {
+    mockFetch(
+      {
+        error: "the cluster is still used by deployments: deployments/first",
+        reason: "deployments-resolve-to-target",
+        details: { deployments: ["deployments/first"], target: "k8s-c1" },
+      },
+      409,
+    );
+    const client = createApiClient(
+      "/apis/kubernetes.open-cluster-management.io/v1alpha",
+    );
+
+    const err = await client
+      .post("/clusters/c1:withdraw", {})
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResourceApiError);
+    const apiErr = err as ResourceApiError;
+    expect(apiErr.status).toBe(409);
+    expect(apiErr.message).toBe(
+      "the cluster is still used by deployments: deployments/first",
+    );
+    expect(apiErr.reason).toBe("deployments-resolve-to-target");
+    expect(apiErr.details).toEqual({
+      deployments: ["deployments/first"],
+      target: "k8s-c1",
+    });
+  });
+
+  it("prefers the gRPC status message when the body has one", async () => {
+    mockFetch({ code: 5, message: "resource not found" }, 404);
+    const client = createApiClient("/v1alpha");
+
+    const err = (await client
+      .get("/missing")
+      .catch((e: unknown) => e)) as ResourceApiError;
+
+    expect(err.message).toBe("resource not found");
+    expect(err.reason).toBeUndefined();
+    expect(err.details).toBeUndefined();
+  });
+
+  it("reads a plain message body", async () => {
+    mockFetch({ message: "a plain refusal" }, 400);
+    const api = createResourceApi<TestProps>("-");
+
+    const err = (await api
+      .search()
+      .catch((e: unknown) => e)) as ResourceApiError;
+
+    expect(err.message).toBe("a plain refusal");
+  });
+
+  it("keeps a plain-text refusal's sentence", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      text: () => Promise.resolve("invalid cluster_id: the name is taken\n"),
+    } as unknown as Response);
+    const client = createApiClient(
+      "/apis/kind.open-cluster-management.io/v1alpha",
+    );
+
+    const err = (await client
+      .post("/clusters", {})
+      .catch((e: unknown) => e)) as ResourceApiError;
+
+    expect(err.status).toBe(400);
+    expect(err.message).toBe("invalid cluster_id: the name is taken");
+    expect(err.body).toBeNull();
+    expect(err.reason).toBeUndefined();
+  });
+
+  it("falls back to the status for a body with no message", async () => {
+    mockFetch({ reason: "conflict" }, 409);
+    const client = createApiClient("/v1alpha");
+
+    const err = (await client
+      .delete("/items/1")
+      .catch((e: unknown) => e)) as ResourceApiError;
+
+    expect(err.message).toBe("Query API error 409");
+    expect(err.reason).toBe("conflict");
+  });
+
+  it("keeps no body for a non-object body", async () => {
+    mockFetch(["not", "an", "envelope"], 502);
+    const client = createApiClient("/v1alpha");
+
+    const err = (await client
+      .get("/broken")
+      .catch((e: unknown) => e)) as ResourceApiError;
+
+    expect(err.message).toBe("Query API error 502");
+    expect(err.body).toBeNull();
+    expect(err.reason).toBeUndefined();
+  });
+
+  it("keeps no body for an unparseable body", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      text: () => Promise.resolve("not json"),
+    } as unknown as Response);
+    const client = createApiClient("/v1alpha");
+
+    const err = (await client
+      .get("/broken")
+      .catch((e: unknown) => e)) as ResourceApiError;
+
+    expect(err.message).toBe("not json");
+    expect(err.body).toBeNull();
+    expect(err.rpcStatus).toBeNull();
   });
 });

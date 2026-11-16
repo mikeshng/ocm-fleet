@@ -57,7 +57,16 @@ func (r *DeploymentRepo) GetView(ctx context.Context, name domain.ResourceName) 
 		 WHERE d.name = $1`,
 		string(name),
 	)
-	return scanDeploymentView(row)
+	v, err := scanDeploymentView(row)
+	if err != nil {
+		return v, err
+	}
+	deliveries, err := listDeliveriesByFulfillments(ctx, r.DB, []domain.FulfillmentID{v.Fulfillment.ID()})
+	if err != nil {
+		return v, err
+	}
+	v.Deliveries = deliveries[v.Fulfillment.ID()]
+	return v, nil
 }
 
 func (r *DeploymentRepo) ListView(ctx context.Context) ([]domain.DeploymentView, error) {
@@ -66,12 +75,88 @@ func (r *DeploymentRepo) ListView(ctx context.Context) ([]domain.DeploymentView,
 		        `+fulfillmentColumnsJoined("f")+`
 		 FROM deployments d
 		 JOIN fulfillments f ON f.id = d.fulfillment_id
-		 `+strategyJoins("f"),
+		 `+strategyJoins("f")+`
+		 -- COLLATE "C" orders names byte-wise, the comparison the page
+		 -- token walk makes in Go; the database's default collation
+		 -- would order some names differently.
+		 ORDER BY d.name COLLATE "C"`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list deployment views: %w", err)
 	}
-	return collectRows(rows, scanDeploymentView)
+	views, err := collectRows(rows, scanDeploymentView)
+	if err != nil {
+		return nil, err
+	}
+
+	deliveries, err := listDeliveriesByFulfillments(ctx, r.DB, viewFulfillmentIDs(views))
+	if err != nil {
+		return nil, err
+	}
+	for i := range views {
+		views[i].Deliveries = deliveries[views[i].Fulfillment.ID()]
+	}
+	return views, nil
+}
+
+func (r *DeploymentRepo) ListViewPage(ctx context.Context, after domain.ResourceName, limit int) (domain.DeploymentViewPage, error) {
+	query := `SELECT d.name, d.uid, d.fulfillment_id, d.created_at, d.updated_at,
+	        ` + fulfillmentColumnsJoined("f") + `
+	 FROM deployments d
+	 JOIN fulfillments f ON f.id = d.fulfillment_id
+	 ` + strategyJoins("f")
+	var args []any
+	if after != "" {
+		// COLLATE "C" compares names byte-wise, the order the page
+		// token walk uses; the database's default collation orders
+		// some names differently.
+		query += `
+	 WHERE d.name COLLATE "C" > $1`
+		args = append(args, string(after))
+	}
+	// One row beyond the page reports whether another page follows.
+	query += fmt.Sprintf(`
+	 ORDER BY d.name COLLATE "C" LIMIT $%d`, len(args)+1)
+	args = append(args, limit+1)
+
+	rows, err := r.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return domain.DeploymentViewPage{}, fmt.Errorf("list deployment view page: %w", err)
+	}
+	views, err := collectRows(rows, scanDeploymentView)
+	if err != nil {
+		return domain.DeploymentViewPage{}, err
+	}
+
+	page := domain.DeploymentViewPage{Views: views}
+	if len(views) > limit {
+		page.Views = views[:limit]
+		page.More = true
+	}
+	deliveries, err := listDeliveriesByFulfillments(ctx, r.DB, viewFulfillmentIDs(page.Views))
+	if err != nil {
+		return domain.DeploymentViewPage{}, err
+	}
+	for i := range page.Views {
+		page.Views[i].Deliveries = deliveries[page.Views[i].Fulfillment.ID()]
+	}
+	return page, nil
+}
+
+// viewFulfillmentIDs returns the distinct fulfillment IDs referenced by
+// views, in first-seen order.
+func viewFulfillmentIDs(views []domain.DeploymentView) []domain.FulfillmentID {
+	seen := make(map[domain.FulfillmentID]struct{}, len(views))
+	ids := make([]domain.FulfillmentID, 0, len(views))
+	for _, v := range views {
+		id := v.Fulfillment.ID()
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (r *DeploymentRepo) Delete(ctx context.Context, name domain.ResourceName) error {

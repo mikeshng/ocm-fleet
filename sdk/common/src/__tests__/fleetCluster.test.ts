@@ -7,6 +7,7 @@ import {
   enrolledClusterStatus,
   fleetClusterTypeFilter,
   foldLinkedClusterResults,
+  hubReportedProblem,
   KIND_CLUSTER_TYPE,
   mergeFleetClusters,
   OBSERVED_CLUSTER_TYPE,
@@ -162,6 +163,72 @@ describe("mergeFleetClusters", () => {
     ]);
     expect(rows.map((r) => r.id)).toEqual(["alpha", "hub1.ext2", "spoke"]);
   });
+
+  it("keeps two hubs' clusters of one name apart", () => {
+    const rows = mergeFleetClusters([
+      observed("hub2", "local-cluster"),
+      observed("hub1", "local-cluster"),
+    ]);
+    expect(rows.map((r) => [r.id, r.hub])).toEqual([
+      ["hub1.local-cluster", "hub1"],
+      ["hub2.local-cluster", "hub2"],
+    ]);
+  });
+
+  describe("a cluster that two hubs report", () => {
+    const link = { state: "enrolled", cluster: "clusters/byhand" };
+    const fromHub1 = observed("hub1", "edge-7", link);
+    const fromHub2 = observed("hub2", "site-b-7", link);
+    function byHand(homeHub?: string): ClusterRecord {
+      const record = enrolled("byhand");
+      if (homeHub) {
+        record.resource.localLabels = {
+          "ocm.open-cluster-management.io/hub": homeHub,
+        };
+      }
+      return record;
+    }
+
+    it("appears once", () => {
+      const rows = mergeFleetClusters([byHand("hub1"), fromHub1, fromHub2]);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].id).toBe("byhand");
+    });
+
+    it("shows the hub whose facts it carries, whatever the order", () => {
+      for (const records of [
+        [byHand("hub2"), fromHub1, fromHub2],
+        [byHand("hub2"), fromHub2, fromHub1],
+        [fromHub1, fromHub2, byHand("hub2")],
+      ]) {
+        const [row] = mergeFleetClusters(records);
+        expect(row.hub).toBe("hub2");
+        expect(row.observed).toBe(fromHub2);
+        expect(row.hubs).toEqual(["hub2", "hub1"]);
+      }
+    });
+
+    it("shows the first hub by id when it carries no hub's facts", () => {
+      for (const records of [
+        [byHand(), fromHub2, fromHub1],
+        [byHand(), fromHub1, fromHub2],
+      ]) {
+        const [row] = mergeFleetClusters(records);
+        expect(row.hub).toBe("hub1");
+        expect(row.observed).toBe(fromHub1);
+        expect(row.hubs).toEqual(["hub1", "hub2"]);
+      }
+    });
+
+    it("names a hub once when it has two records of the cluster", () => {
+      const [row] = mergeFleetClusters([
+        byHand("hub1"),
+        fromHub1,
+        observed("hub1", "edge-7-again", link),
+      ]);
+      expect(row.hubs).toEqual(["hub1"]);
+    });
+  });
 });
 
 describe("observedClusterRouteId", () => {
@@ -222,6 +289,18 @@ describe("lookup filters", () => {
     expect(clusterRecordFilter('a"b')).toContain('"clusters/a\\"b"');
     expect(observedRecordFilter('h.a"b')).toContain('managedClusters/a\\"b"');
   });
+
+  it("escapes a backslash, and a backslash before a quote first", () => {
+    expect(clusterRecordFilter(String.raw`a\b`)).toContain(
+      String.raw`"clusters/a\\b"`,
+    );
+    expect(observedRecordFilter(String.raw`h.a\b`)).toContain(
+      String.raw`managedClusters/a\\b"`,
+    );
+    expect(clusterRecordFilter(String.raw`a\"b`)).toContain(
+      String.raw`"clusters/a\\\"b"`,
+    );
+  });
 });
 
 describe("enrolledClusterStatus", () => {
@@ -267,5 +346,68 @@ describe("observedClusterStatus", () => {
       healthy: false,
       attention: true,
     });
+  });
+
+  it("asks for attention when the hub itself says Unknown", () => {
+    const silent = observed("h", "c", undefined, { available: "Unknown" });
+    expect(observedClusterStatus(silent)).toMatchObject({
+      text: "Unknown",
+      color: "grey",
+      attention: false,
+    });
+
+    const lost = observed("h", "c", undefined, { available: "Unknown" });
+    lost.resource.conditions = {
+      ManagedClusterConditionAvailable: { status: "Unknown" },
+    };
+    expect(observedClusterStatus(lost)).toMatchObject({
+      text: "Unknown",
+      color: "orange",
+      healthy: false,
+      attention: true,
+    });
+  });
+});
+
+describe("hubReportedProblem", () => {
+  const lost = () => {
+    const record = observed(
+      "hub1",
+      "c",
+      { state: "enrolled", cluster: "clusters/hub1.c" },
+      { available: "Unknown" },
+    );
+    record.resource.conditions = {
+      ManagedClusterConditionAvailable: { status: "Unknown" },
+    };
+    return record;
+  };
+
+  it("is silent while the hub reports the cluster available", () => {
+    const [row] = mergeFleetClusters([
+      enrolled("hub1.c"),
+      observed("hub1", "c", { state: "enrolled", cluster: "clusters/hub1.c" }),
+    ]);
+    expect(hubReportedProblem(row)).toBeNull();
+  });
+
+  it("gives the hub's word for a cluster that is known here as well", () => {
+    const [row] = mergeFleetClusters([enrolled("hub1.c"), lost()]);
+    expect(row.origin).toBe("enrolled");
+    expect(hubReportedProblem(row)).toMatchObject({
+      text: "Unknown",
+      attention: true,
+    });
+  });
+
+  it("is silent for a row that is only the hub's record", () => {
+    const [row] = mergeFleetClusters([lost()]);
+    expect(row.origin).toBe("observed");
+    expect(hubReportedProblem(row)).toBeNull();
+  });
+
+  it("is silent for a cluster no hub reports", () => {
+    const [row] = mergeFleetClusters([enrolled("alone")]);
+    expect(hubReportedProblem(row)).toBeNull();
   });
 });

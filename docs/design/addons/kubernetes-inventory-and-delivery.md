@@ -159,13 +159,27 @@ A target can carry an explicit grant (`delivery_credential: platform`), which en
 
 ### Server-side apply
 
-All modes use the same apply path. Manifests are applied sequentially via server-side apply with field manager `resource-manager`. Progress events are reported per manifest. A failure on any manifest stops the delivery. Kubernetes 401/403 errors map to `AuthFailed`; all other errors map to `Failed`.
+All modes use the same apply path. Manifests are applied sequentially via server-side apply with field manager `resource-manager`. Progress events are reported per manifest. A failure on any manifest stops the delivery.
+
+A cluster that forbids a call (403), or that does not recognize the caller's token (401), maps to `AuthFailed`, which pauses the fulfillment until a caller resumes it with fresh credentials. A cluster that does not recognize the platform's stored credential (401) maps to `Failed`, like every other error, and is retried with backoff: no caller can replace that credential, and it comes back when the platform renews it or the cluster's side presents a new one. Removal classifies a refusal the same way.
+
+One 403 is not about the credential: a cluster refuses new content in a namespace that is still being deleted. A deployment that leaves a cluster and is placed on it again before its namespace is gone meets that answer. It maps to `Failed` and is retried with backoff, whatever the credential, because the same call succeeds once the namespace is gone.
+
+### Objects out of reach
+
+Some objects on a target are not for deliveries, whatever the credential allows: the namespace that holds the platform's own access to an enrolled cluster, and what another addon declares. An addon registers a guard with the delivery agent; a guard is asked about a target and answers, for one object (its API group, kind, namespace, and name), with the reason it is out of reach there or with nothing. The kubernetes addon's own guard covers the namespace of the access account on an enrolled target. The ocm addon's guard covers Open Cluster Management on a cluster a hub manages, and a hub's own objects on the cluster it runs on (see [existing clusters and OCM hubs](existing-clusters-and-ocm-hubs.md#what-a-deployment-cannot-reach)).
+
+Every manifest of a delivery is checked before the first one is applied. A delivery that names an object out of reach maps to `Failed`, with a message that names the manifest and the reason, and nothing of it is applied; it is retried with backoff, so it goes through once the manifest no longer names such an object.
 
 ### Removal
 
 Removal chooses its credential the same way as delivery, then deletes each resource. Resources that are already gone (404) are silently treated as success, making removal idempotent.
 
+Removal only deletes objects this resource manager wrote. The cluster records which field manager applied which fields; an object with no managed-fields entry for the addon's field manager (see [Server-side apply](#server-side-apply)) was written by someone else. That happens legitimately: a removal can be dispatched for a delivery that failed before it applied anything, and its manifest then names another manager's object. Deleting by name would take that object away from its owner, so the removal leaves it in place and names it in the result.
+
 A cluster answers "forbidden" to a delete it does not allow whether or not the object exists. With the caller's credential that refusal stands, because the caller can come back with more rights. With the stored credential nobody can, so a forbidden delete is looked at: if the object is not there, there is nothing to remove; if the credential may not read that kind either, the object is left and named in the result; if the object is there and readable, the refusal stands.
+
+An object that is out of reach of deliveries on the target (see [Objects out of reach](#objects-out-of-reach)) is not deleted either: it is left in place and named in the result, like another manager's object.
 
 ### Async dispatch
 
@@ -504,8 +518,8 @@ Producers call `EnsureIndexer` before reporting `Delivered`, and a one-shot star
 What remains open are crash and signal windows around that handshake:
 
 - **Startup-replay miss**: a kubernetes target committed after the replay's final list scan stays unindexed until a later `EnsureIndexer` or process restart + replay. Replay is one-shot; it does not poll.
-- **Crash after Ensure, before terminal `ReportResult`**: the in-process indexer dies with the server. The Kind cluster may already exist, but delivery is not terminal, outputs are not committed, and startup replay has nothing to list. The workflow is still waiting for completion. Kind has no active-delivery recovery yet, so this window can stall until a recovery path lands.
-- **Non-atomic `ReportResult` commit vs workflow signal**: delivery state is persisted, then the fulfillment signal is sent in a separate step. If the process dies after committing `Delivered` but before the signal is observed, `ProcessDeliveryOutputs` (vault + target registration) may never run. Startup replay cannot start an indexer without those outputs. By contrast, once a completion signal is durably in workflow history, a failed or interrupted `ProcessDeliveryOutputs` activity is retried by the workflow — that case does not depend on startup replay.
+- **Crash after Ensure, before terminal `ReportResult`**: the in-process indexer dies with the server. The Kind cluster may already exist, but delivery is not terminal, outputs are not committed, and startup replay has nothing to list. The workflow is still waiting for completion. The kubernetes add-on's post-connect recovery re-dispatches non-terminal deliveries, best effort, which runs `Deliver` or `Remove` again — including the Kind indexer handshake — so the delivery can still reach a terminal state without waiting for another delivery signal.
+- **`ReportResult` commit and workflow signal**: delivery state and its structured outputs are committed together — secrets to the vault, inventory and target registration in the delivery-state transaction. A terminal report also records a completion obligation in that same transaction. The fulfillment signal is sent promptly after the commit and the obligation is cleared once the send succeeds; if the send fails, or the process stops between the commit and the send, the relay finds the surviving obligation and sends it again, so a workflow cannot miss a completion that was durably reported. Replaying the signal is safe: a workflow ignores completions for deliveries it is no longer waiting for. The non-terminal acknowledgement is not recorded this way; only terminal completions carry an obligation.
 
 A briefly running indexer can still leave inventory behind in the worst windows, until the sweep for clusters without a target removes it.
 

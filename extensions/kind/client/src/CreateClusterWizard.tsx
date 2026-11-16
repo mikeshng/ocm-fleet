@@ -1,10 +1,16 @@
 import type { ClusterProviderWizardProps } from "@ocm-fleet/common";
 import { usePluginNavigate } from "@ocm-fleet/common";
-import { Alert, Wizard, WizardStep } from "@patternfly/react-core";
+import {
+  Alert,
+  AlertActionCloseButton,
+  Wizard,
+  WizardStep,
+} from "@patternfly/react-core";
 import { useCallback, useState } from "react";
 
 import {
   createKindCluster,
+  kindClusterNameError,
   type KindClusterSpec,
   type KindNetworkingSpec,
 } from "./api";
@@ -39,6 +45,8 @@ const initialFormData: ClusterFormData = {
 export default function CreateClusterWizard({
   onClose,
   onSetupNext,
+  onCreated,
+  onBusyChange,
 }: ClusterProviderWizardProps) {
   const clusters = usePluginNavigate("core-plugin", "ClustersModule");
   const [formData, setFormData] = useState<ClusterFormData>(initialFormData);
@@ -53,20 +61,24 @@ export default function CreateClusterWizard({
   );
 
   const handleCancel = useCallback(() => {
+    if (creating) return;
     if (onClose) {
       onClose();
     } else {
       clusters.navigate();
     }
-  }, [onClose, clusters]);
+  }, [creating, onClose, clusters]);
 
   const handleSubmit = useCallback(async () => {
-    if (!formData.name.trim()) {
-      setError("Cluster name is required.");
+    const name = formData.name.trim();
+    const nameError = kindClusterNameError(name);
+    if (nameError) {
+      setError(nameError);
       return;
     }
 
     setCreating(true);
+    onBusyChange?.(true);
     setError(null);
 
     try {
@@ -98,23 +110,26 @@ export default function CreateClusterWizard({
         spec.networking = networking;
       }
 
-      await createKindCluster(formData.name.trim(), spec);
+      await createKindCluster(name, spec);
 
       if (onSetupNext) {
         onSetupNext();
+      } else if (onCreated) {
+        onCreated();
       } else if (onClose) {
         onClose();
       } else {
-        clusters.navigate(formData.name.trim());
+        clusters.navigate(name);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setCreating(false);
+      onBusyChange?.(false);
     }
-  }, [formData, onSetupNext, onClose, clusters]);
+  }, [formData, onSetupNext, onCreated, onBusyChange, onClose, clusters]);
 
-  const isStep1Valid = formData.name.trim().length > 0;
+  const isStep1Valid = kindClusterNameError(formData.name.trim()) === null;
 
   return (
     <>
@@ -125,9 +140,9 @@ export default function CreateClusterWizard({
           isInline
           className="pf-v6-u-mb-md"
           actionClose={
-            <button
-              className="pf-v6-c-alert__action-close"
-              onClick={() => setError(null)}
+            <AlertActionCloseButton
+              aria-label="Close the error"
+              onClose={() => setError(null)}
             />
           }
         >

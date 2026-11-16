@@ -9,6 +9,7 @@ import "ocm/v1alpha/attestation.proto";
 import "ocm/v1alpha/manifest_strategy.proto";
 import "ocm/v1alpha/placement_strategy.proto";
 import "ocm/v1alpha/rollout_strategy.proto";
+import "ocm/v1alpha/target_delivery_status.proto";
 
 option go_package = "github.com/stolostron/ocm-fleet/server/gen/ocm/v1alpha;ocmv1alpha";
 
@@ -77,6 +78,12 @@ message Deployment {
   // credentials). Contains the reason for the pause. The lifecycle
   // state is preserved independently.
   string pause_reason = 14 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Delivery state per target, ordered by target ID. There is one entry
+  // for every target the fulfillment has recorded work for, including a
+  // target whose work is being removed or was removed; `operation` says
+  // which. When a target's last attempt failed, its message says why.
+  repeated TargetDeliveryStatus target_statuses = 15 [(google.api.field_behavior) = OUTPUT_ONLY];
 
   // Lifecycle state of a deployment.
   enum State {

@@ -137,11 +137,18 @@ type Agent struct {
 
 	trustMu      sync.RWMutex
 	trustBundles []domain.TrustBundleEntry
+	trustSource  TrustBundleSource
 
 	// inflight tracks delivery IDs with work currently in progress.
 	// The platform provides at-least-once delivery; a retry for a
 	// delivery that is already being processed is safely skipped.
 	inflight sync.Map // map[domain.DeliveryID]struct{}
+
+	// workMu gates a dispatch against Close, and wg joins the background
+	// deliveries and removals Close waits for.
+	workMu  sync.Mutex
+	wg      sync.WaitGroup
+	closing bool
 }
 
 // AgentOption configures an [Agent].
@@ -210,6 +217,19 @@ func WithLoopbackForward(f LoopbackForward) AgentOption {
 	return func(a *Agent) { a.loopbackForward = f }
 }
 
+// TrustBundleSource returns the trust entries of the platform's configured
+// identity providers. The agent restores them at startup so a provisioned
+// cluster receives the same trust settings it would after a trust-bundle
+// delivery, which the platform does not repeat once it has been delivered.
+type TrustBundleSource func(context.Context) ([]domain.TrustBundleEntry, error)
+
+// WithTrustBundleSource sets where the agent restores its trust entries
+// from at startup. Without it the agent only holds entries delivered to it
+// in the current process.
+func WithTrustBundleSource(source TrustBundleSource) AgentOption {
+	return func(a *Agent) { a.trustSource = source }
+}
+
 // NewAgent returns an Agent. The reporter is the addon's client
 // interface for communicating delivery updates back to the platform.
 func NewAgent(reporter domain.DeliveryReporter, factory ClusterProviderFactory, opts ...AgentOption) *Agent {
@@ -230,6 +250,43 @@ func (a *Agent) agentObserver() AgentObserver {
 		return a.observer
 	}
 	return NoOpAgentObserver{}
+}
+
+// startWork reserves a place for one background delivery. Close takes the
+// same lock to mark the agent closing, so it cannot see a zero WaitGroup
+// while a dispatch is about to start.
+func (a *Agent) startWork() bool {
+	a.workMu.Lock()
+	defer a.workMu.Unlock()
+	if a.closing {
+		return false
+	}
+	a.wg.Add(1)
+	return true
+}
+
+// Close stops new dispatches and waits for the deliveries already running
+// to report their outcome, or until ctx is done. A delivery still running
+// at the deadline is left to at-least-once dispatch: the add-on's
+// post-connect recovery re-dispatches deliveries that are still
+// non-terminal after the restart, and the cluster work is safe to repeat.
+// It returns a wrapped ctx.Err when the deadline is reached first.
+func (a *Agent) Close(ctx context.Context) error {
+	a.workMu.Lock()
+	a.closing = true
+	a.workMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("kind: close: %w", ctx.Err())
+	}
 }
 
 func (a *Agent) generationStore() GenerationStore {
@@ -254,9 +311,10 @@ func (a *Agent) Deliver(ctx context.Context, _ domain.TargetInfo, deliveryID dom
 		case domain.TrustBundleManifestType:
 			if err := a.storeTrustBundle(m); err != nil {
 				a.inflight.Delete(deliveryID)
-				_ = a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-					State:   domain.DeliveryStateFailed,
-					Message: fmt.Sprintf("store trust bundle: %v", err),
+				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
+					Operation: domain.DeliveryOperationDeliver,
+					State:     domain.DeliveryStateFailed,
+					Message:   fmt.Sprintf("store trust bundle: %v", err),
 				})
 				return nil
 			}
@@ -264,9 +322,10 @@ func (a *Agent) Deliver(ctx context.Context, _ domain.TargetInfo, deliveryID dom
 			clusterManifests = append(clusterManifests, m)
 		default:
 			a.inflight.Delete(deliveryID)
-			_ = a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-				State:   domain.DeliveryStateFailed,
-				Message: fmt.Sprintf("unsupported manifest type %q", m.ManifestType),
+			_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
+				Operation: domain.DeliveryOperationDeliver,
+				State:     domain.DeliveryStateFailed,
+				Message:   fmt.Sprintf("unsupported manifest type %q", m.ManifestType),
 			})
 			return nil
 		}
@@ -275,8 +334,12 @@ func (a *Agent) Deliver(ctx context.Context, _ domain.TargetInfo, deliveryID dom
 	if len(clusterManifests) == 0 {
 		a.inflight.Delete(deliveryID)
 		asyncCtx := context.WithoutCancel(ctx)
+		if !a.startWork() {
+			return fmt.Errorf("kind: agent is closing")
+		}
 		go func() {
-			_ = a.reporter.ReportResult(asyncCtx, deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+			defer a.wg.Done()
+			_ = reportResultWithRetry(asyncCtx, a.reporter, deliveryID, generation, domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered})
 		}()
 		return nil
 	}
@@ -284,18 +347,20 @@ func (a *Agent) Deliver(ctx context.Context, _ domain.TargetInfo, deliveryID dom
 	specs, err := a.validateManifests(clusterManifests)
 	if err != nil {
 		a.inflight.Delete(deliveryID)
-		_ = a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-			State:   domain.DeliveryStateFailed,
-			Message: fmt.Sprintf("invalid manifests: %v", err),
+		_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
+			Operation: domain.DeliveryOperationDeliver,
+			State:     domain.DeliveryStateFailed,
+			Message:   fmt.Sprintf("invalid manifests: %v", err),
 		})
 		return nil
 	}
 
 	if err := a.verifyToken(ctx, auth); err != nil {
 		a.inflight.Delete(deliveryID)
-		_ = a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-			State:   domain.DeliveryStateAuthFailed,
-			Message: fmt.Sprintf("token verification failed: %v", err),
+		_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
+			Operation: domain.DeliveryOperationDeliver,
+			State:     domain.DeliveryStateAuthFailed,
+			Message:   fmt.Sprintf("token verification failed: %v", err),
 		})
 		return nil
 	}
@@ -303,12 +368,21 @@ func (a *Agent) Deliver(ctx context.Context, _ domain.TargetInfo, deliveryID dom
 	asyncCtx := context.WithoutCancel(ctx)
 	provider := a.providerFactory(NewObserverLogger(asyncCtx, a.reporter, deliveryID, generation, time.Now))
 
-	go a.deliverAsync(asyncCtx, provider, specs, auth, deliveryID, generation)
+	if !a.startWork() {
+		a.inflight.Delete(deliveryID)
+		return fmt.Errorf("kind: agent is closing")
+	}
+	go func() {
+		defer a.wg.Done()
+		a.deliverAsync(asyncCtx, provider, specs, auth, deliveryID, generation)
+	}()
 
 	return nil
 }
 
-// storeTrustBundle unmarshals and stores a trust bundle entry.
+// storeTrustBundle unmarshals and stores a trust bundle entry. An entry
+// for the same issuer and enrollment audience replaces the stored one, so
+// an updated provider configuration does not leave a stale JWKS behind.
 func (a *Agent) storeTrustBundle(m domain.Manifest) error {
 	var entry domain.TrustBundleEntry
 	if err := json.Unmarshal(m.Raw, &entry); err != nil {
@@ -316,8 +390,40 @@ func (a *Agent) storeTrustBundle(m domain.Manifest) error {
 	}
 	a.trustMu.Lock()
 	defer a.trustMu.Unlock()
-	a.trustBundles = append(a.trustBundles, entry)
+	a.trustBundles = upsertTrustBundle(a.trustBundles, entry)
 	return nil
+}
+
+// RestoreTrustBundles loads the platform's configured identity providers
+// and stores their trust entries. It runs at startup: a trust-bundle
+// delivery is recorded as delivered and is not sent again, so a new process
+// would otherwise provision clusters without the platform's trust settings.
+func (a *Agent) RestoreTrustBundles(ctx context.Context) error {
+	if a.trustSource == nil {
+		return nil
+	}
+	entries, err := a.trustSource(ctx)
+	if err != nil {
+		return fmt.Errorf("load trust bundles: %w", err)
+	}
+	a.trustMu.Lock()
+	defer a.trustMu.Unlock()
+	for _, entry := range entries {
+		a.trustBundles = upsertTrustBundle(a.trustBundles, entry)
+	}
+	return nil
+}
+
+// upsertTrustBundle adds entry unless one for the same issuer and
+// enrollment audience is stored, in which case entry replaces it.
+func upsertTrustBundle(entries []domain.TrustBundleEntry, entry domain.TrustBundleEntry) []domain.TrustBundleEntry {
+	for i := range entries {
+		if entries[i].IssuerURL == entry.IssuerURL && entries[i].EnrollmentAudience == entry.EnrollmentAudience {
+			entries[i] = entry
+			return entries
+		}
+	}
+	return append(entries, entry)
 }
 
 // TrustBundles returns a snapshot of the currently stored trust bundle
@@ -362,8 +468,13 @@ func (a *Agent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain
 	if _, loaded := a.inflight.LoadOrStore(deliveryID, struct{}{}); loaded {
 		return nil
 	}
+	if !a.startWork() {
+		a.inflight.Delete(deliveryID)
+		return fmt.Errorf("kind: agent is closing")
+	}
 
 	go func() {
+		defer a.wg.Done()
 		defer a.inflight.Delete(deliveryID)
 		ctx := context.Background()
 
@@ -372,7 +483,8 @@ func (a *Agent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain
 			kindName, err := encodeKindClusterName(spec.resourceID())
 			if err != nil {
 				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-					State: domain.DeliveryStateFailed, Message: err.Error(),
+					Operation: domain.DeliveryOperationRemove,
+					State:     domain.DeliveryStateFailed, Message: err.Error(),
 				})
 				return
 			}
@@ -381,7 +493,8 @@ func (a *Agent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain
 			listed, err := provider.List()
 			if err != nil {
 				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-					State: domain.DeliveryStateFailed, Message: fmt.Sprintf("list kind clusters: %v", err),
+					Operation: domain.DeliveryOperationRemove,
+					State:     domain.DeliveryStateFailed, Message: fmt.Sprintf("list kind clusters: %v", err),
 				})
 				return
 			}
@@ -400,21 +513,24 @@ func (a *Agent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain
 			kc, err := provider.KubeConfig(owned, useInternal)
 			if err != nil {
 				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-					State: domain.DeliveryStateFailed, Message: fmt.Sprintf("get kubeconfig for %q: %v", owned, err),
+					Operation: domain.DeliveryOperationRemove,
+					State:     domain.DeliveryStateFailed, Message: fmt.Sprintf("get kubeconfig for %q: %v", owned, err),
 				})
 				return
 			}
 			recorded, hasGen, err := a.generationStore().Get(ctx, owned, []byte(kc))
 			if err != nil {
 				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-					State: domain.DeliveryStateFailed, Message: fmt.Sprintf("read ownership generation for %q: %v", owned, err),
+					Operation: domain.DeliveryOperationRemove,
+					State:     domain.DeliveryStateFailed, Message: fmt.Sprintf("read ownership generation for %q: %v", owned, err),
 				})
 				return
 			}
 			if hasGen && generation < recorded {
 				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-					State:   domain.DeliveryStateFailed,
-					Message: fmt.Sprintf("stale generation %d for kind cluster %q (recorded %d)", generation, owned, recorded),
+					Operation: domain.DeliveryOperationRemove,
+					State:     domain.DeliveryStateFailed,
+					Message:   fmt.Sprintf("stale generation %d for kind cluster %q (recorded %d)", generation, owned, recorded),
 				})
 				return
 			}
@@ -424,7 +540,8 @@ func (a *Agent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain
 			a.removeLoopbackForward(ctx, provider, owned)
 			if err := provider.Delete(owned, ""); err != nil {
 				_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-					State: domain.DeliveryStateFailed, Message: err.Error(),
+					Operation: domain.DeliveryOperationRemove,
+					State:     domain.DeliveryStateFailed, Message: err.Error(),
 				})
 				return
 			}
@@ -436,7 +553,8 @@ func (a *Agent) Remove(_ context.Context, _ domain.TargetInfo, deliveryID domain
 			}
 		}
 		_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-			State: domain.DeliveryStateDelivered,
+			Operation: domain.DeliveryOperationRemove,
+			State:     domain.DeliveryStateDelivered,
 		})
 	}()
 	return nil
@@ -479,7 +597,7 @@ func (a *Agent) deliverAsync(ctx context.Context, provider ClusterProvider, spec
 		}
 	}
 
-	result := domain.DeliveryResult{State: domain.DeliveryStateDelivered}
+	result := domain.DeliveryResult{Operation: domain.DeliveryOperationDeliver, State: domain.DeliveryStateDelivered}
 	for _, out := range outputs {
 		result.ProvisionedTargets = append(result.ProvisionedTargets, out.Target())
 		result.ProducedSecrets = append(result.ProducedSecrets, out.Secrets()...)
@@ -830,8 +948,9 @@ func (a *Agent) failDelivery(ctx context.Context, deliveryID domain.DeliveryID, 
 		Message: msg,
 	})
 	_ = reportResultWithRetry(ctx, a.reporter, deliveryID, generation, domain.DeliveryResult{
-		State:   domain.DeliveryStateFailed,
-		Message: msg,
+		Operation: domain.DeliveryOperationDeliver,
+		State:     domain.DeliveryStateFailed,
+		Message:   msg,
 	})
 }
 

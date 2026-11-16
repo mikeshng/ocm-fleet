@@ -53,15 +53,52 @@
     },
     "generate": {
       "executor": "nx:run-commands",
+      "metadata": {
+        "description": "Regenerate the committed protobuf and OpenAPI artifacts from the proto sources. Not cached: buf.gen.yaml cleans its output directories, which a cache restore cannot reproduce."
+      },
       "options": {
         "command": "buf generate --path proto/ocm"
       },
+      "cache": false,
       "inputs": [
         "{projectRoot}/**/*.proto",
         "{workspaceRoot}/buf.yaml",
-        "{workspaceRoot}/buf.gen.yaml"
+        "{workspaceRoot}/buf.lock",
+        "{workspaceRoot}/buf.gen.yaml",
+        {
+          "runtime": "buf --version"
+        }
       ],
-      "outputs": ["{workspaceRoot}/server/gen"]
+      "outputs": ["{workspaceRoot}/server/gen", "{workspaceRoot}/docs/openapi"]
+    },
+    "check:generated": {
+      "executor": "nx:run-commands",
+      "metadata": {
+        "description": "Regenerate the protobuf and OpenAPI artifacts and fail when the committed copies differ. Requires buf and the workspace's Node dependencies."
+      },
+      "options": {
+        "forwardAllArgs": false,
+        "env": {
+          "NX_DAEMON": "false"
+        },
+        "commands": [
+          "buf generate --path proto/ocm",
+          "npx prettier --write --ignore-unknown --ignore-path .gitignore --ignore-path .prettierignore docs/openapi/ocm-fleet.swagger.yaml",
+          "bash -c 'set -e; changed=$(git status --porcelain -- server/gen docs/openapi); if [ -n \"$changed\" ]; then printf \"%s\\n\" \"$changed\"; echo \"generated artifacts are stale: run npx nx run proto:generate and commit the result\"; exit 1; fi'"
+        ],
+        "parallel": false
+      },
+      "cache": false,
+      "inputs": [
+        "{projectRoot}/**/*.proto",
+        "{workspaceRoot}/buf.yaml",
+        "{workspaceRoot}/buf.lock",
+        "{workspaceRoot}/buf.gen.yaml",
+        {
+          "runtime": "buf --version"
+        }
+      ],
+      "outputs": []
     }
   }
 }

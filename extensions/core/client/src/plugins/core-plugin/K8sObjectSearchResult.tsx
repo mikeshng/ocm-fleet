@@ -38,6 +38,8 @@ export function resolveK8sObject(
 
   const title = metaName ?? resource.resource.name.split("/").pop() ?? "";
 
+  // A search runs across every cluster: say which one the object is on.
+  const clusterPrefix = clusterId ? `${clusterId} · ` : "";
   const namespaceSuffix = namespace ? `${namespace} · ` : "";
 
   switch (kind) {
@@ -47,7 +49,7 @@ export function resolveK8sObject(
         module: "PodsModule",
         to: `${clusterId}/${uid}`,
         title,
-        description: `${namespaceSuffix}Pod`,
+        description: `${clusterPrefix}${namespaceSuffix}Pod`,
       };
     case "Namespace":
       return {
@@ -55,7 +57,7 @@ export function resolveK8sObject(
         module: "NamespacesModule",
         to: `${clusterId}/${uid}`,
         title,
-        description: "Namespace",
+        description: `${clusterPrefix}Namespace`,
       };
     case "Node":
       return {
@@ -63,7 +65,7 @@ export function resolveK8sObject(
         module: "NodesModule",
         to: `${clusterId}/${uid}`,
         title,
-        description: "Node",
+        description: `${clusterPrefix}Node`,
       };
     default:
       return {
@@ -72,7 +74,7 @@ export function resolveK8sObject(
         to: clusterId,
         search: KIND_TO_TAB[kind] ? `?tab=${KIND_TO_TAB[kind]}` : undefined,
         title,
-        description: `${namespaceSuffix}${kind}`,
+        description: `${clusterPrefix}${namespaceSuffix}${kind}`,
         navigable: false,
       };
   }

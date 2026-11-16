@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 )
 
@@ -45,6 +47,53 @@ func TestApplyLoopbackIssuerHost_SkipsLoopback(t *testing.T) {
 	}
 }
 
+func TestWriteIssuerHostPatchKeepsHostnameAsAString(t *testing.T) {
+	// url.Parse accepts these, and unquoted each one is a YAML
+	// indicator: an alias, an anchor (which would silently drop the
+	// hostname), a tag, or a block scalar.
+	for _, hostname := range []string{
+		"ocm-fleet.localhost",
+		"*alias",
+		"&anchor",
+		"!tag",
+		">folded",
+		`a"b`,
+	} {
+		t.Run(hostname, func(t *testing.T) {
+			dir, err := writeIssuerHostPatch(hostname)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			raw, err := os.ReadFile(filepath.Join(dir, kubeadmIssuerHostPatchFile))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var patch struct {
+				Spec struct {
+					HostAliases []struct {
+						IP        string   `json:"ip"`
+						Hostnames []string `json:"hostnames"`
+					} `json:"hostAliases"`
+				} `json:"spec"`
+			}
+			if err := yaml.Unmarshal(raw, &patch); err != nil {
+				t.Fatalf("patch is not YAML: %v\n%s", err, raw)
+			}
+			if len(patch.Spec.HostAliases) != 1 {
+				t.Fatalf("hostAliases = %+v\n%s", patch.Spec.HostAliases, raw)
+			}
+			alias := patch.Spec.HostAliases[0]
+			if alias.IP != "127.0.0.1" {
+				t.Fatalf("ip = %q", alias.IP)
+			}
+			if len(alias.Hostnames) != 1 || alias.Hostnames[0] != hostname {
+				t.Fatalf("hostnames = %q, want %q\n%s", alias.Hostnames, hostname, raw)
+			}
+		})
+	}
+}
+
 func TestApplyLoopbackIssuerHost_AddsPatchForDNSHost(t *testing.T) {
 	cfg := toKindConfig(ClusterSpec{Name: "x", Nodes: []NodeSpec{{Role: "control-plane"}}})
 	if err := applyLoopbackIssuerHost(&cfg, "https://ocm-fleet.localhost:8085/idp"); err != nil {
@@ -64,7 +113,7 @@ func TestApplyLoopbackIssuerHost_AddsPatchForDNSHost(t *testing.T) {
 		"name: kube-apiserver",
 		"namespace: kube-system",
 		`ip: "127.0.0.1"`,
-		"- ocm-fleet.localhost",
+		`- "ocm-fleet.localhost"`,
 		"hostAliases:",
 	} {
 		if !strings.Contains(body, want) {

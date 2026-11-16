@@ -82,3 +82,20 @@ AIPs
 234 Batch methods: Update
 235 Batch methods: Delete
 236 Policy preview
+
+## Deliberate exceptions
+
+The add-on HTTP routes — the enrollment, bundle, and hub routes under
+`/apis/kubernetes.open-cluster-management.io/v1alpha` and
+`/apis/ocm.open-cluster-management.io/v1alpha` — answer failures with the add-on
+envelope `{"error": <message>, "reason": <word>, "details": {...}}` rather than
+the `google.rpc.Status` JSON object AIP-193 prescribes, and they use a
+non-canonical 422 `unverified` status and lowercase reason words. This is
+deliberate: those routes are the add-ons' own public surface, not transcoded
+gRPC methods, and their clients — the enrollment agent, a hub's add-on
+template, and administrators reading a terse reason word in a terminal — are
+served by the documented vocabulary. The envelope, every status, and every
+reason word are the contract in
+[existing-clusters-api.md](existing-clusters-api.md#bodies-and-answers). The
+gRPC API, its transcoded HTTP routes, and the inventory query keep the AIP-193
+shape.

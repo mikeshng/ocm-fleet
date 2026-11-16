@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package ocm.v1alpha;
+
+import "google/api/field_behavior.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/stolostron/ocm-fleet/server/gen/ocm/v1alpha;ocmv1alpha";
+
+// TargetDeliveryStatus reports a deployment's state on one target: what
+// work the record describes (`operation`), where that work stands
+// (`state`), and, when an attempt failed, why (`message`).
+message TargetDeliveryStatus {
+  // Target the status refers to.
+  string target_id = 1 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Current delivery state on the target.
+  State state = 2 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Reason the last delivery attempt failed. Empty while no attempt has
+  // failed, and cleared once an attempt delivers.
+  string message = 3 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Failed delivery attempts in the current generation and operation
+  // cycle. Reset when a new cycle starts — a new generation, or a record
+  // whose operation switches at the same generation; preserved when the
+  // orchestration retries the same cycle.
+  int32 attempts = 4 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // When this status last changed.
+  google.protobuf.Timestamp update_time = 5 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Whether the recorded work applies the manifests to the target or
+  // removes them from it.
+  Operation operation = 6 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // The kind of work a status describes.
+  enum Operation {
+    // Default value. Not used.
+    OPERATION_UNSPECIFIED = 0;
+
+    // The manifests are being, or have been, applied to the target.
+    OPERATION_DELIVER = 1;
+
+    // The manifests are being, or have been, removed from the target;
+    // STATE_DELIVERED then means the removal completed.
+    OPERATION_REMOVE = 2;
+  }
+
+  // Delivery lifecycle state of one target.
+  enum State {
+    // Default value. Not used.
+    STATE_UNSPECIFIED = 0;
+
+    // Dispatch is pending; the addon has not received the work.
+    STATE_PENDING = 1;
+
+    // The addon accepted the work.
+    STATE_ACCEPTED = 2;
+
+    // The addon is performing the work.
+    STATE_PROGRESSING = 3;
+
+    // The work is done on the target: applied for OPERATION_DELIVER,
+    // removed for OPERATION_REMOVE.
+    STATE_DELIVERED = 4;
+
+    // The last attempt failed. Retried when the orchestration allows.
+    STATE_FAILED = 5;
+
+    // The work was done only in part. A removal that finishes with
+    // objects left in place reports this state.
+    STATE_PARTIAL = 6;
+
+    // The addon could not authenticate to the target.
+    STATE_AUTH_FAILED = 7;
+  }
+}

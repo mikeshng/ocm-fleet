@@ -182,3 +182,43 @@ func TestDeleteExtensionResource_StartsWorkflowWhenManaged(t *testing.T) {
 		t.Fatalf("Fulfillment.State = %q, want deleting", view.Fulfillment.State())
 	}
 }
+
+// TestCreateExtensionResource_RejectsDuplicateName ensures a second create
+// for a stored type/name reports ErrAlreadyExists and leaves the first
+// resource untouched. The persist activity treats an existing resource as
+// its own replay, so without the pre-check the second create would answer
+// success with the first resource's content.
+func TestCreateExtensionResource_RejectsDuplicateName(t *testing.T) {
+	h := setupExtensionResourceService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fixed := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+
+	name := domain.ResourceName("widgets/w1")
+	seedManagedPlusInventoryTypeForDelete(t, h.store, fixed)
+
+	if _, err := h.svc.Create(ctx, application.CreateExtensionResourceInput{
+		ResourceType: deletePreflightResourceType,
+		Name:         name,
+		Spec:         json.RawMessage(`{"name":"first"}`),
+	}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	_, err := h.svc.Create(ctx, application.CreateExtensionResourceInput{
+		ResourceType: deletePreflightResourceType,
+		Name:         name,
+		Spec:         json.RawMessage(`{"name":"second"}`),
+	})
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("second Create err = %v, want ErrAlreadyExists", err)
+	}
+
+	view, err := h.svc.Get(ctx, deletePreflightResourceType, name)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if view.Intent == nil || string(view.Intent.Spec) != `{"name":"first"}` {
+		t.Fatalf("stored spec was replaced by the duplicate create: %+v", view.Intent)
+	}
+}

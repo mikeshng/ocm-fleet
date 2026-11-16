@@ -11,10 +11,12 @@ import (
 // newOCMIntegration assembles the integration with Open Cluster
 // Management hubs. enrollment is the kubernetes add-on's enrollment
 // capability, or nil when that add-on is not enabled: hubs are then
-// observed and clusters cannot be enrolled through them. It reports
-// false when the composition supplies no record store (test
+// observed and clusters cannot be enrolled through them. deliveries is
+// that add-on's delivery agent, or nil: with it, the integration keeps
+// deliveries out of what is Open Cluster Management's on a cluster. It
+// reports false when the composition supplies no record store (test
 // assemblies).
-func newOCMIntegration(deps AddonDeps, enrollment *kubernetesEnrollment) (AddonSpec, bool) {
+func newOCMIntegration(deps AddonDeps, enrollment *kubernetesEnrollment, deliveries *kubernetesaddon.DeliveryAgent) (AddonSpec, bool) {
 	if deps.InventoryRecords == nil || deps.Store == nil || deps.Vault == nil {
 		return AddonSpec{}, false
 	}
@@ -29,8 +31,12 @@ func newOCMIntegration(deps AddonDeps, enrollment *kubernetesEnrollment) (AddonS
 		Vault:      deps.Vault,
 		Records:    deps.InventoryRecords,
 		Enrollment: enrollmentSvc,
+		Clients:    ocmaddon.ClientGoHubClients{Egress: kubernetesaddon.EgressPolicy{Allow: deps.Config.ClusterEgressAllow}},
 		Logger:     deps.Logger,
 	})
+	if deliveries != nil {
+		deliveries.AddGuard(svc)
+	}
 	handlers := ocmaddon.NewHTTP(svc, endpoint, deps.Caller, deps.Logger)
 	appCtx := deps.AppCtx
 	return AddonSpec{

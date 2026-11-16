@@ -64,6 +64,11 @@ export type OnboardingActionExtras = {
   form: EncodedCodeRef;
   overviewCta?: string;
   category?: FleetExtensionType;
+  /**
+   * A resource type (`group/Kind`) whose presence completes this step
+   * in the getting-started checklist, without browser-local progress.
+   */
+  completeWhenResourceExists?: string;
 };
 
 export type RouteGroupProperties = BaseExtensionProperties & RouteGroupExtras;

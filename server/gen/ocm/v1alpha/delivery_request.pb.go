@@ -127,7 +127,7 @@ var File_ocm_v1alpha_delivery_request_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_delivery_request_proto_rawDesc = "" +
 	"\n" +
-	"\"ocm/v1alpha/delivery_request.proto\x12\vocm.v1alpha\x1a\x1fgoogle/api/field_behavior.proto\x1a\x1docm/v1alpha/attestation.proto\x1a\x1aocm/v1alpha/manifest.proto\x1a\x1focm/v1alpha/delivery_auth.proto\"\xcd\x02\n" +
+	"\"ocm/v1alpha/delivery_request.proto\x12\vocm.v1alpha\x1a\x1fgoogle/api/field_behavior.proto\x1a\x1docm/v1alpha/attestation.proto\x1a\x1focm/v1alpha/delivery_auth.proto\x1a\x1aocm/v1alpha/manifest.proto\"\xcd\x02\n" +
 	"\x0fDeliveryRequest\x12$\n" +
 	"\vdelivery_id\x18\x01 \x01(\tB\x03\xe0A\x02R\n" +
 	"deliveryId\x12(\n" +
@@ -176,8 +176,8 @@ func file_ocm_v1alpha_delivery_request_proto_init() {
 		return
 	}
 	file_ocm_v1alpha_attestation_proto_init()
-	file_ocm_v1alpha_manifest_proto_init()
 	file_ocm_v1alpha_delivery_auth_proto_init()
+	file_ocm_v1alpha_manifest_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

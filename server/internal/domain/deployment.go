@@ -92,10 +92,31 @@ func (d Deployment) CreatedAt() time.Time { return d.createdAt }
 func (d Deployment) UpdatedAt() time.Time { return d.updatedAt }
 
 // DeploymentView is the read model that joins a [Deployment] with its
-// [Fulfillment]. Constructed by the repository via joins; never
-// written directly. The transport layer maps this to the proto
-// Deployment message.
+// [Fulfillment] and the [Delivery] records of that fulfillment.
+// Constructed by the repository via joins; never written directly. The
+// transport layer maps this to the proto Deployment message.
 type DeploymentView struct {
 	Deployment  Deployment
 	Fulfillment Fulfillment
+
+	// Deliveries holds the per-target delivery records of the
+	// fulfillment, ordered by target ID. Each record reports the
+	// current state of the fulfillment's work on that target — and,
+	// when the last attempt failed, the message the addon reported —
+	// so callers can explain a deployment that is not progressing and
+	// surface the reason through the API.
+	Deliveries []Delivery
+}
+
+// DeploymentViewPage is one page of deployment views read in name
+// order. Its deliveries are the ones belonging to the page's views,
+// not to the whole collection.
+type DeploymentViewPage struct {
+	Views []DeploymentView
+
+	// More reports whether another page follows. It is set only when
+	// the page is full, so a caller that walks pages until More is
+	// false reads every view exactly once even when the collection
+	// size is a multiple of the page size.
+	More bool
 }

@@ -29,10 +29,16 @@ func bundleBearer(t *testing.T, addon EnrollmentAddon) string {
 
 func templateManifests(t *testing.T, addon EnrollmentAddon) []map[string]any {
 	t.Helper()
-	if len(addon.Hub) != 2 || addon.Hub[0]["kind"] != "AddOnTemplate" {
+	var template map[string]any
+	for _, obj := range addon.Hub {
+		if obj["kind"] == "AddOnTemplate" {
+			template = obj
+		}
+	}
+	if template == nil {
 		t.Fatalf("add-on hub objects = %v", addon.Hub)
 	}
-	raw, found, err := unstructured.NestedSlice(addon.Hub[0], "spec", "agentSpec", "workload", "manifests")
+	raw, found, err := unstructured.NestedSlice(template, "spec", "agentSpec", "workload", "manifests")
 	if err != nil || !found {
 		t.Fatalf("template has no manifests: %v", err)
 	}
@@ -53,6 +59,9 @@ func TestVerifyPresentation(t *testing.T) {
 		withClaim("too-long", string(make([]byte, 300)))))
 	h.createCluster(managedCluster("pending", notAccepted(), withClientConfig("https://pending.test:6443", extCA)))
 	h.createCluster(managedCluster("no-address"))
+	attackerCA := testCA(t, "attacker")
+	recordedPair := append(append([]byte{}, extCA...), attackerCA...)
+	h.createCluster(managedCluster("multi", withClientConfig("https://multi.test:6443", recordedPair)))
 
 	if _, err := h.svc.VerifyPresentation(h.ctx, "hub1", "ext", extCA); !hasReason(err, kubernetesaddon.ErrEnrollmentRefused, "hub-not-connected") {
 		t.Fatalf("before the hub is connected: %v", err)
@@ -70,6 +79,11 @@ func TestVerifyPresentation(t *testing.T) {
 		"not accepted":      {"pending", extCA, kubernetesaddon.ErrEnrollmentRefused, "cluster-not-accepted"},
 		"no address on hub": {"no-address", extCA, kubernetesaddon.ErrEnrollmentUnverified, "no-recorded-address"},
 		"another CA":        {"ext", testCA(t, "impostor"), kubernetesaddon.ErrEnrollmentUnverified, "ca-mismatch"},
+		// A hub record that trusts more than the cluster does must not
+		// decide the probe's trust root: that would hand the honest
+		// cluster's token to whoever holds the extra CA.
+		"hub records an extra CA": {"multi", extCA, kubernetesaddon.ErrEnrollmentUnverified, "ca-mismatch"},
+		"presented an extra CA":   {"ext", recordedPair, kubernetesaddon.ErrEnrollmentUnverified, "ca-mismatch"},
 	}
 	for name, tc := range refusals {
 		t.Run(name, func(t *testing.T) {
@@ -83,7 +97,8 @@ func TestVerifyPresentation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyPresentation: %v", err)
 	}
-	if got.ClusterID != "hub1.ext" || got.APIServer != "https://ext.test:6443" || !kubernetesaddon.SameCA(got.CACert, extCA) {
+	if got.ClusterID != "hub1.ext" || got.APIServer != "https://ext.test:6443" || !kubernetesaddon.SameCASet(got.CACert, extCA) ||
+		string(got.CACert) != string(extCA) {
 		t.Errorf("verified cluster = %+v", got)
 	}
 	want := map[string]string{
@@ -92,9 +107,93 @@ func TestVerifyPresentation(t *testing.T) {
 		"claim.id.k8s.io":   "abc-123",
 		LabelHub:            "hub1",
 		LabelManagedCluster: "ext",
+		LabelHubClusterSet:  "hub1.prod",
 	}
 	if !sameLabels(got.Labels, want) {
 		t.Errorf("labels = %v, want %v (a claim too long for a label is left out)", got.Labels, want)
+	}
+
+	// The same set in another order is the same trust set; the CA the
+	// probe gets is the one the cluster presented.
+	presentedPair := append(append([]byte{}, attackerCA...), extCA...)
+	multi, err := h.svc.VerifyPresentation(h.ctx, "hub1", "multi", presentedPair)
+	if err != nil {
+		t.Fatalf("VerifyPresentation with the cluster's full CA bundle: %v", err)
+	}
+	if string(multi.CACert) != string(presentedPair) {
+		t.Error("the returned CA is not the presented bundle")
+	}
+}
+
+// A hub can record a cluster's address without a CA: the registration
+// agent may be given the address alone. The verifier then holds no CA
+// for the cluster, so — as the design puts it — there is no set for the
+// presented CA to equal: the presented CA is the probe's only trust
+// root, and the case is not a mismatch.
+func TestVerifyPresentationOfAClusterWithNoRecordedCA(t *testing.T) {
+	h := newHarness(t)
+	presented := testCA(t, "presented")
+	h.createCluster(managedCluster("no-ca", withClientConfig("https://no-ca.test:6443/", nil)))
+	h.connect("hub1")
+	eventually(t, "hub synced", func() bool { return h.svc.hub("hub1").isSynced() })
+
+	got, err := h.svc.VerifyPresentation(h.ctx, "hub1", "no-ca", presented)
+	if err != nil {
+		t.Fatalf("VerifyPresentation of a cluster whose address the hub records without a CA: %v", err)
+	}
+	if got.ClusterID != "hub1.no-ca" || got.APIServer != "https://no-ca.test:6443" {
+		t.Errorf("verified cluster = %+v", got)
+	}
+	if string(got.CACert) != string(presented) {
+		t.Error("the returned CA is not the presented one")
+	}
+}
+
+// An address the hub records with a CA is the one to use when the
+// presented CA equals the recorded set, even if the hub also records an
+// address without a CA before it: the pinned address carries the
+// stronger assurance, and picking by position would use the weaker one.
+func TestVerifyPresentationPrefersAnAddressRecordedWithACA(t *testing.T) {
+	h := newHarness(t)
+	presented := testCA(t, "presented")
+	h.createCluster(managedCluster("mixed", withClientConfigs(
+		recordedAddress{url: "https://mixed-unpinned.test:6443"},
+		recordedAddress{url: "https://mixed-pinned.test:6443", ca: presented},
+	)))
+	h.connect("hub1")
+	eventually(t, "hub synced", func() bool { return h.svc.hub("hub1").isSynced() })
+
+	got, err := h.svc.VerifyPresentation(h.ctx, "hub1", "mixed", presented)
+	if err != nil {
+		t.Fatalf("VerifyPresentation: %v", err)
+	}
+	if got.APIServer != "https://mixed-pinned.test:6443" {
+		t.Errorf("verified address = %q, want the address recorded with the presented CA", got.APIServer)
+	}
+}
+
+// The equality applies to the addresses the hub records with a CA, not
+// to the cluster as a whole: a CA that matches none of them still
+// verifies through an address recorded without a CA, whose presentation
+// has no recorded set to equal. A cluster all of whose addresses carry
+// CAs keeps refusing a CA that matches none, as the table in
+// TestVerifyPresentation checks.
+func TestVerifyPresentationOfAClusterWithPinnedAndUnpinnedAddresses(t *testing.T) {
+	h := newHarness(t)
+	presented := testCA(t, "presented")
+	h.createCluster(managedCluster("mixed", withClientConfigs(
+		recordedAddress{url: "https://mixed-pinned.test:6443", ca: testCA(t, "recorded")},
+		recordedAddress{url: "https://mixed-unpinned.test:6443"},
+	)))
+	h.connect("hub1")
+	eventually(t, "hub synced", func() bool { return h.svc.hub("hub1").isSynced() })
+
+	got, err := h.svc.VerifyPresentation(h.ctx, "hub1", "mixed", presented)
+	if err != nil {
+		t.Fatalf("VerifyPresentation: %v", err)
+	}
+	if got.APIServer != "https://mixed-unpinned.test:6443" || string(got.CACert) != string(presented) {
+		t.Errorf("verified cluster = %+v, want the unpinned address with the presented CA", got)
 	}
 }
 
@@ -145,7 +244,7 @@ func TestEnrollThroughAHub(t *testing.T) {
 	}
 	wantLabels := map[string]string{
 		"team": "blue", clusterSetLabel: "prod", "region": "eu", "claim.id.k8s.io": "abc-123",
-		LabelHub: "hub1", LabelManagedCluster: "ext",
+		LabelHub: "hub1", LabelManagedCluster: "ext", LabelHubClusterSet: "hub1.prod",
 	}
 	if !sameLabels(target.Labels(), wantLabels) {
 		t.Errorf("target labels = %v, want %v", target.Labels(), wantLabels)
@@ -318,6 +417,85 @@ func TestAClusterEnrolledByHandThatAHubKnows(t *testing.T) {
 	if !hasReason(err, kubernetesaddon.ErrEnrollmentConflict, "cluster-already-known") {
 		t.Fatalf("second enrollment of one cluster: %v", err)
 	}
+}
+
+func TestWithdrawnClusterWithItsOwnIDIsShownWithdrawn(t *testing.T) {
+	h := newHarness(t)
+	api, ca, token := h.addRealCluster("edge-7")
+	if _, err := h.enrollment.Enroll(h.ctx, kubernetesaddon.EnrollRequest{
+		ClusterID: "byhand", APIServer: api, CACert: ca, Token: token, Actor: "ops",
+	}); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	// The hub knows the same cluster under its own name.
+	h.createCluster(managedCluster("edge-7", withClientConfig(api, ca)))
+	h.connect("hub1")
+	eventually(t, "linked by address and CA", func() bool {
+		rec, ok := h.observed("hub1", "edge-7")
+		return ok && rec.obs.Enrollment == EnrollmentLink{State: LinkEnrolled, Cluster: "clusters/byhand", Target: "k8s-byhand", Basis: BasisAddressAndCA}
+	})
+
+	if _, err := h.enrollment.Withdraw(h.ctx, "byhand", kubernetesaddon.WithdrawRequest{Actor: "ops"}); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	// The record's id is not the one the hub's names would make; the
+	// address and CA the hub records for the cluster are what say it is
+	// the withdrawn cluster.
+	eventually(t, "observed record says the hand-enrolled cluster was withdrawn", func() bool {
+		rec, ok := h.observed("hub1", "edge-7")
+		return ok && rec.obs.Enrollment == EnrollmentLink{State: LinkWithdrawn, Cluster: "clusters/byhand"}
+	})
+}
+
+func TestWithdrawnRecordsThatSeveralClustersFitLeaveTheLinkToTheIDFallback(t *testing.T) {
+	h := newHarness(t)
+	api, ca, token := h.addRealCluster("edge-7")
+	// The same cluster enrolled twice under two names, withdrawn between
+	// the enrollments: two withdrawn records now have its address and CA,
+	// and neither the hub's names nor its address lead to one of them.
+	for _, id := range []string{"first", "second"} {
+		if _, err := h.enrollment.Enroll(h.ctx, kubernetesaddon.EnrollRequest{
+			ClusterID: id, APIServer: api, CACert: ca, Token: token, Actor: "ops",
+		}); err != nil {
+			t.Fatalf("Enroll(%s): %v", id, err)
+		}
+		if _, err := h.enrollment.Withdraw(h.ctx, id, kubernetesaddon.WithdrawRequest{Actor: "ops"}); err != nil {
+			t.Fatalf("Withdraw(%s): %v", id, err)
+		}
+	}
+	h.createCluster(managedCluster("edge-7", withClientConfig(api, ca)))
+	h.connect("hub1")
+	eventually(t, "the observed cluster is recorded as observed", func() bool {
+		rec, ok := h.observed("hub1", "edge-7")
+		return ok && rec.obs.Enrollment == EnrollmentLink{State: LinkObserved}
+	})
+	never(t, "an observed cluster claimed as one of two withdrawn records", func() bool {
+		rec, ok := h.observed("hub1", "edge-7")
+		return ok && rec.obs.Enrollment.State == LinkWithdrawn
+	})
+}
+
+func TestWithdrawnRecordsThatSeveralClustersFitStillLinkByTheHubsName(t *testing.T) {
+	h := newHarness(t)
+	api, ca, token := h.addRealCluster("edge-7")
+	// One withdrawn record has exactly the id the hub's names lead to;
+	// another shares its address and CA, so the address decides neither.
+	for _, id := range []string{"hub1.edge-7", "second"} {
+		if _, err := h.enrollment.Enroll(h.ctx, kubernetesaddon.EnrollRequest{
+			ClusterID: id, APIServer: api, CACert: ca, Token: token, Actor: "ops",
+		}); err != nil {
+			t.Fatalf("Enroll(%s): %v", id, err)
+		}
+		if _, err := h.enrollment.Withdraw(h.ctx, id, kubernetesaddon.WithdrawRequest{Actor: "ops"}); err != nil {
+			t.Fatalf("Withdraw(%s): %v", id, err)
+		}
+	}
+	h.createCluster(managedCluster("edge-7", withClientConfig(api, ca)))
+	h.connect("hub1")
+	eventually(t, "the observed cluster links to the withdrawn record its names lead to", func() bool {
+		rec, ok := h.observed("hub1", "edge-7")
+		return ok && rec.obs.Enrollment == EnrollmentLink{State: LinkWithdrawn, Cluster: "clusters/hub1.edge-7"}
+	})
 }
 
 func TestEnrollmentAddonNeedsAConnectedHubAndAnEndpoint(t *testing.T) {

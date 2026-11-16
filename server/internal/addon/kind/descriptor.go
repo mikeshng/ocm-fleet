@@ -52,6 +52,13 @@ func Schema() domain.ExtensionResourceSchema {
 		Management: &domain.ManagementSchema{
 			SpecMessage: "ocm.kind.v1alpha.KindClusterSpec",
 			Relation:    domain.NewRegisteredSelfTarget("kind-local", ManagedClusterManifestType),
+			// The provider only takes names in its own charset and
+			// length, so an id it cannot carry is refused at create
+			// rather than left behind as a failed resource.
+			ValidateID: func(id string) error {
+				_, err := encodeKindClusterName(domain.ResourceID(id))
+				return err
+			},
 		},
 		Inventory: &domain.InventorySchema{},
 	}

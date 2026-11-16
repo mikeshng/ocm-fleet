@@ -51,6 +51,25 @@ func tlsServerCAPEM(ts *httptest.Server) string {
 	}))
 }
 
+// newDiscoveryTestServer serves the discovery documents the REST mapper
+// asks for, and hands every other request to object.
+func newDiscoveryTestServer(t *testing.T, object http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api":
+			fmt.Fprint(w, `{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[]}`)
+		case "/apis":
+			fmt.Fprint(w, `{"kind":"APIGroupList","apiVersion":"v1","groups":[]}`)
+		case "/api/v1":
+			fmt.Fprint(w, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[{"name":"configmaps","singularName":"configmap","namespaced":true,"kind":"ConfigMap","verbs":["get","delete","patch"]}]}`)
+		default:
+			object(w, r)
+		}
+	}))
+}
+
 // channelReporter implements [domain.DeliveryReporter] for tests,
 // routing events and results to channels for deterministic waits.
 type channelReporter struct {
@@ -96,6 +115,69 @@ func (nopReporter) ReportResult(context.Context, domain.DeliveryID, domain.Gener
 }
 func (nopReporter) ListActiveDeliveries(context.Context, []domain.TargetID) ([]domain.ActiveDelivery, error) {
 	return nil, nil
+}
+
+// flakyReporter fails a configured number of ReportResult calls before
+// recording one: a transient platform error must not lose the outcome.
+type flakyReporter struct {
+	mu       sync.Mutex
+	failures int
+	attempts int
+	done     chan domain.DeliveryResult
+}
+
+func (r *flakyReporter) ReportEvent(context.Context, domain.DeliveryID, domain.Generation, domain.DeliveryEvent) error {
+	return nil
+}
+
+func (r *flakyReporter) ReportResult(_ context.Context, _ domain.DeliveryID, _ domain.Generation, result domain.DeliveryResult) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempts++
+	if r.failures > 0 {
+		r.failures--
+		return errors.New("platform unavailable")
+	}
+	r.done <- result
+	return nil
+}
+
+func (r *flakyReporter) ListActiveDeliveries(context.Context, []domain.TargetID) ([]domain.ActiveDelivery, error) {
+	return nil, nil
+}
+
+// countingResultReporter records every delivery result without blocking,
+// so a test can tell how many reports one delivery produced.
+type countingResultReporter struct {
+	mu      sync.Mutex
+	results []domain.DeliveryResult
+	done    chan domain.DeliveryResult
+}
+
+func newCountingResultReporter() *countingResultReporter {
+	return &countingResultReporter{done: make(chan domain.DeliveryResult, 16)}
+}
+
+func (r *countingResultReporter) ReportEvent(context.Context, domain.DeliveryID, domain.Generation, domain.DeliveryEvent) error {
+	return nil
+}
+
+func (r *countingResultReporter) ReportResult(_ context.Context, _ domain.DeliveryID, _ domain.Generation, result domain.DeliveryResult) error {
+	r.mu.Lock()
+	r.results = append(r.results, result)
+	r.mu.Unlock()
+	r.done <- result
+	return nil
+}
+
+func (r *countingResultReporter) ListActiveDeliveries(context.Context, []domain.TargetID) ([]domain.ActiveDelivery, error) {
+	return nil, nil
+}
+
+func (r *countingResultReporter) resultCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.results)
 }
 
 // TestAgent_Deliver_SucceedsWhenIndexerAbsent asserts that the Kubernetes
@@ -743,6 +825,406 @@ func TestAgent_Remove_EmptyManifests_ReportsDelivered(t *testing.T) {
 	result := awaitDone(t, reporter.done)
 	if result.State != domain.DeliveryStateDelivered {
 		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateDelivered, result.Message)
+	}
+}
+
+// A removal that finishes with an object it may not touch reports
+// Partial: the removal is over, but something the delivery may have
+// applied still stands, and the message names it.
+func TestAgent_Remove_LeftoverObject_ReportsPartial(t *testing.T) {
+	bundle := buildUnitTestAttestation(t)
+	ts := newDiscoveryTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/default/configmaps/left-behind" {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden","reason":"Forbidden","code":403}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+	})
+	defer ts.Close()
+
+	reporter := newChannelReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter,
+		kubernetes.WithKeyResolver(bundle.keyResolver),
+		kubernetes.WithHTTPClient(bundle.httpClient),
+	)
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server":            ts.URL,
+			"ca_cert":               tlsServerCAPEM(ts),
+			"trust_bundle":          bundle.trustBundleJSON,
+			"service_account_token": "platform-tok",
+		},
+	})
+
+	manifest := domain.Manifest{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"left-behind","namespace":"default"}}`),
+	}
+	if err := agent.Remove(context.Background(), target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{}, bundle.attestation, 1); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	result := awaitDone(t, reporter.done)
+	if result.Operation != domain.DeliveryOperationRemove {
+		t.Errorf("Operation = %q, want %q", result.Operation, domain.DeliveryOperationRemove)
+	}
+	if result.State != domain.DeliveryStatePartial {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStatePartial, result.Message)
+	}
+	want := "left as they are: ConfigMap default/left-behind (the stored credential may neither read nor delete it)"
+	if result.Message != want {
+		t.Errorf("Message = %q, want %q", result.Message, want)
+	}
+}
+
+// A removal with the caller's credential that finds an object another
+// manager wrote leaves it in place and says so.
+func TestAgent_Remove_LeftoverObject_CallerCredential_ReportsPartial(t *testing.T) {
+	ts := newDiscoveryTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/default/configmaps/left-behind" {
+			fmt.Fprint(w, `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"left-behind","namespace":"default","managedFields":[{"manager":"someone-else","operation":"Apply"}]},"data":{"from":"someone"}}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+	})
+	defer ts.Close()
+
+	reporter := newChannelReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter)
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server": ts.URL,
+			"ca_cert":    tlsServerCAPEM(ts),
+		},
+	})
+
+	manifest := domain.Manifest{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"left-behind","namespace":"default"}}`),
+	}
+	if err := agent.Remove(context.Background(), target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	result := awaitDone(t, reporter.done)
+	if result.Operation != domain.DeliveryOperationRemove {
+		t.Errorf("Operation = %q, want %q", result.Operation, domain.DeliveryOperationRemove)
+	}
+	if result.State != domain.DeliveryStatePartial {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStatePartial, result.Message)
+	}
+	want := "left as they are: ConfigMap default/left-behind (not written by this resource manager)"
+	if result.Message != want {
+		t.Errorf("Message = %q, want %q", result.Message, want)
+	}
+}
+
+// closingProbe reports that a Close has started waiting for in-flight
+// work, so a test can look at Close's result without a scheduling window.
+type closingProbe struct {
+	once    sync.Once
+	closing chan struct{}
+}
+
+func (p *closingProbe) Closing() {
+	p.once.Do(func() { close(p.closing) })
+}
+
+// Close waits for a delivery already running and refuses new dispatches.
+func TestAgent_Close_JoinsInFlightDelivery(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	started := make(chan struct{})
+	var once sync.Once
+	ts := newDiscoveryTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			once.Do(func() { close(started) })
+			<-release
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden","reason":"Forbidden","code":403}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+	})
+	// A failure before the release must still unblock the handler, or the
+	// server's Close would wait for it forever. Cleanups run last
+	// registered first, so ts.Close is registered before unblock.
+	t.Cleanup(ts.Close)
+	t.Cleanup(unblock)
+
+	probe := &closingProbe{closing: make(chan struct{})}
+	reporter := newChannelReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter, kubernetes.WithAgentProbe(probe))
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server": ts.URL,
+			"ca_cert":    tlsServerCAPEM(ts),
+		},
+	})
+	manifest := domain.Manifest{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"close-test","namespace":"default"}}`),
+	}
+	if err := agent.Deliver(context.Background(), target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	<-started
+
+	closed := make(chan error, 1)
+	go func() { closed <- agent.Close(context.Background()) }()
+	// With no context deadline Close can return only after the running
+	// delivery finishes, so once the probe reports it started waiting, a
+	// non-blocking look at its result is conclusive.
+	<-probe.closing
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while a delivery was still running: %v", err)
+	default:
+	}
+	unblock()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the delivery finished")
+	}
+	if result := awaitDone(t, reporter.done); result.State != domain.DeliveryStateAuthFailed {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateAuthFailed, result.Message)
+	}
+	if err := agent.Deliver(context.Background(), target, "d2", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err == nil || !strings.Contains(err.Error(), "closing") {
+		t.Errorf("Deliver after Close = %v, want an error saying the agent is closing", err)
+	}
+	if err := agent.Remove(context.Background(), target, "d2", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err == nil || !strings.Contains(err.Error(), "closing") {
+		t.Errorf("Remove after Close = %v, want an error saying the agent is closing", err)
+	}
+}
+
+// Close respects its deadline while a delivery is still running.
+func TestAgent_Close_DeadlineIsRespected(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	ts := newDiscoveryTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			once.Do(func() { close(started) })
+			<-release
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden","reason":"Forbidden","code":403}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+	})
+	defer ts.Close()
+
+	reporter := newChannelReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter)
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server": ts.URL,
+			"ca_cert":    tlsServerCAPEM(ts),
+		},
+	})
+	manifest := domain.Manifest{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"close-deadline","namespace":"default"}}`),
+	}
+	if err := agent.Deliver(context.Background(), target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	<-started
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := agent.Close(closeCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Close = %v, want a wrapped context.DeadlineExceeded", err)
+	}
+	close(release)
+	awaitDone(t, reporter.done)
+}
+
+// A second Deliver for a delivery already being applied is skipped: the
+// platform provides at-least-once delivery, and a startup recovery plus a
+// replayed workflow activity would otherwise run the same apply twice and
+// report twice.
+func TestAgent_Deliver_SkipsDuplicateWhileInFlight(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	started := make(chan struct{})
+	var patches atomic.Int32
+	var once sync.Once
+	ts := newDiscoveryTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patches.Add(1)
+			once.Do(func() { close(started) })
+			<-release
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden","reason":"Forbidden","code":403}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+	})
+	t.Cleanup(ts.Close)
+	t.Cleanup(unblock)
+
+	reporter := newCountingResultReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter)
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server": ts.URL,
+			"ca_cert":    tlsServerCAPEM(ts),
+		},
+	})
+	manifest := domain.Manifest{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"in-flight-deliver","namespace":"default"}}`),
+	}
+	ctx := context.Background()
+	if err := agent.Deliver(ctx, target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	<-started
+
+	if err := agent.Deliver(ctx, target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("duplicate Deliver: %v", err)
+	}
+	unblock()
+	if result := awaitDone(t, reporter.done); result.State != domain.DeliveryStateAuthFailed {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateAuthFailed, result.Message)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := agent.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if n := patches.Load(); n != 1 {
+		t.Errorf("apply requests = %d, want 1: a duplicate dispatch must be skipped", n)
+	}
+	if n := reporter.resultCount(); n != 1 {
+		t.Errorf("result reports = %d, want 1: a duplicate dispatch must not report", n)
+	}
+}
+
+// A second Remove for a delivery already being removed is skipped, for
+// the same reason as Deliver.
+func TestAgent_Remove_SkipsDuplicateWhileInFlight(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	started := make(chan struct{})
+	var gets atomic.Int32
+	var once sync.Once
+	ts := newDiscoveryTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/default/configmaps/in-flight-remove" {
+			gets.Add(1)
+			once.Do(func() { close(started) })
+			<-release
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"not found","reason":"NotFound","code":404}`)
+	})
+	t.Cleanup(ts.Close)
+	t.Cleanup(unblock)
+
+	reporter := newCountingResultReporter()
+	agent := kubernetes.NewDeliveryAgent(reporter)
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server": ts.URL,
+			"ca_cert":    tlsServerCAPEM(ts),
+		},
+	})
+	manifest := domain.Manifest{
+		ManifestType: kubernetes.ManifestManifestType,
+		Raw:          json.RawMessage(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"in-flight-remove","namespace":"default"}}`),
+	}
+	ctx := context.Background()
+	if err := agent.Remove(ctx, target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	<-started
+
+	if err := agent.Remove(ctx, target, "d1", []domain.Manifest{manifest}, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("duplicate Remove: %v", err)
+	}
+	unblock()
+	if result := awaitDone(t, reporter.done); result.State != domain.DeliveryStateDelivered {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateDelivered, result.Message)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := agent.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if n := gets.Load(); n != 1 {
+		t.Errorf("object reads = %d, want 1: a duplicate dispatch must be skipped", n)
+	}
+	if n := reporter.resultCount(); n != 1 {
+		t.Errorf("result reports = %d, want 1: a duplicate dispatch must not report", n)
+	}
+}
+
+// A transient failure reporting a delivery outcome is retried rather
+// than dropped.
+func TestAgent_Deliver_ResultReportingRetriesTransientFailure(t *testing.T) {
+	reporter := &flakyReporter{failures: 2, done: make(chan domain.DeliveryResult, 1)}
+	agent := kubernetes.NewDeliveryAgent(reporter)
+
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{
+		ID:   "k8s-test",
+		Type: kubernetes.TargetType,
+		Name: "test-cluster",
+		Properties: map[string]string{
+			"api_server": "https://127.0.0.1:6443",
+		},
+	})
+
+	if err := agent.Deliver(context.Background(), target, "d1", nil, domain.DeliveryAuth{Token: "tok"}, nil, 1); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	result := awaitDone(t, reporter.done)
+	if result.Operation != domain.DeliveryOperationDeliver {
+		t.Errorf("Operation = %q, want %q", result.Operation, domain.DeliveryOperationDeliver)
+	}
+	if result.State != domain.DeliveryStateDelivered {
+		t.Errorf("State = %q, want %q; message: %s", result.State, domain.DeliveryStateDelivered, result.Message)
+	}
+	reporter.mu.Lock()
+	attempts := reporter.attempts
+	reporter.mu.Unlock()
+	if attempts != 3 {
+		t.Errorf("ReportResult attempts = %d, want 3 (two transient failures, then success)", attempts)
 	}
 }
 

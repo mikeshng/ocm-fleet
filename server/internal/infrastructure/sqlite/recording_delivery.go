@@ -48,7 +48,10 @@ func (s *RecordingDeliveryService) Deliver(ctx context.Context, target domain.Ta
 
 	if s.Reporter != nil {
 		go func() {
-			_ = s.Reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+			_ = s.Reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+				Operation: domain.DeliveryOperationDeliver,
+				State:     domain.DeliveryStateDelivered,
+			})
 		}()
 	}
 
@@ -70,14 +73,21 @@ func (s *RecordingDeliveryService) Remove(ctx context.Context, target domain.Tar
 		return fmt.Errorf("get delivery: %w", err)
 	}
 	now := s.now()
-	if err := tx.Deliveries().Put(ctx, domain.NewDelivery(
+	// Report the removal as a removal cycle: a fresh record for this call
+	// would be a pending put at the same generation, which the platform
+	// would reject against the removal operation it dispatched.
+	d := domain.NewDelivery(
 		deliveryID,
 		fulfillmentIDFromDeliveryID(deliveryID),
 		target.ID(),
 		nil,
 		generation,
 		now,
-	)); err != nil {
+	)
+	if _, err := d.Withdraw(generation, now); err != nil {
+		return fmt.Errorf("withdraw delivery: %w", err)
+	}
+	if err := tx.Deliveries().Put(ctx, d); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -86,7 +96,10 @@ func (s *RecordingDeliveryService) Remove(ctx context.Context, target domain.Tar
 
 	if s.Reporter != nil {
 		go func() {
-			_ = s.Reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+			_ = s.Reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+				Operation: domain.DeliveryOperationRemove,
+				State:     domain.DeliveryStateDelivered,
+			})
 		}()
 	}
 

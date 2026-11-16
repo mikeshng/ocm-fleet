@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -31,8 +32,15 @@ type PlacementTargetAdvisor interface {
 }
 
 // Create starts the durable create-deployment workflow, which persists
-// the deployment and launches orchestration as a child workflow.
+// the deployment and launches orchestration as a child workflow. A name
+// that is already stored is the caller's duplicate and is refused with
+// [domain.ErrAlreadyExists]; the workflow's persistence is replay safe,
+// so an activity retry after a restart reports the stored deployment
+// instead of failing.
 func (s *DeploymentService) Create(ctx context.Context, in domain.CreateDeploymentInput) (domain.DeploymentView, error) {
+	if err := s.rejectDuplicate(ctx, in.Name); err != nil {
+		return domain.DeploymentView{}, err
+	}
 	if err := s.checkStaticPlacement(ctx, in.PlacementStrategy); err != nil {
 		return domain.DeploymentView{}, err
 	}
@@ -84,6 +92,25 @@ func (s *DeploymentService) Create(ctx context.Context, in domain.CreateDeployme
 	}
 
 	return view, nil
+}
+
+// rejectDuplicate refuses a create whose name is already stored. The
+// persist activity treats an existing deployment as its own replay and
+// returns it as a success, so without this check a second caller's
+// create would succeed instead of reporting [domain.ErrAlreadyExists].
+func (s *DeploymentService) rejectDuplicate(ctx context.Context, name domain.ResourceName) error {
+	tx, err := s.Store.BeginReadOnly(ctx)
+	if err != nil {
+		return fmt.Errorf("begin read tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	if _, err := tx.Deployments().Get(ctx, name); err == nil {
+		return fmt.Errorf("%w: deployment %q", domain.ErrAlreadyExists, name)
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return fmt.Errorf("look up deployment %q: %w", name, err)
+	}
+	return tx.Commit()
 }
 
 // checkStaticPlacement refuses a deployment whose static placement
@@ -156,6 +183,24 @@ func (s *DeploymentService) List(ctx context.Context) ([]domain.DeploymentView, 
 		return nil, err
 	}
 	return views, tx.Commit()
+}
+
+// ListPage returns one page of deployments, ordered by name, starting
+// strictly after after, plus whether more follow. The repository applies
+// the name predicate and the limit in storage, so a paged read of a large
+// fleet does not load every deployment for every page.
+func (s *DeploymentService) ListPage(ctx context.Context, after domain.ResourceName, limit int) (domain.DeploymentViewPage, error) {
+	tx, err := s.Store.BeginReadOnly(ctx)
+	if err != nil {
+		return domain.DeploymentViewPage{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	page, err := tx.Deployments().ListViewPage(ctx, after, limit)
+	if err != nil {
+		return domain.DeploymentViewPage{}, err
+	}
+	return page, tx.Commit()
 }
 
 // ResumeInput carries the optional re-signing parameters for resuming
@@ -253,12 +298,24 @@ func (s *DeploymentService) Delete(ctx context.Context, name domain.ResourceName
 	if err != nil {
 		return domain.DeploymentView{}, err
 	}
+
+	// The idempotent path returns the current view, including its
+	// deliveries, so the response matches a read of the same resource.
+	idempotent := fulfillment.State() == domain.FulfillmentStateDeleting && !fulfillment.Paused()
+	var deliveries []domain.Delivery
+	if idempotent {
+		deliveries, err = tx.Deliveries().ListByFulfillment(ctx, dep.FulfillmentID())
+		if err != nil {
+			return domain.DeploymentView{}, fmt.Errorf("list deliveries: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return domain.DeploymentView{}, fmt.Errorf("commit read tx: %w", err)
 	}
 
-	if fulfillment.State() == domain.FulfillmentStateDeleting && !fulfillment.Paused() {
-		return domain.DeploymentView{Deployment: dep, Fulfillment: *fulfillment}, nil
+	if idempotent {
+		return domain.DeploymentView{Deployment: dep, Fulfillment: *fulfillment, Deliveries: deliveries}, nil
 	}
 
 	exec, err := s.DeleteWF.Start(ctx, domain.DeleteDeploymentInput{

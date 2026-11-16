@@ -34,9 +34,17 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { listDeployments, listTargets, type MgmtTarget } from "./api";
+import {
+  deliveryColor,
+  deliveryStateLabel,
+  deploymentsByTarget,
+  isRemoval,
+  isRemovalCompleted,
+  type TargetDeployment,
+} from "./targetDeliveries";
 
 interface TargetInfo extends MgmtTarget {
-  deployments: string[];
+  deployments: TargetDeployment[];
 }
 
 function stateColor(state: string): "green" | "orange" | "grey" {
@@ -60,14 +68,7 @@ export default function TargetsPage() {
         listDeployments(),
       ]);
 
-      const byTarget = new Map<string, string[]>();
-      for (const dep of deploymentsResp.deployments ?? []) {
-        for (const tid of dep.resolvedTargetIds ?? []) {
-          const existing = byTarget.get(tid) ?? [];
-          existing.push(dep.name);
-          byTarget.set(tid, existing);
-        }
-      }
+      const byTarget = deploymentsByTarget(deploymentsResp.deployments ?? []);
 
       setTargets(
         (targetsResp.targets ?? []).map((t) => ({
@@ -119,13 +120,17 @@ export default function TargetsPage() {
           <Title headingLevel="h1">Targets</Title>
         </FlexItem>
         <FlexItem>
-          <span className="pf-v6-u-font-size-sm pf-v6-u-text-color-subtle">
-            {targets.length} registered
-          </span>
+          {/* A count is a reading, and a read that failed has none: while the list has never
+              been read, the page shows the error alone rather than "0 registered". */}
+          {(!error || targets.length > 0) && (
+            <span className="pf-v6-u-font-size-sm pf-v6-u-text-color-subtle">
+              {targets.length} registered
+            </span>
+          )}
         </FlexItem>
       </Flex>
 
-      {error && (
+      {error && targets.length > 0 && (
         <Alert
           variant="warning"
           title={error}
@@ -134,7 +139,14 @@ export default function TargetsPage() {
         />
       )}
 
-      {targets.length === 0 ? (
+      {error && targets.length === 0 ? (
+        <EmptyState titleText="The targets did not load" headingLevel="h2">
+          <EmptyStateBody>{error}</EmptyStateBody>
+          <Button variant="primary" onClick={fetchTargets}>
+            Retry
+          </Button>
+        </EmptyState>
+      ) : targets.length === 0 ? (
         <EmptyState titleText="No targets found" headingLevel="h2">
           <EmptyStateBody>
             Targets are registered when the management plane starts, when a
@@ -237,8 +249,21 @@ export default function TargetsPage() {
                       {t.deployments.length > 0 ? (
                         <LabelGroup>
                           {t.deployments.map((d) => (
-                            <Label key={d} color="green" isCompact>
-                              {d.replace("deployments/", "")}
+                            <Label
+                              key={d.name}
+                              color={deliveryColor(
+                                d.status?.state,
+                                d.status?.operation,
+                              )}
+                              isCompact
+                            >
+                              {d.name.replace("deployments/", "")}
+                              {(d.status?.state !== "STATE_DELIVERED" ||
+                                isRemoval(d.status)) &&
+                                ` · ${deliveryStateLabel(
+                                  d.status?.state,
+                                  d.status?.operation,
+                                )}`}
                             </Label>
                           ))}
                         </LabelGroup>
@@ -321,7 +346,61 @@ export default function TargetsPage() {
                               Active Deployments
                             </DescriptionListTerm>
                             <DescriptionListDescription>
-                              {t.deployments.length}
+                              {
+                                t.deployments.filter(
+                                  (d) => !isRemovalCompleted(d.status),
+                                ).length
+                              }
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>
+                              Delivery status
+                            </DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {t.deployments.length === 0 ? (
+                                <span className="pf-v6-u-text-color-subtle">
+                                  No deployments target this cluster
+                                </span>
+                              ) : (
+                                t.deployments.map((d) => (
+                                  <div
+                                    key={d.name}
+                                    className="pf-v6-u-mb-sm"
+                                    data-testid={`delivery-${d.name.replace(
+                                      "deployments/",
+                                      "",
+                                    )}`}
+                                  >
+                                    <span className="pf-v6-u-font-family-monospace">
+                                      {d.name.replace("deployments/", "")}
+                                    </span>{" "}
+                                    <Label
+                                      color={deliveryColor(
+                                        d.status?.state,
+                                        d.status?.operation,
+                                      )}
+                                      isCompact
+                                    >
+                                      {deliveryStateLabel(
+                                        d.status?.state,
+                                        d.status?.operation,
+                                      )}
+                                    </Label>
+                                    {(d.status?.attempts ?? 0) > 0 && (
+                                      <span className="pf-v6-u-ml-sm pf-v6-u-text-color-subtle">
+                                        {d.status?.attempts} failed attempt
+                                        {d.status?.attempts === 1 ? "" : "s"}
+                                      </span>
+                                    )}
+                                    {d.status?.message && (
+                                      <div className="pf-v6-u-text-color-subtle">
+                                        {d.status.message}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))
+                              )}
                             </DescriptionListDescription>
                           </DescriptionListGroup>
                         </DescriptionList>

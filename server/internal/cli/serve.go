@@ -42,6 +42,7 @@ type serveFlags struct {
 	enrollmentCAFile              string
 	enrollmentConnectAddress      string
 	enrollmentAgentImage          string
+	clusterEgressAllow            string
 }
 
 // newServeCmd builds the serve Cobra command and passes explicit --db selection
@@ -79,6 +80,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.enrollmentCAFile, "enrollment-ca-file", os.Getenv("OCM_RM_ENROLLMENT_CA_FILE"), "PEM CA certificate that signs --enrollment-server-url's certificate (empty = clusters' system roots)")
 	cmd.Flags().StringVar(&f.enrollmentConnectAddress, "enrollment-connect-address", os.Getenv("OCM_RM_ENROLLMENT_CONNECT_ADDRESS"), "host:port existing clusters dial instead of resolving --enrollment-server-url's host")
 	cmd.Flags().StringVar(&f.enrollmentAgentImage, "enrollment-agent-image", os.Getenv("OCM_RM_ENROLLMENT_AGENT_IMAGE"), "image of the enrollment agent, written into enrollment manifests")
+	cmd.Flags().StringVar(&f.clusterEgressAllow, "cluster-egress-allow", os.Getenv("OCM_RM_CLUSTER_EGRESS_ALLOW"), "comma-separated CIDRs the server may dial for a cluster or hub although they are otherwise refused (loopback, link-local, cloud metadata)")
 	return cmd
 }
 

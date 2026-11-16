@@ -353,9 +353,16 @@ type createDeploymentWorkflow struct {
 }
 
 func (w *createDeploymentWorkflow) Start(ctx context.Context, input domain.CreateDeploymentInput) (domain.Execution[domain.DeploymentView], error) {
-	return startWorkflow(&w.guard, "create-"+string(input.Name), ctx,
+	exec, err := startWorkflow(&w.guard, "create-"+string(input.Name), ctx,
 		nil, w.spec.Run, input,
 	)
+	if errors.Is(err, domain.ErrAlreadyRunning) {
+		// The instance ID is the deployment name: a create already
+		// running for it means the deployment exists, so a second
+		// caller's create is a duplicate.
+		return nil, fmt.Errorf("%w: deployment %q", domain.ErrAlreadyExists, input.Name)
+	}
+	return exec, err
 }
 
 // --- ProvisionIdPWorkflow ---
@@ -509,7 +516,9 @@ func (r *baseRecord) unmarshalSignal(name string, data []byte) (any, error) {
 // JSON round-trips both input and output. The workflow goroutine blocks
 // until the activity completes. Failed activities are retried up to
 // [activityMaxAttempts] times, matching go-workflows' default retry
-// policy. Between retries a [runtime.Gosched] yields the processor so
+// policy. A terminal error and an unresolved placement are not retried:
+// they fail the same way on every attempt with the same input. Between
+// retries a [runtime.Gosched] yields the processor so
 // transient contention (e.g. SQLite SQLITE_LOCKED) can resolve.
 func (r *baseRecord) Run(activity domain.Activity[any, any], in any) (any, error) {
 	deserializedIn, err := jsonRoundTrip(in)
@@ -531,7 +540,7 @@ func (r *baseRecord) Run(activity domain.Activity[any, any], in any) (any, error
 		out, err := r.runOnce(activity, deserializedIn)
 		if err != nil {
 			lastErr = err
-			if domain.IsTerminal(err) {
+			if domain.IsTerminal(err) || domain.IsPlacementUnresolved(err) {
 				break
 			}
 			continue

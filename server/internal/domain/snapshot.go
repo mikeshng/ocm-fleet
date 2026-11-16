@@ -65,6 +65,8 @@ type DeliverySnapshot struct {
 	Generation    Generation
 	State         DeliveryState
 	Operation     DeliveryOperation
+	Message       string
+	Attempts      int
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
@@ -368,6 +370,8 @@ func (d *Delivery) Snapshot() DeliverySnapshot {
 		Generation:    d.generation,
 		State:         d.state,
 		Operation:     d.operation,
+		Message:       d.message,
+		Attempts:      d.attempts,
 		CreatedAt:     d.createdAt,
 		UpdatedAt:     d.updatedAt,
 	}
@@ -594,6 +598,12 @@ func DeploymentFromSnapshot(s DeploymentSnapshot) Deployment {
 
 // DeliveryFromSnapshot constructs a [Delivery] from a snapshot.
 func DeliveryFromSnapshot(s DeliverySnapshot) Delivery {
+	operation := s.Operation
+	if operation == "" {
+		// An absent operation is the delivery table's historical default:
+		// a put cycle.
+		operation = DeliveryOperationDeliver
+	}
 	return Delivery{
 		id:            s.ID,
 		fulfillmentID: s.FulfillmentID,
@@ -601,7 +611,9 @@ func DeliveryFromSnapshot(s DeliverySnapshot) Delivery {
 		manifests:     s.Manifests,
 		generation:    s.Generation,
 		state:         s.State,
-		operation:     s.Operation,
+		operation:     operation,
+		message:       s.Message,
+		attempts:      s.Attempts,
 		createdAt:     s.CreatedAt,
 		updatedAt:     s.UpdatedAt,
 	}

@@ -23,6 +23,10 @@ import (
 // clusterProbeTimeout bounds every request a probe makes to a cluster.
 const clusterProbeTimeout = 15 * time.Second
 
+// clusterIdentityNamespace is the namespace whose UID identifies a
+// cluster apart from the address it is reached at.
+const clusterIdentityNamespace = "kube-system"
+
 // serviceAccountUserPrefix is the user name prefix Kubernetes gives a
 // service account: system:serviceaccount:<namespace>:<name>.
 const serviceAccountUserPrefix = "system:serviceaccount:"
@@ -106,6 +110,10 @@ type ClusterProbeResult struct {
 	ServiceAccount ServiceAccountRef
 	// KubernetesVersion is the cluster's reported git version.
 	KubernetesVersion string
+	// ClusterUID identifies the cluster itself: the UID of its
+	// kube-system namespace. It is the same at every address the
+	// cluster is reached at. Empty when the credential may not read it.
+	ClusterUID string
 	// Rights is what the credential may do.
 	Rights ClusterRights
 	// TokenIssuedAt and TokenExpiresAt come from the token's own
@@ -131,11 +139,15 @@ type ClusterProber interface {
 
 // ClientGoClusterProber is the [ClusterProber] that talks to real
 // clusters.
-type ClientGoClusterProber struct{}
+type ClientGoClusterProber struct {
+	// Egress decides which addresses the prober may dial. The zero
+	// value applies the default refusals; see [EgressPolicy].
+	Egress EgressPolicy
+}
 
 var _ ClusterProber = ClientGoClusterProber{}
 
-func (ClientGoClusterProber) client(conn ClusterConnection) (kubeclient.Interface, error) {
+func (p ClientGoClusterProber) client(conn ClusterConnection) (kubeclient.Interface, error) {
 	if conn.APIServer == "" {
 		return nil, fmt.Errorf("%w: cluster API address is required", domain.ErrInvalidArgument)
 	}
@@ -145,12 +157,14 @@ func (ClientGoClusterProber) client(conn ClusterConnection) (kubeclient.Interfac
 	if conn.Token == "" {
 		return nil, fmt.Errorf("%w: cluster credential is required", domain.ErrInvalidArgument)
 	}
-	client, err := kubeclient.NewForConfig(&rest.Config{
+	cfg := &rest.Config{
 		Host:            conn.APIServer,
 		BearerToken:     conn.Token,
 		TLSClientConfig: rest.TLSClientConfig{CAData: conn.CACert},
 		Timeout:         clusterProbeTimeout,
-	})
+	}
+	p.Egress.DialConfig(cfg)
+	client, err := kubeclient.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build cluster client: %w", err)
 	}
@@ -196,6 +210,17 @@ func (p ClientGoClusterProber) Probe(ctx context.Context, conn ClusterConnection
 		return ClusterProbeResult{}, classifyClusterError("read the cluster version", err)
 	}
 	out.KubernetesVersion = version.GitVersion
+
+	// What identifies the cluster apart from its address. A credential
+	// that may not read it leaves the cluster without one.
+	ns, err := client.CoreV1().Namespaces().Get(ctx, clusterIdentityNamespace, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		out.ClusterUID = string(ns.UID)
+	case apierrors.IsForbidden(err), apierrors.IsNotFound(err):
+	default:
+		return ClusterProbeResult{}, classifyClusterError("read the cluster's identifier", err)
+	}
 
 	can := func(attrs authorizationv1.ResourceAttributes) (bool, error) {
 		review, err := client.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{

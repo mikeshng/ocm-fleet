@@ -19,27 +19,29 @@ type clusterState struct {
 	conds map[domain.ConditionType]domain.Condition
 }
 
-// loadClusterState reads the record of a cluster. A cluster without a
-// record, or with one that cannot be read, starts from an empty state.
-func (s *EnrollmentService) loadClusterState(ctx context.Context, clusterID string) *clusterState {
+// loadClusterState reads the record of a cluster. Only a cluster without
+// a record starts from an empty state: a record that exists but cannot be
+// read or decoded is an error, because writing an empty state over it
+// would erase what the record knows (a withdrawal, for example) and
+// silently undo an earlier decision.
+func (s *EnrollmentService) loadClusterState(ctx context.Context, clusterID string) (*clusterState, error) {
 	state := &clusterState{conds: map[domain.ConditionType]domain.Condition{}}
 	res, err := s.readRecord(ctx, ClusterResourceType, ClusterRecordName(clusterID))
 	if err != nil {
-		if !errors.Is(err, domain.ErrNotFound) {
-			s.logger.Warn("could not read cluster record; starting from an empty one", "cluster", clusterID, "error", err)
+		if errors.Is(err, domain.ErrNotFound) {
+			return state, nil
 		}
-		return state
+		return nil, fmt.Errorf("read record of cluster %q: %w", clusterID, err)
 	}
 	if err := decodeObservation(res, &state.obs); err != nil {
-		s.logger.Warn("could not decode cluster record; starting from an empty one", "cluster", clusterID, "error", err)
-		state.obs = ClusterObservation{}
+		return nil, fmt.Errorf("decode record of cluster %q: %w", clusterID, err)
 	}
 	if inv := res.Inventory(); inv != nil {
 		for _, c := range inv.Conditions() {
 			state.conds[c.Type()] = c
 		}
 	}
-	return state
+	return state, nil
 }
 
 // set records a condition. The transition time moves only when the
@@ -136,6 +138,7 @@ func observationFromTarget(target domain.TargetInfo, prev ClusterObservation) Cl
 	obs.AccessForm = props[PropAccessForm]
 	obs.APIServer = props[PropAPIServer]
 	obs.CAFingerprint = firstCAFingerprint([]byte(props[PropCACert]))
+	obs.ClusterUID = props[PropClusterUID]
 	obs.Target = string(target.ID())
 	obs.ServiceAccount = props[PropServiceAccount]
 	obs.Profile = props[PropAccessProfile]

@@ -33,6 +33,19 @@ import (
 	"github.com/stolostron/ocm-fleet/server/internal/transport/platformresource"
 )
 
+// HTTP server bounds: a client that opens a connection and sends no
+// request must not hold it, request bodies and response writes are
+// bounded in time, and idle keep-alive connections are released so
+// connection counts stay bounded. WebSocket routes are hijacked, which
+// clears these deadlines on the connection, so the time bounds apply to
+// ordinary requests only.
+const (
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 30 * time.Second
+	httpWriteTimeout      = 60 * time.Second
+	httpIdleTimeout       = 2 * time.Minute
+)
+
 // Server is a fully ready resource manager server process handle. Endpoints are immutable.
 // Stores, services, and transport servers are not exposed; exercise the
 // process through public endpoints. Wait surfaces unexpected background
@@ -46,6 +59,11 @@ type Server struct {
 	httpServer *http.Server
 	grpcLis    net.Listener
 	httpLis    net.Listener
+	// httpBaseCancel ends the context every HTTP handler derives from.
+	// It is called after the HTTP server has finished its own shutdown,
+	// so hijacked connections (the UI event sockets), which net/http
+	// neither tracks nor closes, still end.
+	httpBaseCancel context.CancelFunc
 
 	wfRegistry domain.Registry
 	appCtx     context.Context
@@ -187,6 +205,7 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 	deliveryReporter := application.NewDeliveryReportService(
 		p.store,
 		reg,
+		application.WithDeliveryReportVault(p.vault),
 		application.WithDeliveryObserver(observability.NewMultiDeliveryObserver(
 			observability.NewDeliveryObserver(logger),
 			eventHub,
@@ -294,10 +313,12 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 	}
 
 	// Dynamic managed resource HTTP routes are registered directly on
-	// topMux by the SchemaActivator at canonical
-	// /apis/{service}/{version}/{collection} prefixes. Go 1.22+ ServeMux
-	// uses longest-prefix matching, so these always take precedence over
-	// the gateway's /v1alpha/ catch-all and the platform-owned
+	// topMux by the SchemaActivator at each service root,
+	// /apis/{service}/{version}. One route table per root dispatches the
+	// collections beneath it, so a URL is the root followed by either a
+	// collection or a resource name. Go 1.22+ ServeMux uses longest-prefix
+	// matching, so these always take precedence over the gateway's
+	// /v1alpha/ catch-all and the platform-owned
 	// /apis/open-cluster-management.io/ prefix used by QueryResources.
 	topMux := http.NewServeMux()
 	// Minimal health probes are unauthenticated and registered before auth
@@ -340,7 +361,9 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 	cleanups = append(cleanups, func() { _ = httpLis.Close() })
 	httpEP := endpointFromListener(httpLis)
 	srv.endpoints = Endpoints{GRPC: grpcEP, HTTP: httpEP}
-	srv.httpServer = &http.Server{Handler: transporthttp.MaxBody(topMux)}
+	httpBaseCtx, httpBaseCancel := context.WithCancel(context.Background())
+	srv.httpBaseCancel = httpBaseCancel
+	srv.httpServer = newHTTPServer(transporthttp.MaxBody(topMux), httpBaseCtx, httpReadTimeout, httpWriteTimeout)
 
 	// --- addon lifecycle ---
 	//
@@ -364,6 +387,11 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		Router: router, TypeSvc: typeSvc, Activator: activator,
 	})
 
+	placementReevaluation := &application.PlacementReevaluationService{
+		Store:         p.store,
+		Orchestration: wfs.orchWf,
+		Logger:        logger.With("component", "placement"),
+	}
 	addonDeps := AddonDeps{
 		Config:            cfg,
 		Logger:            logger,
@@ -373,6 +401,7 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		InventoryReporter: inventoryReporter,
 		InventoryRecords:  inventoryRecords,
 		TrustBundles:      trustBundleSource(wfs.authMethodSvc),
+		Placement:         placementReevaluation,
 		Caller:            callerFromContext,
 		Indexing:          kubeIndexing,
 		AppCtx:            appCtx,
@@ -440,6 +469,18 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 		_ = reg.Close(waitCtx)
 	})
 
+	// Deliver completion signals that the reporting path could not send,
+	// including ones recorded before a restart. It exits on appCancel.
+	completionRelay := application.NewDeliveryCompletionRelay(
+		p.store, reg,
+		application.WithDeliveryCompletionRelayLogger(logger),
+	)
+	go completionRelay.Run(appCtx)
+
+	// Keep placement in step with the target fleet, whoever changes it.
+	// It exits on appCancel.
+	go placementReevaluation.Run(appCtx)
+
 	// Install the initial AuthMethod after the workflow worker is running so
 	// ProvisionIdP can complete under both mem and go-workflows registries.
 	// Listeners are bound but Serve has not started, so the public API stays closed.
@@ -464,7 +505,7 @@ func Start(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option)
 	// Serve owns accepted connections; register stop before readiness so a
 	// failed proveReadiness unwinds servers the same way as Close.
 	cleanups = append(cleanups, func() {
-		_ = stopIngress(grpcServer, srv.httpServer, o.shutdownGrace)
+		_ = stopIngress(grpcServer, srv.httpServer, srv.httpBaseCancel, o.shutdownGrace)
 	})
 
 	if err := proveReadiness(ctx, grpcEP.Dial); err != nil {
@@ -554,7 +595,7 @@ func (s *Server) shutdown() error {
 	}
 
 	// Quiesce ingress while dependencies remain live.
-	join(stopIngress(s.grpcServer, s.httpServer, s.shutdownGrace))
+	join(stopIngress(s.grpcServer, s.httpServer, s.httpBaseCancel, s.shutdownGrace))
 
 	// Cancel app-owned work and join producers.
 	s.appCancel()
@@ -600,9 +641,27 @@ func (s *Server) shutdown() error {
 	return primary
 }
 
+// newHTTPServer builds the HTTP server with the configured bounds. The
+// base context is the parent of every handler's request context; the
+// caller cancels it after the server's own shutdown so hijacked
+// connections still end.
+func newHTTPServer(handler http.Handler, baseCtx context.Context, readTimeout, writeTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		BaseContext:       func(net.Listener) context.Context { return baseCtx },
+	}
+}
+
 // stopIngress performs graceful-then-forced gRPC stop and bounded HTTP
 // Shutdown. Used by Close and by Start fail cleanup after Serve has begun.
-func stopIngress(grpcServer *grpc.Server, httpServer *http.Server, grace time.Duration) error {
+// The HTTP base context is canceled once Shutdown has returned: Shutdown
+// waits for ordinary handlers, and the cancel then ends the handlers of
+// hijacked connections, which Shutdown and Close do not reach.
+func stopIngress(grpcServer *grpc.Server, httpServer *http.Server, httpBaseCancel context.CancelFunc, grace time.Duration) error {
 	var primary error
 	if grpcServer != nil {
 		stopped := make(chan struct{})
@@ -620,9 +679,17 @@ func stopIngress(grpcServer *grpc.Server, httpServer *http.Server, grace time.Du
 	if httpServer != nil {
 		httpCtx, cancel := context.WithTimeout(context.Background(), grace)
 		if err := httpServer.Shutdown(httpCtx); err != nil {
+			// Shutdown gives up when its grace expires with requests
+			// still open. Close releases those connections now instead
+			// of leaving the process holding them; the shutdown error is
+			// the one a caller needs to see.
+			_ = httpServer.Close()
 			primary = err
 		}
 		cancel()
+		if httpBaseCancel != nil {
+			httpBaseCancel()
+		}
 	}
 	return primary
 }

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	kindaddon "github.com/stolostron/ocm-fleet/server/internal/addon/kind"
+	ocmaddon "github.com/stolostron/ocm-fleet/server/internal/addon/ocm"
 	"github.com/stolostron/ocm-fleet/server/internal/application"
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 	"github.com/stolostron/ocm-fleet/server/internal/infrastructure/delivery"
@@ -567,6 +568,50 @@ func TestDynamicSchemaActivator_DeactivateRemovesHTTPRoutes(t *testing.T) {
 	code := httpStatus(t, env.httpURL+"/apis/kind.open-cluster-management.io/v1alpha/clusters/test-id")
 	if code != http.StatusNotFound {
 		t.Errorf("expected 404 on canonical route after Deactivate, got %d", code)
+	}
+}
+
+// TestDynamicSchemaActivator_SharesServiceRoot proves that the services
+// of one add-on share the /apis/{service}/{version} root: the collection
+// address serves each service, a nested resource name routes to the
+// service whose leaf collection it names, and deactivating one service
+// leaves the other serving.
+func TestDynamicSchemaActivator_SharesServiceRoot(t *testing.T) {
+	env := newActivatorWithHTTP(t)
+	ctx := context.Background()
+
+	if _, err := env.activator.Activate(ctx, ocmaddon.HubSchema()); err != nil {
+		t.Fatalf("Activate hubs: %v", err)
+	}
+	mcID, err := env.activator.Activate(ctx, ocmaddon.ManagedClusterSchema())
+	if err != nil {
+		t.Fatalf("Activate managedClusters: %v", err)
+	}
+
+	const root = "/apis/ocm.open-cluster-management.io/v1alpha"
+	hubURL := env.httpURL + root + "/hubs/hub-a"
+	nestedURL := env.httpURL + root + "/hubs/hub-a/managedClusters/mc-a"
+	listURL := env.httpURL + root + "/managedClusters"
+
+	// No Resources dep: the gRPC handler errors, but the route exists, so
+	// the answer is anything but the mux's 404.
+	if code := httpStatus(t, hubURL); code == http.StatusNotFound {
+		t.Errorf("GET %s = 404, want the hubs route to exist", hubURL)
+	}
+	if code := httpStatus(t, nestedURL); code == http.StatusNotFound {
+		t.Errorf("GET %s = 404, want the nested managed-cluster route to exist", nestedURL)
+	}
+
+	env.activator.Deactivate(mcID)
+
+	if code := httpStatus(t, hubURL); code == http.StatusNotFound {
+		t.Errorf("GET %s = 404 after deactivating managedClusters, want hubs to keep serving", hubURL)
+	}
+	if code := httpStatus(t, nestedURL); code != http.StatusNotFound {
+		t.Errorf("GET %s = %d after deactivating managedClusters, want 404", nestedURL, code)
+	}
+	if code := httpStatus(t, listURL); code != http.StatusNotFound {
+		t.Errorf("GET %s = %d after deactivating managedClusters, want 404", listURL, code)
 	}
 }
 

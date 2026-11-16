@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { KindCluster, KindClusterSpec } from "../api";
-import { createKindCluster } from "../api";
+import { createKindCluster, kindClusterNameError } from "../api";
 
 function mockFetch(body: unknown, status = 200) {
   return vi.spyOn(globalThis, "fetch").mockResolvedValue({
@@ -77,11 +77,45 @@ describe("createKindCluster", () => {
     expect(params.get("cluster_id")).toBe("my cluster/special");
   });
 
-  it("throws on API error", async () => {
-    mockFetch({ message: "quota exceeded" }, 400);
-
-    await expect(createKindCluster("fail", {})).rejects.toThrow(
-      "Kind cluster creation failed",
+  it("keeps the server's refusal sentence on an API error", async () => {
+    mockFetch(
+      { error: "cluster 'taken' already exists", reason: "already-exists" },
+      409,
     );
+
+    await expect(createKindCluster("taken", {})).rejects.toThrow(
+      "cluster 'taken' already exists",
+    );
+  });
+
+  it("keeps a plain-text refusal sentence", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      text: () =>
+        Promise.resolve(
+          "invalid cluster_id: use lowercase letters, digits, '.', or '-'\n",
+        ),
+    } as unknown as Response);
+
+    await expect(createKindCluster("Taken", {})).rejects.toThrow(
+      "invalid cluster_id: use lowercase letters, digits, '.', or '-'",
+    );
+  });
+});
+
+describe("kindClusterNameError", () => {
+  it("accepts the names the server can carry", () => {
+    expect(kindClusterNameError("demo")).toBeNull();
+    expect(kindClusterNameError("my-cluster")).toBeNull();
+    expect(kindClusterNameError("a.b")).toBeNull();
+    expect(kindClusterNameError("a".repeat(39))).toBeNull();
+  });
+
+  it("names what an unacceptable name must change", () => {
+    expect(kindClusterNameError("")).toMatch(/enter a cluster name/i);
+    expect(kindClusterNameError("My_Cluster")).toMatch(/lowercase/i);
+    expect(kindClusterNameError("a".repeat(40))).toMatch(/39/);
   });
 });

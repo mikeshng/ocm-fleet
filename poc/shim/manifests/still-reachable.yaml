@@ -1,0 +1,15 @@
+# Delivered to a cluster while its hub has lost contact with it: a namespace and a note.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: still-reachable
+  labels:
+    app.kubernetes.io/part-of: fleet-demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: note
+  namespace: still-reachable
+data:
+  written: while the hub had lost contact with this cluster

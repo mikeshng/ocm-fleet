@@ -13,6 +13,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
@@ -39,6 +40,10 @@ const (
 // defaultClusterBundleTTL is how long a bundle that names one cluster
 // stays valid when its creator sets no expiry.
 const defaultClusterBundleTTL = 24 * time.Hour
+
+// MaxBundleTTL is the longest a bundle may stay valid when its creator
+// sets the expiry.
+const MaxBundleTTL = 30 * 24 * time.Hour
 
 // BundleScope says which clusters a bundle may enroll. Exactly one of
 // the two forms is set: a verifier with its scope, or one cluster.
@@ -83,6 +88,11 @@ func (b BundleObservation) TokenLifetime() time.Duration {
 
 // CreateBundleRequest is the input of [EnrollmentService.CreateBundle].
 type CreateBundleRequest struct {
+	// ID is the id the creator chose for the bundle, empty when the
+	// server generates one. A create that names an existing bundle
+	// answers the conflict instead of a second secret, so a client that
+	// is unsure whether a create landed can retry it safely.
+	ID                    string
 	Route                 string
 	Scope                 BundleScope
 	Profile               string
@@ -102,9 +112,12 @@ type CreateBundleRequest struct {
 
 // kubernetesNamePattern matches a name usable for the RBAC objects the
 // access piece refers to.
-var kubernetesNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.:]*[a-z0-9])?$`)
+var kubernetesNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
 
-// bundleIDPattern is the shape of a generated bundle id.
+// bundleIDPattern is the shape of a bundle id, whether the server
+// generated it or its creator chose it: the routes that name a bundle
+// by id check the shape, so an id outside it could neither be
+// presented nor revoked.
 var bundleIDPattern = regexp.MustCompile(`^eb-[0-9a-f]{12}$`)
 
 func bundleRecordName(id string) domain.ResourceName {
@@ -194,8 +207,14 @@ func (s *EnrollmentService) CreateBundle(ctx context.Context, req CreateBundleRe
 	if lifetime < MinTokenLifetime {
 		return BundleObservation{}, "", fmt.Errorf("%w: token lifetime must be at least %s", domain.ErrInvalidArgument, MinTokenLifetime)
 	}
+	if lifetime > MaxTokenLifetime {
+		return BundleObservation{}, "", fmt.Errorf("%w: token lifetime must be at most %s", domain.ErrInvalidArgument, MaxTokenLifetime)
+	}
 	if req.TTL < 0 {
 		return BundleObservation{}, "", fmt.Errorf("%w: bundle lifetime must not be negative", domain.ErrInvalidArgument)
+	}
+	if req.TTL > MaxBundleTTL {
+		return BundleObservation{}, "", fmt.Errorf("%w: bundle lifetime must be at most %s", domain.ErrInvalidArgument, MaxBundleTTL)
 	}
 
 	if scope.ClusterID != "" {
@@ -205,15 +224,21 @@ func (s *EnrollmentService) CreateBundle(ctx context.Context, req CreateBundleRe
 		}
 	}
 
-	idBytes := make([]byte, 6)
-	secretBytes := make([]byte, 32)
-	if _, err := io.ReadFull(s.random, idBytes); err != nil {
-		return BundleObservation{}, "", fmt.Errorf("generate bundle id: %w", err)
+	id := req.ID
+	if id != "" && !bundleIDPattern.MatchString(id) {
+		return BundleObservation{}, "", fmt.Errorf("%w: bundle id %q must look like eb- followed by 12 lowercase hexadecimal digits", domain.ErrInvalidArgument, id)
 	}
+	secretBytes := make([]byte, 32)
 	if _, err := io.ReadFull(s.random, secretBytes); err != nil {
 		return BundleObservation{}, "", fmt.Errorf("generate bundle secret: %w", err)
 	}
-	id := "eb-" + hex.EncodeToString(idBytes)
+	if id == "" {
+		idBytes := make([]byte, 6)
+		if _, err := io.ReadFull(s.random, idBytes); err != nil {
+			return BundleObservation{}, "", fmt.Errorf("generate bundle id: %w", err)
+		}
+		id = "eb-" + hex.EncodeToString(idBytes)
+	}
 	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
 
 	now := s.now().UTC()
@@ -238,6 +263,19 @@ func (s *EnrollmentService) CreateBundle(ctx context.Context, req CreateBundleRe
 		obs.ExpiresAt = &expires
 	}
 
+	m := s.lockBundle(id)
+	defer s.unlockBundle(id, m)
+	// The id must name no bundle yet. A create that names an existing
+	// bundle answers the conflict and leaves that bundle alone, secret
+	// included: a retried create must never leave the cluster that holds
+	// the first answer with a secret the vault no longer accepts, and must
+	// never mint a second working secret.
+	switch _, err := s.GetBundle(ctx, id); {
+	case err == nil:
+		return BundleObservation{}, "", bundleIDInUse(id)
+	case !errors.Is(err, domain.ErrNotFound):
+		return BundleObservation{}, "", err
+	}
 	if err := s.vault.Put(ctx, bundleSecretRef(id), hashBundleSecret(secret)); err != nil {
 		return BundleObservation{}, "", fmt.Errorf("store bundle secret: %w", err)
 	}
@@ -247,6 +285,17 @@ func (s *EnrollmentService) CreateBundle(ctx context.Context, req CreateBundleRe
 	}
 	s.logger.Info("enrollment bundle created", "bundle", id, "route", route, "by", req.Actor)
 	return obs, id + "." + secret, nil
+}
+
+// bundleIDInUse answers a create whose id names an existing bundle. The
+// answer names the bundle so a client that is unsure whether its create
+// landed can read the one that did, but it carries no secret: only the
+// create that made a bundle ever does.
+func bundleIDInUse(id string) *EnrollmentError {
+	e := enrollmentErr(ErrEnrollmentConflict, "bundle-id-in-use",
+		"enrollment bundle %q already exists: revoke it first, or create with another bundle id", id)
+	e.Details = map[string]any{"name": string(bundleRecordName(id))}
+	return e
 }
 
 // GetBundle returns a bundle record.
@@ -288,9 +337,62 @@ func (s *EnrollmentService) ListBundles(ctx context.Context) ([]BundleObservatio
 	return out, nil
 }
 
+// A bundleLock is one bundle record's mutex and the number of callers
+// that hold or wait for it. The entry is removed from the service's map
+// when the last caller releases it, so the map is bounded by the
+// changes in flight, not by every bundle id ever named: an id that
+// names no bundle costs at most the time its request spends holding
+// it.
+type bundleLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockBundle serializes every change to one bundle record and counts
+// the caller. Every call must be paired with [unlockBundle].
+func (s *EnrollmentService) lockBundle(id string) *bundleLock {
+	s.mu.Lock()
+	l, ok := s.bundleLocks[id]
+	if !ok {
+		l = &bundleLock{}
+		s.bundleLocks[id] = l
+	}
+	l.refs++
+	s.mu.Unlock()
+	l.mu.Lock()
+	return l
+}
+
+// unlockBundle releases the record's mutex and drops the map entry when
+// no caller holds or waits for it. The reference count is taken under
+// s.mu before a caller waits, so an entry is never removed under a
+// waiter: a new caller either joins this entry or finds none.
+func (s *EnrollmentService) unlockBundle(id string, l *bundleLock) {
+	l.mu.Unlock()
+	s.mu.Lock()
+	l.refs--
+	if l.refs == 0 {
+		delete(s.bundleLocks, id)
+	}
+	s.mu.Unlock()
+}
+
 // RevokeBundle removes a bundle and its secret. Clusters already
 // enrolled with it stay enrolled; nothing new can be presented with it.
 func (s *EnrollmentService) RevokeBundle(ctx context.Context, id, actor string) error {
+	if !bundleIDPattern.MatchString(id) {
+		return fmt.Errorf("%w: enrollment bundle %q", domain.ErrNotFound, id)
+	}
+	// Refuse an id that names no bundle before taking the bundle's
+	// lock: the lock serializes revocation against use recording of a
+	// stored bundle, and a caller sending random ids must not make the
+	// lock map hold them. The check under the lock stays authoritative;
+	// this one only keeps ids that name nothing out of the map.
+	if _, err := s.GetBundle(ctx, id); err != nil {
+		return err
+	}
+	m := s.lockBundle(id)
+	defer s.unlockBundle(id, m)
 	if _, err := s.GetBundle(ctx, id); err != nil {
 		return err
 	}
@@ -306,9 +408,18 @@ func (s *EnrollmentService) RevokeBundle(ctx context.Context, id, actor string) 
 	return nil
 }
 
+// reasonBundleSecretMismatch is the answer for a well-formed bearer
+// value that names an existing bundle but carries the wrong secret. It
+// is the one authentication failure that means someone is guessing at
+// a real bundle rather than at an id.
+const reasonBundleSecretMismatch = "bundle-secret-mismatch"
+
 // authenticateBundle checks a presented bearer value ("<id>.<secret>")
-// and returns its bundle. Every failure is the same error for the
-// caller, so the endpoint does not reveal which bundle ids exist.
+// and returns its bundle. The message is the same for every failure, so
+// the answer does not carry which bundle ids exist in its sentence; the
+// reason distinguishes the bundle's state (unknown, wrong secret,
+// expired), per the documented contract, and bundle ids are random
+// enough that guessing one is not practical.
 func (s *EnrollmentService) authenticateBundle(ctx context.Context, bearer string) (BundleObservation, error) {
 	denied := func(reason string) error {
 		return enrollmentErr(ErrEnrollmentUnauthenticated, reason, "the enrollment bundle secret is not valid")
@@ -332,7 +443,7 @@ func (s *EnrollmentService) authenticateBundle(ctx context.Context, bearer strin
 		return BundleObservation{}, fmt.Errorf("read bundle secret: %w", err)
 	}
 	if subtle.ConstantTimeCompare(want, hashBundleSecret(secret)) != 1 {
-		return BundleObservation{}, denied("bundle-secret-mismatch")
+		return BundleObservation{}, denied(reasonBundleSecretMismatch)
 	}
 	if obs.ExpiresAt != nil && !s.now().Before(*obs.ExpiresAt) {
 		return BundleObservation{}, denied("bundle-expired")
@@ -341,13 +452,25 @@ func (s *EnrollmentService) authenticateBundle(ctx context.Context, bearer strin
 }
 
 // noteBundleUse records that a bundle enrolled or refreshed a cluster.
-// Failure to record it does not fail the enrollment.
-func (s *EnrollmentService) noteBundleUse(ctx context.Context, obs BundleObservation) {
+// The record is read again under the bundle's lock: the snapshot taken
+// when the secret was checked may be stale by now, and a bundle revoked
+// while the cluster was being admitted must not be written back into
+// existence. Failure to record the use does not fail the enrollment.
+func (s *EnrollmentService) noteBundleUse(ctx context.Context, id string) {
+	m := s.lockBundle(id)
+	defer s.unlockBundle(id, m)
+	obs, err := s.GetBundle(ctx, id)
+	if err != nil {
+		if !errors.Is(err, domain.ErrNotFound) {
+			s.logger.Warn("could not read enrollment bundle to record its use", "bundle", id, "error", err)
+		}
+		return
+	}
 	now := s.now().UTC()
 	obs.Uses++
 	obs.LastUsedAt = &now
 	if err := s.writeBundle(ctx, obs); err != nil {
-		s.logger.Warn("could not record enrollment bundle use", "bundle", obs.ID, "error", err)
+		s.logger.Warn("could not record enrollment bundle use", "bundle", id, "error", err)
 	}
 }
 
