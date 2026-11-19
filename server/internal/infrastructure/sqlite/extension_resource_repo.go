@@ -1502,6 +1502,76 @@ func (r *ExtensionResourceRepo) deleteInventoryReplacements(ctx context.Context,
 	return r.hardDeleteExtensionResourcesByPredicate(ctx, whereSQL, args)
 }
 
+// ListCollections implements [domain.ExtensionResourceRepository.ListCollections].
+func (r *ExtensionResourceRepo) ListCollections(ctx context.Context, rt domain.ResourceType) ([]domain.CollectionName, error) {
+	rows, err := r.DB.QueryContext(ctx,
+		`SELECT DISTINCT collection_name FROM extension_resources
+		 WHERE service_name = ? AND type_name = ?
+		 ORDER BY collection_name`,
+		string(rt.ServiceName()), rt.TypeName())
+	if err != nil {
+		return nil, fmt.Errorf("list collections: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.CollectionName
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan collection name: %w", err)
+		}
+		out = append(out, domain.CollectionName(name))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list collections: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteByCollectionPrefix implements
+// [domain.ExtensionResourceRepository.DeleteByCollectionPrefix]. The
+// prefix is compared literally (substr, not LIKE), so '%' and '_' in a
+// resource ID segment carry no wildcard meaning.
+func (r *ExtensionResourceRepo) DeleteByCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string) (int64, error) {
+	return r.deleteByCollectionPrefix(ctx, rt, prefix, "")
+}
+
+// DeleteStaleByCollectionPrefix implements
+// [domain.ExtensionResourceRepository.DeleteStaleByCollectionPrefix].
+// updated_at is stored as RFC 3339 text whose fraction has no fixed
+// width, so the two times are compared after strftime has brought both
+// to the same millisecond form rather than as raw text.
+func (r *ExtensionResourceRepo) DeleteStaleByCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error) {
+	return r.deleteByCollectionPrefix(ctx, rt, prefix,
+		` AND NOT EXISTS (SELECT 1 FROM extension_resource_inventory inv
+			WHERE inv.extension_resource_uid = extension_resources.uid
+			  AND strftime('%Y-%m-%dT%H:%M:%f', inv.updated_at) >= ?)`,
+		notWrittenSince.UTC().Format("2006-01-02T15:04:05.000"))
+}
+
+// deleteByCollectionPrefix deletes the resources of type rt under
+// prefix that also satisfy extraWhere (a predicate starting with
+// " AND ", or empty), and returns how many.
+func (r *ExtensionResourceRepo) deleteByCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix, extraWhere string, extraArgs ...any) (int64, error) {
+	if prefix == "" {
+		return 0, fmt.Errorf("%w: collection prefix must not be empty", domain.ErrInvalidArgument)
+	}
+	whereSQL := "service_name = ? AND type_name = ? AND substr(collection_name, 1, length(?)) = ?" + extraWhere
+	args := append([]any{string(rt.ServiceName()), rt.TypeName(), prefix, prefix}, extraArgs...)
+
+	var n int64
+	if err := r.DB.QueryRowContext(ctx,
+		`SELECT count(*) FROM extension_resources WHERE `+whereSQL, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count extension resources by collection prefix: %w", err)
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if err := r.hardDeleteExtensionResourcesByPredicate(ctx, whereSQL, args); err != nil {
+		return 0, fmt.Errorf("delete extension resources by collection prefix: %w", err)
+	}
+	return n, nil
+}
+
 func (r *ExtensionResourceRepo) ListObservations(ctx context.Context, uid domain.ExtensionResourceUID, limit int) ([]domain.Observation, error) {
 	rows, err := r.DB.QueryContext(ctx,
 		`SELECT id, extension_resource_uid, observation, observed_at, created_at

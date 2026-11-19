@@ -116,6 +116,16 @@ func (p *fulfillmentRunProbe) RetryDelayStarted(delay time.Duration) {
 	)
 }
 
+func (p *fulfillmentRunProbe) RetryDelayInterrupted(startGen, currentGen domain.Generation) {
+	if !p.logger.Enabled(p.ctx, slog.LevelInfo) {
+		return
+	}
+	p.logger.LogAttrs(p.ctx, slog.LevelInfo, "retry delay interrupted by a new generation",
+		slog.Int64("start_generation", int64(startGen)),
+		slog.Int64("current_generation", int64(currentGen)),
+	)
+}
+
 func (p *fulfillmentRunProbe) ContinueAsNewTriggered() {
 	if !p.logger.Enabled(p.ctx, slog.LevelInfo) {
 		return
@@ -397,6 +407,24 @@ func (p *deliverProbe) SkippedAlreadyAcked() {
 	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "delivery skipped: already acked")
 }
 
+func (p *deliverProbe) SkippedTerminal(state domain.DeliveryState) {
+	if !p.logger.Enabled(p.ctx, slog.LevelDebug) {
+		return
+	}
+	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "delivery skipped: terminal for the current cycle",
+		slog.String("state", string(state)),
+	)
+}
+
+func (p *deliverProbe) SkippedStale(recordGen domain.Generation) {
+	if !p.logger.Enabled(p.ctx, slog.LevelWarn) {
+		return
+	}
+	p.logger.LogAttrs(p.ctx, slog.LevelWarn, "delivery skipped: record generation is ahead of the dispatch cycle",
+		slog.Int64("record_generation", int64(recordGen)),
+	)
+}
+
 func (p *deliverProbe) Error(err error) {
 	p.err = err
 }
@@ -465,6 +493,15 @@ func (p *removeProbe) AlreadyPending() {
 		return
 	}
 	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "remove skipped: already past pending")
+}
+
+func (p *removeProbe) SkippedTerminal(state domain.DeliveryState) {
+	if !p.logger.Enabled(p.ctx, slog.LevelDebug) {
+		return
+	}
+	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "remove skipped: terminal",
+		slog.String("state", string(state)),
+	)
 }
 
 func (p *removeProbe) Error(err error) {
@@ -546,76 +583,6 @@ func (p *persistReconciliationProbe) End() {
 		return
 	}
 	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "persist reconciliation completed",
-		slog.Duration("duration", duration),
-	)
-}
-
-// ---------------------------------------------------------------------------
-// ProcessOutputsStarted → processOutputsProbe (activity-level)
-// ---------------------------------------------------------------------------
-
-func (o *FulfillmentObserver) ProcessOutputsStarted(ctx context.Context) (context.Context, domain.ProcessOutputsProbe) {
-	logger := o.logger
-	if logger.Enabled(ctx, slog.LevelDebug) {
-		logger.LogAttrs(ctx, slog.LevelDebug, "process delivery outputs started")
-	}
-	return ctx, &processOutputsProbe{
-		logger:    logger,
-		ctx:       ctx,
-		startTime: time.Now(),
-	}
-}
-
-type processOutputsProbe struct {
-	domain.NoOpProcessOutputsProbe
-	logger    *slog.Logger
-	ctx       context.Context
-	startTime time.Time
-	err       error
-}
-
-func (p *processOutputsProbe) SecretsStored(count int) {
-	if count == 0 || !p.logger.Enabled(p.ctx, slog.LevelDebug) {
-		return
-	}
-	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "secrets stored",
-		slog.Int("count", count),
-	)
-}
-
-func (p *processOutputsProbe) TargetsRegistered(count int) {
-	if count == 0 || !p.logger.Enabled(p.ctx, slog.LevelInfo) {
-		return
-	}
-	p.logger.LogAttrs(p.ctx, slog.LevelInfo, "delivery outputs processed",
-		slog.Int("targets_registered", count),
-	)
-}
-
-func (p *processOutputsProbe) Skipped() {
-	if !p.logger.Enabled(p.ctx, slog.LevelDebug) {
-		return
-	}
-	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "delivery outputs skipped: no outputs")
-}
-
-func (p *processOutputsProbe) Error(err error) {
-	p.err = err
-}
-
-func (p *processOutputsProbe) End() {
-	duration := time.Since(p.startTime)
-	if p.err != nil {
-		p.logger.LogAttrs(p.ctx, slog.LevelError, "process delivery outputs failed",
-			slog.Duration("duration", duration),
-			slog.String("error", p.err.Error()),
-		)
-		return
-	}
-	if !p.logger.Enabled(p.ctx, slog.LevelDebug) {
-		return
-	}
-	p.logger.LogAttrs(p.ctx, slog.LevelDebug, "process delivery outputs completed",
 		slog.Duration("duration", duration),
 	)
 }

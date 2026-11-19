@@ -72,15 +72,96 @@ export interface RpcStatus {
   details?: unknown[];
 }
 
-/** Error thrown when the query API returns a non-OK response. */
+/** A parsed error body, when it is a plain object. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** A non-empty string field of a parsed error body. */
+function stringField(value: unknown, key: string): string | undefined {
+  const field = asRecord(value)?.[key];
+  return typeof field === "string" && field !== "" ? field : undefined;
+}
+
+/**
+ * Error thrown when an API request returns a non-OK response.
+ *
+ * Query API errors carry the gRPC-gateway `RpcStatus`; add-on routes
+ * answer their own envelopes (for example
+ * `{error, reason, details}`), which are kept whole in {@link body} so
+ * a caller can read the server's sentence, its stable reason, and any
+ * structured detail. Both are `null` when the body is absent or not a
+ * plain object. Some record routes answer as `text/plain`; that sentence
+ * is kept as the message.
+ */
 export class ResourceApiError extends Error {
   constructor(
     public readonly status: number,
     public readonly rpcStatus: RpcStatus | null,
+    public readonly body: Record<string, unknown> | null = null,
+    plainText?: string,
   ) {
-    super(rpcStatus?.message ?? `Query API error ${status}`);
+    super(ResourceApiError.messageFor(status, rpcStatus, body, plainText));
     this.name = "ResourceApiError";
   }
+
+  private static messageFor(
+    status: number,
+    rpcStatus: RpcStatus | null,
+    body: Record<string, unknown> | null,
+    plainText?: string,
+  ): string {
+    return (
+      stringField(rpcStatus, "message") ??
+      stringField(body, "error") ??
+      stringField(body, "message") ??
+      (plainText?.trim() || undefined) ??
+      `Query API error ${status}`
+    );
+  }
+
+  /** The stable reason an add-on gives for a refusal, if any. */
+  get reason(): string | undefined {
+    return stringField(this.body, "reason");
+  }
+
+  /** The refusal's structured detail, as the server sent it. */
+  get details(): unknown {
+    return asRecord(this.body)?.details;
+  }
+}
+
+/**
+ * Parse a non-OK response into a {@link ResourceApiError}.
+ *
+ * The body is read once as text: valid JSON keeps its envelope, and a
+ * body that is not JSON (the dynamic API's record routes answer
+ * `text/plain`) is kept as the message.
+ */
+async function errorFromResponse(res: Response): Promise<ResourceApiError> {
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    text = "";
+  }
+  let parsed: unknown = null;
+  let plainText: string | undefined;
+  if (text !== "") {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      plainText = text;
+    }
+  }
+  return new ResourceApiError(
+    res.status,
+    parsed as RpcStatus | null,
+    asRecord(parsed),
+    plainText,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +191,7 @@ async function queryRequest<Props>(
   const url = buildQueryUrl(scope, params);
   const res = await fetch(url);
   if (!res.ok) {
-    const rpcStatus = (await res.json().catch(() => null)) as RpcStatus | null;
-    throw new ResourceApiError(res.status, rpcStatus);
+    throw await errorFromResponse(res);
   }
   return res.json() as Promise<QueryResourcesResponse<Props>>;
 }
@@ -248,8 +328,7 @@ async function apiRequest<T>(
 ): Promise<T> {
   const res = await fetch(`${basePath}${path}`, init);
   if (!res.ok) {
-    const rpcStatus = (await res.json().catch(() => null)) as RpcStatus | null;
-    throw new ResourceApiError(res.status, rpcStatus);
+    throw await errorFromResponse(res);
   }
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;

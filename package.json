@@ -9,7 +9,8 @@
     "sdk/build-utils",
     "sdk/node-plugin",
     "extensions/core/client",
-    "extensions/kind/client"
+    "extensions/kind/client",
+    "extensions/ocm/client"
   ],
   "devDependencies": {
     "@module-federation/enhanced": "^2.9.0",

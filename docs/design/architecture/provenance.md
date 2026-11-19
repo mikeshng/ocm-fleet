@@ -1370,7 +1370,13 @@ Missing, expired, or temporarily unavailable authorization material normally
 causes `PausedAuth` when a user can provide fresh authorization or credentials.
 Malformed or contradictory evidence is rejected. Neither outcome causes
 fallback to TOFU, an unrelated authority, or a profile outside the matched
-policy.
+policy. A fulfillment whose provenance names a signer with no enrollment on
+record pauses its deliveries and removals, naming the missing signer, until
+the fulfillment is resumed with an intent signed by an enrolled signer.
+Deletion is not an escape: withdrawing what a target already holds needs the
+same attestation, so deleting a paused fulfillment pauses in its turn. A pass
+that needs no attestation, such as a deletion with nothing left to remove or
+a delivery already complete at its generation, is not held by it.
 
 Verification explanations should identify the failed layer without exposing
 credentials, private material, or other secrets. Profile-specific errors are

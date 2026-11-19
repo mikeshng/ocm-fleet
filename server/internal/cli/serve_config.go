@@ -35,6 +35,15 @@ func loadServeConfig(f *serveFlags, sel serveSelections) (bootstrap.Config, erro
 		caBundle = data
 	}
 
+	var enrollmentCA []byte
+	if f.enrollmentCAFile != "" {
+		data, err := os.ReadFile(f.enrollmentCAFile)
+		if err != nil {
+			return bootstrap.Config{}, fmt.Errorf("read enrollment CA file: %w", err)
+		}
+		enrollmentCA = data
+	}
+
 	return bootstrap.NewConfig(bootstrap.ConfigInput{
 		GRPCAddr:                      f.grpcAddr,
 		HTTPAddr:                      f.httpAddr,
@@ -54,6 +63,11 @@ func loadServeConfig(f *serveFlags, sel serveSelections) (bootstrap.Config, erro
 		OIDCRegistrySubjectExpression: f.oidcRegistrySubjectExpression,
 		OIDCPublicKeyClaimExpression:  f.oidcPublicKeyClaimExpression,
 		Addons:                        f.addons,
+		EnrollmentServerURL:           f.enrollmentServerURL,
+		EnrollmentCABundle:            enrollmentCA,
+		EnrollmentConnectAddress:      f.enrollmentConnectAddress,
+		EnrollmentAgentImage:          f.enrollmentAgentImage,
+		ClusterEgressAllow:            f.clusterEgressAllow,
 	})
 }
 

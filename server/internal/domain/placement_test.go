@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
@@ -45,6 +46,16 @@ func TestStaticPlacement_UnknownTargetReturnsError(t *testing.T) {
 	_, err := s.Resolve(context.Background(), testPlacementPool)
 	if err == nil {
 		t.Fatal("expected error for unknown target")
+	}
+	if !errors.Is(err, domain.ErrPlacementUnresolved) || !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("error = %v, want it to be both ErrPlacementUnresolved and ErrNotFound", err)
+	}
+	// A durable engine hands the error back as text.
+	if !domain.IsPlacementUnresolved(errors.New(err.Error())) {
+		t.Errorf("IsPlacementUnresolved does not recognize the error by its text: %v", err)
+	}
+	if domain.IsTerminal(err) {
+		t.Errorf("an unresolved placement must not be terminal: %v", err)
 	}
 }
 

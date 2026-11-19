@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
@@ -121,6 +122,78 @@ func TestResolvedTargetInfos_OmitsMissingFromPool(t *testing.T) {
 	}
 	if got[0].ID() != "t1" {
 		t.Errorf("got[0].ID = %s, want t1", got[0].ID())
+	}
+}
+
+func placementIDs(targets []domain.PlacementTarget) []domain.TargetID {
+	ids := make([]domain.TargetID, len(targets))
+	for i, t := range targets {
+		ids[i] = t.ID
+	}
+	return ids
+}
+
+func TestNewPlacementPool_CandidatesAndRetained(t *testing.T) {
+	pool := []domain.TargetInfo{
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "ready", State: domain.TargetStateReady}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "stateless"}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "held-waiting", State: domain.TargetStateInitializing}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "new-waiting", State: domain.TargetStateInitializing}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "held-draining", State: domain.TargetStateDraining}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "held-terminated", State: domain.TargetStateTerminated}),
+	}
+	held := []domain.TargetID{"ready", "held-waiting", "held-draining", "held-terminated", "unregistered"}
+
+	got := domain.NewPlacementPool(pool, held)
+
+	if ids := placementIDs(got.Candidates); !slices.Equal(ids, []domain.TargetID{"ready", "stateless", "held-waiting", "held-draining"}) {
+		t.Errorf("Candidates = %v, want [ready stateless held-waiting held-draining]", ids)
+	}
+	if ids := placementIDs(got.Retained); !slices.Equal(ids, []domain.TargetID{"held-waiting", "held-draining"}) {
+		t.Errorf("Retained = %v, want [held-waiting held-draining]", ids)
+	}
+}
+
+func TestPlacementPool_Settle_AddsRetainedTargetsLeftOut(t *testing.T) {
+	pool := domain.PlacementPool{Retained: []domain.PlacementTarget{{ID: "kept"}, {ID: "picked"}}}
+
+	got := pool.Settle([]domain.PlacementTarget{{ID: "a"}, {ID: "picked"}})
+
+	if ids := placementIDs(got); !slices.Equal(ids, []domain.TargetID{"a", "picked", "kept"}) {
+		t.Errorf("Settle = %v, want [a picked kept]", ids)
+	}
+	if ids := placementIDs((domain.PlacementPool{}).Settle([]domain.PlacementTarget{{ID: "a"}})); !slices.Equal(ids, []domain.TargetID{"a"}) {
+		t.Errorf("Settle with nothing retained = %v, want [a]", ids)
+	}
+}
+
+func TestComputeTargetDelta_RemovesOnlyTargetsThatCanBeReached(t *testing.T) {
+	pool := []domain.TargetInfo{
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "kept", State: domain.TargetStateReady}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "added", State: domain.TargetStateReady}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "deselected", State: domain.TargetStateReady}),
+		domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "terminated", State: domain.TargetStateTerminated}),
+	}
+	previous := []domain.TargetID{"kept", "deselected", "terminated", "unregistered"}
+	resolved := []domain.TargetInfo{pool[0], pool[1]}
+
+	delta := domain.ComputeTargetDelta(previous, resolved, pool)
+
+	ids := func(targets []domain.TargetInfo) []domain.TargetID {
+		out := make([]domain.TargetID, len(targets))
+		for i, t := range targets {
+			out[i] = t.ID()
+		}
+		return out
+	}
+	if got := ids(delta.Unchanged); !slices.Equal(got, []domain.TargetID{"kept"}) {
+		t.Errorf("Unchanged = %v, want [kept]", got)
+	}
+	if got := ids(delta.Added); !slices.Equal(got, []domain.TargetID{"added"}) {
+		t.Errorf("Added = %v, want [added]", got)
+	}
+	if got := ids(delta.Removed); !slices.Equal(got, []domain.TargetID{"deselected"}) {
+		t.Errorf("Removed = %v, want [deselected]: a terminated or unregistered target gets no removal", got)
 	}
 }
 

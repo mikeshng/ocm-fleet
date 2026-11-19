@@ -229,6 +229,30 @@ func TestAgent_Deliver_CreatesCluster(t *testing.T) {
 	}
 }
 
+// Close refuses new deliver and remove dispatches.
+func TestAgent_Close_RefusesNewDispatches(t *testing.T) {
+	provider := newFakeProvider()
+	agent, _ := newTestAgent(nopReporter{}, provider)
+	if err := agent.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	target := domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "k1", Type: kind.TargetType, Name: "local-kind"})
+	manifests := []domain.Manifest{{
+		ManifestType: kind.ClusterManifestType,
+		Raw:          json.RawMessage(`{"name": "dev-cluster"}`),
+	}}
+	if err := agent.Deliver(context.Background(), target, "d1:k1", manifests, domain.DeliveryAuth{}, nil, 1); err == nil || !strings.Contains(err.Error(), "closing") {
+		t.Errorf("Deliver after Close = %v, want an error saying the agent is closing", err)
+	}
+	if err := agent.Remove(context.Background(), target, "d2:k1", manifests, domain.DeliveryAuth{}, nil, 1); err == nil || !strings.Contains(err.Error(), "closing") {
+		t.Errorf("Remove after Close = %v, want an error saying the agent is closing", err)
+	}
+	if provider.hasCluster("ocm-fleet--dev-cluster") {
+		t.Error("a dispatch after Close created a cluster")
+	}
+}
+
 func TestAgent_Deliver_RejectsUnmanagedExistingCluster(t *testing.T) {
 	provider := newFakeProvider()
 	provider.clusters["dev-cluster"] = nil
@@ -247,6 +271,9 @@ func TestAgent_Deliver_RejectsUnmanagedExistingCluster(t *testing.T) {
 	}
 
 	result := awaitDone(t, reporter.done)
+	if result.Operation != domain.DeliveryOperationDeliver {
+		t.Errorf("Operation = %q, want %q", result.Operation, domain.DeliveryOperationDeliver)
+	}
 	if result.State != domain.DeliveryStateFailed {
 		t.Errorf("State = %q, want %q", result.State, domain.DeliveryStateFailed)
 	}
@@ -438,6 +465,9 @@ func TestAgent_Remove_DeletesCluster(t *testing.T) {
 	}
 
 	result := awaitDone(t, reporter.done)
+	if result.Operation != domain.DeliveryOperationRemove {
+		t.Errorf("Operation = %q, want %q", result.Operation, domain.DeliveryOperationRemove)
+	}
 	if result.State != domain.DeliveryStateDelivered {
 		t.Fatalf("result.State = %q, want %q", result.State, domain.DeliveryStateDelivered)
 	}
@@ -1004,6 +1034,98 @@ func TestAgent_Deliver_TrustBundle_IncludedInProvisionedTarget(t *testing.T) {
 	}
 	if entries[0].IssuerURL != "https://issuer.example.com" {
 		t.Errorf("issuer = %q", entries[0].IssuerURL)
+	}
+}
+
+func TestAgent_RestoreTrustBundles_IncludedInProvisionedTarget(t *testing.T) {
+	// A restarted process receives no new trust-bundle delivery: the
+	// platform recorded the original one as delivered. The agent restores
+	// the configured providers instead, and the cluster it provisions
+	// still carries them.
+	fp := newFakeProvider()
+	reporter := newChannelReporter()
+	agent := kind.NewAgent(reporter, fakeFactory(fp),
+		kind.WithGenerationStore(kind.NewMemoryGenerationStore()),
+		stubPlatformSA(),
+		kind.WithTrustBundleSource(func(context.Context) ([]domain.TrustBundleEntry, error) {
+			return []domain.TrustBundleEntry{{
+				IssuerURL:          "https://issuer.example.com",
+				JWKSURI:            "https://issuer.example.com/jwks",
+				EnrollmentAudience: "enroll",
+			}}, nil
+		}))
+	if err := agent.RestoreTrustBundles(context.Background()); err != nil {
+		t.Fatalf("RestoreTrustBundles: %v", err)
+	}
+
+	spec := kind.ClusterSpec{Name: "restored-trust"}
+	specRaw, _ := json.Marshal(spec)
+	err := agent.Deliver(context.Background(), domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{}), "d-cluster", []domain.Manifest{{
+		ManifestType: kind.ClusterManifestType,
+		Raw:          specRaw,
+	}}, domain.DeliveryAuth{}, nil, 1)
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+
+	done := awaitDone(t, reporter.done)
+	if done.State != domain.DeliveryStateDelivered {
+		t.Fatalf("async State = %q (message: %s)", done.State, done.Message)
+	}
+	if len(done.ProvisionedTargets) != 1 {
+		t.Fatalf("provisioned targets len = %d, want 1", len(done.ProvisionedTargets))
+	}
+	trustJSON := done.ProvisionedTargets[0].Properties["trust_bundle"]
+	if trustJSON == "" {
+		t.Fatal("provisioned target missing trust_bundle property")
+	}
+	var entries []domain.TrustBundleEntry
+	if err := json.Unmarshal([]byte(trustJSON), &entries); err != nil {
+		t.Fatalf("unmarshal trust_bundle: %v", err)
+	}
+	if len(entries) != 1 || entries[0].IssuerURL != "https://issuer.example.com" {
+		t.Fatalf("trust entries = %+v, want the configured issuer", entries)
+	}
+}
+
+func TestAgent_RestoreTrustBundles_ReplacesSameProvider(t *testing.T) {
+	agent := kind.NewAgent(newChannelReporter(), fakeFactory(newFakeProvider()),
+		kind.WithGenerationStore(kind.NewMemoryGenerationStore()),
+		stubPlatformSA(),
+		kind.WithTrustBundleSource(func(context.Context) ([]domain.TrustBundleEntry, error) {
+			return []domain.TrustBundleEntry{
+				{IssuerURL: "https://issuer.example.com", JWKSURI: "https://issuer.example.com/new-jwks", EnrollmentAudience: "enroll"},
+				{IssuerURL: "https://other.example.com", JWKSURI: "https://other.example.com/jwks", EnrollmentAudience: "enroll"},
+			}, nil
+		}))
+	if err := agent.RestoreTrustBundles(context.Background()); err != nil {
+		t.Fatalf("first RestoreTrustBundles: %v", err)
+	}
+	if err := agent.RestoreTrustBundles(context.Background()); err != nil {
+		t.Fatalf("second RestoreTrustBundles: %v", err)
+	}
+
+	bundles := agent.TrustBundles()
+	if len(bundles) != 2 {
+		t.Fatalf("trust bundles len = %d, want 2 (restore must replace, not append)", len(bundles))
+	}
+	if bundles[0].JWKSURI != "https://issuer.example.com/new-jwks" {
+		t.Errorf("issuer jwks = %q, want the configured one", bundles[0].JWKSURI)
+	}
+}
+
+func TestAgent_RestoreTrustBundles_SourceError(t *testing.T) {
+	agent := kind.NewAgent(newChannelReporter(), fakeFactory(newFakeProvider()),
+		kind.WithGenerationStore(kind.NewMemoryGenerationStore()),
+		stubPlatformSA(),
+		kind.WithTrustBundleSource(func(context.Context) ([]domain.TrustBundleEntry, error) {
+			return nil, errors.New("store unavailable")
+		}))
+	if err := agent.RestoreTrustBundles(context.Background()); err == nil {
+		t.Fatal("expected RestoreTrustBundles to report the source error")
+	}
+	if got := agent.TrustBundles(); len(got) != 0 {
+		t.Fatalf("trust bundles = %+v, want none after a failed restore", got)
 	}
 }
 

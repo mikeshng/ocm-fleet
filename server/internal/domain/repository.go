@@ -35,7 +35,19 @@ type DeploymentRepository interface {
 	Create(ctx context.Context, d Deployment) error
 	Get(ctx context.Context, name ResourceName) (Deployment, error)
 	GetView(ctx context.Context, name ResourceName) (DeploymentView, error)
+	// ListView returns every deployment view ordered by deployment name,
+	// compared byte-wise: the order the page token walks.
 	ListView(ctx context.Context) ([]DeploymentView, error)
+	// ListViewPage returns at most limit deployment views ordered by
+	// deployment name, compared byte-wise, starting strictly after
+	// after. An empty after starts at the first view, and limit must be
+	// positive. The predicate and
+	// the limit run in storage and only the page's views have their
+	// deliveries read, so walking a large collection page by page does
+	// not materialize the whole collection per page. More reports
+	// whether another page follows; it is set only when the page is
+	// full.
+	ListViewPage(ctx context.Context, after ResourceName, limit int) (DeploymentViewPage, error)
 	Delete(ctx context.Context, name ResourceName) error
 }
 
@@ -54,10 +66,41 @@ type InventoryRepository interface {
 type DeliveryRepository interface {
 	Put(ctx context.Context, d Delivery) error
 	Get(ctx context.Context, id DeliveryID) (Delivery, error)
+	// GetForUpdate returns the delivery like Get, holding a write fence
+	// on its row until the transaction ends: another transaction that
+	// reads the same row this way waits until the first one commits or
+	// rolls back. A transaction that reads a delivery's state and then
+	// writes the whole record back must read it this way. Two reports
+	// for one delivery otherwise both read the same state and the one
+	// that commits last can undo the other: a progress report that read
+	// before a terminal one commits after it, replacing delivered or
+	// failed with progressing. Backends whose write transactions already
+	// run one writer at a time (SQLite BEGIN IMMEDIATE) implement this
+	// as Get.
+	GetForUpdate(ctx context.Context, id DeliveryID) (Delivery, error)
 	GetByFulfillmentTarget(ctx context.Context, fID FulfillmentID, tID TargetID) (Delivery, error)
 	ListByFulfillment(ctx context.Context, fID FulfillmentID) ([]Delivery, error)
 	ListActive(ctx context.Context, targetIDs []TargetID) ([]Delivery, error)
 	DeleteByFulfillment(ctx context.Context, fID FulfillmentID) error
+}
+
+// DeliveryCompletionRepository persists the completions that still have
+// to be signaled to their fulfillment workflows. The record is written
+// in the same transaction as the delivery's terminal state, so it
+// outlives a crash between that state change and the signal.
+type DeliveryCompletionRepository interface {
+	// Put records a completion obligation. A delivery has at most one
+	// outstanding obligation: a newer terminal report of the same
+	// delivery replaces the previous one, whose generation or operation
+	// the workflow would discard as stale anyway.
+	Put(ctx context.Context, c DeliveryCompletion) error
+	// ListOutstanding returns the obligations that still have to be
+	// signaled, oldest first.
+	ListOutstanding(ctx context.Context) ([]DeliveryCompletion, error)
+	// Delete removes one obligation. It matches on the full cycle
+	// identity, so a deletion racing a newer terminal report cannot
+	// remove that newer obligation.
+	Delete(ctx context.Context, deliveryID DeliveryID, generation Generation, operation DeliveryOperation) error
 }
 
 // ExtensionResourceRepository persists extension resource types,
@@ -145,6 +188,38 @@ type ExtensionResourceRepository interface {
 	// Whole-resource deletion is not expressible here; use
 	// [InventoryReplacement.IsDelete] via ReplaceInventory instead.
 	ApplyInventoryDeltas(ctx context.Context, deltas []InventoryDelta) error
+
+	// ListCollections returns, ordered by name, the distinct collection
+	// names that hold at least one extension resource of type rt. For a
+	// nested type the collection name carries its parent segments (e.g.
+	// "clusters/c1/namespaces/default/apiResources/pods/objects"), so a
+	// caller can tell which parents still own rows without reading the
+	// rows themselves.
+	ListCollections(ctx context.Context, rt ResourceType) ([]CollectionName, error)
+
+	// DeleteByCollectionPrefix hard-deletes every extension resource of
+	// type rt whose collection name starts with prefix, with the same
+	// cascade and orphaned alias-claim cleanup as [Delete], and returns
+	// how many rows were removed. Zero matching rows is success. It
+	// exists so that everything reported under a parent that is gone
+	// (e.g. prefix "clusters/c1/") can be removed in one statement
+	// instead of one exact-name delete per row. An empty prefix is
+	// rejected with [ErrInvalidArgument]: removing a whole type is
+	// never what a caller of this method means. Like inventory deletes
+	// through [ReplaceInventory], inventory-only type policy is enforced
+	// by the application layer, not here.
+	DeleteByCollectionPrefix(ctx context.Context, rt ResourceType, prefix string) (int64, error)
+
+	// DeleteStaleByCollectionPrefix is [DeleteByCollectionPrefix]
+	// restricted to the resources whose inventory was last written
+	// before notWrittenSince (the ReceivedAt of the latest
+	// [ReplaceInventory] or [ApplyInventoryDeltas] that touched them); a
+	// resource with no inventory row counts as stale. A reporter that
+	// has just reported everything that exists under a parent uses it
+	// to remove what it did not report: the resources whose source
+	// disappeared while no reporter was watching. Times are compared
+	// to the millisecond at least.
+	DeleteStaleByCollectionPrefix(ctx context.Context, rt ResourceType, prefix string, notWrittenSince time.Time) (int64, error)
 
 	// Observation history (append-only). Neither ReplaceInventory nor
 	// ApplyInventoryDeltas populates this synchronously today -- see

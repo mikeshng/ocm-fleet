@@ -38,6 +38,11 @@ type serveFlags struct {
 	oidcRegistrySubjectExpression string
 	oidcPublicKeyClaimExpression  string
 	addons                        string
+	enrollmentServerURL           string
+	enrollmentCAFile              string
+	enrollmentConnectAddress      string
+	enrollmentAgentImage          string
+	clusterEgressAllow            string
 }
 
 // newServeCmd builds the serve Cobra command and passes explicit --db selection
@@ -70,7 +75,12 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.oidcRegistryID, "oidc-registry-id", os.Getenv("OIDC_REGISTRY_ID"), "external key registry ID (requires --oidc-registry-subject-expression)")
 	cmd.Flags().StringVar(&f.oidcRegistrySubjectExpression, "oidc-registry-subject-expression", os.Getenv("OIDC_REGISTRY_SUBJECT_EXPRESSION"), "CEL expression mapping ID token claims to a registry subject")
 	cmd.Flags().StringVar(&f.oidcPublicKeyClaimExpression, "oidc-public-key-claim-expression", os.Getenv("OIDC_PUBLIC_KEY_CLAIM_EXPRESSION"), "CEL expression extracting signer SPKI from ID token claims (mutually exclusive with registry mapping)")
-	cmd.Flags().StringVar(&f.addons, "addons", defaultAddons(), "comma-separated list of addons to enable (default: kind,kubernetes; override with OCM_RM_SERVER_ADDONS)")
+	cmd.Flags().StringVar(&f.addons, "addons", defaultAddons(), "comma-separated list of addons to enable (default: kind,kubernetes,ocm; override with OCM_RM_SERVER_ADDONS)")
+	cmd.Flags().StringVar(&f.enrollmentServerURL, "enrollment-server-url", os.Getenv("OCM_RM_ENROLLMENT_SERVER_URL"), "https address of this server as existing clusters address it, written into enrollment manifests")
+	cmd.Flags().StringVar(&f.enrollmentCAFile, "enrollment-ca-file", os.Getenv("OCM_RM_ENROLLMENT_CA_FILE"), "PEM CA certificate that signs --enrollment-server-url's certificate (empty = clusters' system roots)")
+	cmd.Flags().StringVar(&f.enrollmentConnectAddress, "enrollment-connect-address", os.Getenv("OCM_RM_ENROLLMENT_CONNECT_ADDRESS"), "host:port existing clusters dial instead of resolving --enrollment-server-url's host")
+	cmd.Flags().StringVar(&f.enrollmentAgentImage, "enrollment-agent-image", os.Getenv("OCM_RM_ENROLLMENT_AGENT_IMAGE"), "image of the enrollment agent, written into enrollment manifests")
+	cmd.Flags().StringVar(&f.clusterEgressAllow, "cluster-egress-allow", os.Getenv("OCM_RM_CLUSTER_EGRESS_ALLOW"), "comma-separated CIDRs the server may dial for a cluster or hub although they are otherwise refused (loopback, link-local, cloud metadata)")
 	return cmd
 }
 
@@ -206,5 +216,5 @@ func envOrDefault(key, fallback string) string {
 // defaultAddons returns the serve --addons default. An explicit --addons flag
 // remains authoritative over OCM_RM_SERVER_ADDONS.
 func defaultAddons() string {
-	return envOrDefault("OCM_RM_SERVER_ADDONS", "kind,kubernetes")
+	return envOrDefault("OCM_RM_SERVER_ADDONS", "kind,kubernetes,ocm")
 }

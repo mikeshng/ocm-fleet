@@ -59,7 +59,8 @@ func goInfra(t *testing.T) workflowenginetest.Infra {
 		Delivery: router,
 		Vault:    vault,
 		DeliveryReporterFactory: func(reg domain.Registry) domain.DeliveryReporter {
-			reporter := application.NewDeliveryReportService(store, reg)
+			reporter := application.NewDeliveryReportService(store, reg,
+				application.WithDeliveryReportVault(vault))
 			recordingAgent.Reporter = reporter
 			return reporter
 		},

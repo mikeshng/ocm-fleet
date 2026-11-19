@@ -1,4 +1,5 @@
-FROM localhost/ocm-fleet-server:latest
+ARG SERVER_IMAGE=localhost/ocm-fleet-server:latest
+FROM ${SERVER_IMAGE}
 
 ARG KIND_VERSION=v0.31.0
 ARG KUBECTL_VERSION=v1.33.0

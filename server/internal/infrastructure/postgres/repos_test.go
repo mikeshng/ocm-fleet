@@ -6,6 +6,7 @@ import (
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/authmethodrepotest"
+	"github.com/stolostron/ocm-fleet/server/internal/domain/deliverycompletionrepotest"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/deliveryrepotest"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/deploymentrepotest"
 	"github.com/stolostron/ocm-fleet/server/internal/domain/extensionresourcerepotest"
@@ -65,6 +66,13 @@ func TestDeliveryRepo(t *testing.T) {
 	t.Parallel()
 	deliveryrepotest.Run(t, func(t *testing.T) domain.DeliveryRepository {
 		return newTxRepo(t, domain.Tx.Deliveries)
+	})
+}
+
+func TestDeliveryCompletionRepo(t *testing.T) {
+	t.Parallel()
+	deliverycompletionrepotest.Run(t, func(t *testing.T) domain.DeliveryCompletionRepository {
+		return newTxRepo(t, domain.Tx.DeliveryCompletions)
 	})
 }
 

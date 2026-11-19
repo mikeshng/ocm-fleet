@@ -99,7 +99,94 @@ type GenericInformer struct {
 	resyncCh             chan<- ResyncEvent
 	nsFilter             *NamespaceFilter
 	watchResourceVersion string // cursor for clean watch resume
-	logger               *slog.Logger
+	// forbidden is the verb ("list" or "watch") the cluster refuses the
+	// credential for this resource, or empty; forbiddenCount is how many
+	// times in a row it was refused. See noteForbidden.
+	forbidden      string
+	forbiddenCount int
+	// settled is set once this informer has nothing more to add to a
+	// first complete picture of its resource: it has listed it, or it
+	// has been refused it forbiddenDropAfter times in a row. See
+	// [InformerManager.Settled].
+	settled atomic.Bool
+	logger  *slog.Logger
+}
+
+// A credential with less than full read access (an enrolled cluster's
+// access account, for example) is refused for some resources for as
+// long as its rights stay as they are: that is a state, not a failure
+// to retry every few seconds. The informer asks again after
+// forbiddenFirstWait, then doubles the wait up to forbiddenMaxWait.
+// The first waits are short because a cluster that is just starting
+// can refuse a request it allows a moment later.
+const (
+	forbiddenFirstWait = 30 * time.Second
+	forbiddenMaxWait   = 15 * time.Minute
+	// forbiddenDropAfter is the number of refusals in a row after which
+	// the objects this informer had indexed are taken out of the
+	// inventory: they can no longer be kept current.
+	forbiddenDropAfter = 3
+)
+
+// forbiddenWait is the wait before the next attempt on a refused resource.
+func (i *GenericInformer) forbiddenWait() time.Duration {
+	wait := forbiddenFirstWait
+	for n := 1; n < i.forbiddenCount && wait < forbiddenMaxWait; n++ {
+		wait *= 2
+	}
+	return min(wait, forbiddenMaxWait)
+}
+
+// noteForbidden records that the cluster refuses the credential verb on
+// this resource. It is said once, not on every attempt, and the
+// informer counts as initialized: there is nothing it could load, and
+// the informers started after it must not wait for it.
+func (i *GenericInformer) noteForbidden(verb string) {
+	if i.forbidden != verb {
+		i.forbiddenCount = 0
+		i.logger.Info("resource is not indexed: the credential may not " + verb + " it; asking again later")
+	}
+	i.forbidden = verb
+	i.forbiddenCount++
+	i.initialized.Store(true)
+	if i.forbiddenCount >= forbiddenDropAfter {
+		i.settled.Store(true)
+	}
+}
+
+// clearForbidden notes that the cluster now allows verb again.
+func (i *GenericInformer) clearForbidden(verb string) {
+	if i.forbidden == verb {
+		i.forbidden = ""
+		i.forbiddenCount = 0
+		i.logger.Info("the credential may " + verb + " the resource again; it is indexed")
+	}
+}
+
+// dropUnreadable takes the objects this informer had indexed out of the
+// inventory once their resource stays refused: an empty LIST snapshot
+// makes the writer delete what it had reported for this resource. The
+// local index is cleared only when the writer confirms, so that a
+// failed attempt is repeated at the next refusal.
+func (i *GenericInformer) dropUnreadable(ctx context.Context) {
+	if i.forbiddenCount < forbiddenDropAfter || len(i.resourceIndex) == 0 {
+		return
+	}
+	ack := make(chan error, 1)
+	if !i.sendResync(ctx, ResyncEvent{GVR: i.gvr, Scope: i.scope, Generation: i.generation, Ack: ack}) {
+		return
+	}
+	select {
+	case err := <-ack:
+		if err != nil {
+			return
+		}
+		i.logger.Info("objects of a resource the credential may no longer read are taken out of the inventory",
+			"count", len(i.resourceIndex))
+		i.resourceIndex = make(map[string]string)
+		i.watchResourceVersion = ""
+	case <-ctx.Done():
+	}
 }
 
 // NewInformer creates a GenericInformer for the given GVR and discovery
@@ -166,7 +253,14 @@ func (i *GenericInformer) Run(ctx context.Context) {
 		default:
 		}
 
-		if i.retries > 0 {
+		if i.forbidden != "" {
+			// Not a failure to back off from: wait, longer each time, then ask again.
+			select {
+			case <-time.After(i.forbiddenWait()):
+			case <-ctx.Done():
+				continue // re-enter loop to hit the ctx.Done() case above
+			}
+		} else if i.retries > 0 {
 			// Backoff: 2s increments, max 2min.
 			wait := time.Duration(min(i.retries*2, 120)) * time.Second
 			i.logger.Debug("backoff before retry", "wait", wait)
@@ -183,7 +277,9 @@ func (i *GenericInformer) Run(ctx context.Context) {
 			if err != nil {
 				continue
 			}
+			i.clearForbidden("list")
 			i.initialized.Store(true)
+			i.settled.Store(true)
 			needList = false
 		}
 
@@ -226,6 +322,11 @@ func (i *GenericInformer) listAndResync(ctx context.Context) error {
 	for {
 		resources, err := i.client.Resource(i.gvr).List(ctx, opts)
 		if err != nil {
+			if apierrors.IsForbidden(err) {
+				i.noteForbidden("list")
+				i.dropUnreadable(ctx)
+				return err
+			}
 			if ctx.Err() == nil {
 				i.logger.Warn("error listing resources", "error", err)
 			}
@@ -317,6 +418,12 @@ func (i *GenericInformer) watch(ctx context.Context) watchOutcome {
 		AllowWatchBookmarks: true,
 	})
 	if err != nil {
+		if apierrors.IsForbidden(err) {
+			// The resource can be listed but not watched: it is read
+			// again by a new LIST after the wait.
+			i.noteForbidden("watch")
+			return watchOutcomeNeedList
+		}
 		i.logger.Warn("error starting watch", "error", err)
 		i.retries++
 		if isExpiredResourceVersionError(err) {
@@ -330,6 +437,7 @@ func (i *GenericInformer) watch(ctx context.Context) watchOutcome {
 
 	i.logger.Info("watching", "group", i.gvr.Group, "resource", i.gvr.Resource)
 	i.retries = 0 // Reset retries on successful watch start.
+	i.clearForbidden("watch")
 
 	for {
 		select {
@@ -549,6 +657,12 @@ type InformerManager struct {
 	nextGen uint64
 	logger  *slog.Logger
 
+	// settleMu guards informers and reconciled, which [Settled] reads
+	// from another goroutine than the one that reconciles.
+	settleMu   sync.Mutex
+	informers  map[schema.GroupVersionResource]*GenericInformer
+	reconciled bool
+
 	// informerWG tracks every ordinary and CRD informer goroutine so StopAll
 	// can await them after cancellation.
 	informerWG sync.WaitGroup
@@ -577,8 +691,29 @@ func NewInformerManager(
 		stoppers:    make(map[schema.GroupVersionResource]context.CancelFunc),
 		generations: make(map[schema.GroupVersionResource]uint64),
 		scopes:      make(map[schema.GroupVersionResource]ObjectScope),
+		informers:   make(map[schema.GroupVersionResource]*GenericInformer),
 		logger:      logger,
 	}
+}
+
+// Settled reports whether the manager has a first complete picture of
+// the cluster: discovery and the first reconcile are done, and every
+// informer has listed its resource or has been refused it repeatedly.
+// From then on, an object of this cluster that no informer has reported
+// does not exist as far as this indexer can tell. It is safe to call
+// from any goroutine.
+func (m *InformerManager) Settled() bool {
+	m.settleMu.Lock()
+	defer m.settleMu.Unlock()
+	if !m.reconciled {
+		return false
+	}
+	for _, informer := range m.informers {
+		if !informer.settled.Load() {
+			return false
+		}
+	}
+	return true
 }
 
 // Reconcile adjusts running informers to match the desired set of
@@ -618,6 +753,9 @@ func (m *InformerManager) Reconcile(ctx context.Context, desired []DiscoveredAPI
 			delete(m.stoppers, gvr)
 			delete(m.generations, gvr)
 			delete(m.scopes, gvr)
+			m.settleMu.Lock()
+			delete(m.informers, gvr)
+			m.settleMu.Unlock()
 			if m.removeCh != nil {
 				select {
 				case m.removeCh <- RemoveGVREvent{GVR: gvr, Scope: scope, Generation: gen}:
@@ -638,11 +776,19 @@ func (m *InformerManager) Reconcile(ctx context.Context, desired []DiscoveredAPI
 		m.stoppers[gvr] = cancel
 		m.generations[gvr] = gen
 		m.scopes[gvr] = desc.Scope
+		m.settleMu.Lock()
+		m.informers[gvr] = informer
+		m.settleMu.Unlock()
 		m.startInformer(informer, informerCtx)
 		// Serialize startup to avoid memory spikes.
 		informer.WaitUntilInitialized(ctx, 10*time.Second)
 	}
 
+	if ctx.Err() == nil {
+		m.settleMu.Lock()
+		m.reconciled = true
+		m.settleMu.Unlock()
+	}
 	m.logger.Info("reconcile complete", "running", len(m.stoppers))
 }
 

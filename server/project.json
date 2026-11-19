@@ -63,6 +63,14 @@
       },
       "cache": false
     },
+    "test:race": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go test -race -count=1 ./internal/addon/... ./internal/enrollmentagent/... ./internal/application/ ./internal/bootstrap/",
+        "cwd": "server"
+      },
+      "cache": false
+    },
     "test-integration": {
       "executor": "nx:run-commands",
       "options": {

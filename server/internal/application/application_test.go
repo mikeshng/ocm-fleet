@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -317,8 +318,79 @@ func TestCreateDeployment_StaticPlacement_UnknownTarget(t *testing.T) {
 			Targets: []domain.TargetID{"t1", "missing"},
 		},
 	})
-	if err != nil && !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound or nil, got: %v", err)
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `"missing"`) {
+		t.Errorf("error %q does not name the unknown target", err)
+	}
+	// Nothing was created: the refusal happens before the workflow starts.
+	if _, err := h.deployments.Get(ctx, "deployments/d1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("Get after refused create: got %v, want ErrNotFound", err)
+	}
+}
+
+// targetAdvisorFunc adapts a function to [application.PlacementTargetAdvisor].
+type targetAdvisorFunc func(domain.TargetID) string
+
+func (f targetAdvisorFunc) ExplainUnknownTarget(_ context.Context, id domain.TargetID) string {
+	return f(id)
+}
+
+func TestCreateDeployment_StaticPlacement_UnknownTarget_UsesAdvisor(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	h.deployments.TargetAdvisors = []application.PlacementTargetAdvisor{
+		targetAdvisorFunc(func(domain.TargetID) string { return "" }),
+		targetAdvisorFunc(func(id domain.TargetID) string { return "it is only observed: " + string(id) }),
+	}
+	_, err := h.deployments.Create(ctx, domain.CreateDeploymentInput{
+		Name: "deployments/d1",
+		ManifestStrategy: domain.ManifestStrategySpec{
+			Type:      domain.ManifestStrategyInline,
+			Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+		},
+		PlacementStrategy: domain.PlacementStrategySpec{
+			Type:    domain.PlacementStrategyStatic,
+			Targets: []domain.TargetID{"observed-one"},
+		},
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "it is only observed: observed-one") {
+		t.Errorf("error %q does not carry the advisor's explanation", err)
+	}
+}
+
+func TestCreateDeployment_StaticPlacement_TargetNotReady(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := h.targets.Register(ctx, domain.NewTargetInfo(
+		"waiting", "test", "waiting", domain.TargetStateInitializing, nil, nil, nil,
+	)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	_, err := h.deployments.Create(ctx, domain.CreateDeploymentInput{
+		Name: "deployments/d1",
+		ManifestStrategy: domain.ManifestStrategySpec{
+			Type:      domain.ManifestStrategyInline,
+			Manifests: []domain.Manifest{{Raw: json.RawMessage(`{}`)}},
+		},
+		PlacementStrategy: domain.PlacementStrategySpec{
+			Type:    domain.PlacementStrategyStatic,
+			Targets: []domain.TargetID{"waiting"},
+		},
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "initializing") {
+		t.Errorf("error %q does not state the target's state", err)
 	}
 }
 
@@ -459,6 +531,82 @@ func TestDeleteDeployment_IdempotentWhileDeleting(t *testing.T) {
 	}
 	if dep2.Fulfillment.State() != domain.FulfillmentStateDeleting {
 		t.Fatalf("second Delete state = %q, want deleting", dep2.Fulfillment.State())
+	}
+}
+
+func TestDeleteDeployment_IdempotentReturnsDeliveries(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	fID := domain.FulfillmentID("deployments/d1")
+	f := domain.FulfillmentFromSnapshot(domain.FulfillmentSnapshot{
+		ID:         fID,
+		Generation: 2,
+		ManifestStrategy: domain.ManifestStrategySpec{
+			Type: domain.ManifestStrategyInline,
+		},
+		PlacementStrategy: domain.PlacementStrategySpec{
+			Type: domain.PlacementStrategyAll,
+		},
+		ResolvedTargets: []domain.TargetID{"t1"},
+		State:           domain.FulfillmentStateDeleting,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	dep := domain.DeploymentFromSnapshot(domain.DeploymentSnapshot{
+		Name:          "deployments/d1",
+		UID:           domain.NewDeploymentUID(),
+		FulfillmentID: fID,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	})
+	d := domain.DeliveryFromSnapshot(domain.DeliverySnapshot{
+		ID:            "deployments/d1:t1",
+		FulfillmentID: fID,
+		TargetID:      "t1",
+		State:         domain.DeliveryStateFailed,
+		Message:       `apply object 1: conflict with "work-agent"`,
+		Attempts:      2,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	})
+
+	tx, err := h.store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.RollbackOnExit()
+	if err := tx.Fulfillments().Create(ctx, f); err != nil {
+		t.Fatalf("seed fulfillment: %v", err)
+	}
+	if err := tx.Deployments().Create(ctx, dep); err != nil {
+		t.Fatalf("seed deployment: %v", err)
+	}
+	if err := tx.Deliveries().Put(ctx, d); err != nil {
+		t.Fatalf("seed delivery: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	view, err := h.deployments.Delete(ctx, "deployments/d1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if view.Fulfillment.State() != domain.FulfillmentStateDeleting {
+		t.Fatalf("state = %q, want deleting", view.Fulfillment.State())
+	}
+	if len(view.Deliveries) != 1 {
+		t.Fatalf("len(Deliveries) = %d, want 1", len(view.Deliveries))
+	}
+	got := view.Deliveries[0]
+	if got.TargetID() != "t1" {
+		t.Errorf("TargetID = %q, want t1", got.TargetID())
+	}
+	if got.Message() != `apply object 1: conflict with "work-agent"` {
+		t.Errorf("Message = %q", got.Message())
 	}
 }
 
@@ -748,14 +896,18 @@ func (a *authFailThenSucceedAgent) Deliver(_ context.Context, _ domain.TargetInf
 	if n == 1 {
 		go func() {
 			_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
-				State:   domain.DeliveryStateAuthFailed,
-				Message: "401 Unauthorized",
+				State:     domain.DeliveryStateAuthFailed,
+				Message:   "401 Unauthorized",
+				Operation: domain.DeliveryOperationDeliver,
 			})
 		}()
 		return nil
 	}
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+			State:     domain.DeliveryStateDelivered,
+			Operation: domain.DeliveryOperationDeliver,
+		})
 	}()
 	return nil
 }
@@ -821,7 +973,10 @@ type removeAuthFailThenSucceedAgent struct {
 
 func (a *removeAuthFailThenSucceedAgent) Deliver(_ context.Context, _ domain.TargetInfo, deliveryID domain.DeliveryID, _ []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+			State:     domain.DeliveryStateDelivered,
+			Operation: domain.DeliveryOperationDeliver,
+		})
 	}()
 	return nil
 }
@@ -835,14 +990,18 @@ func (a *removeAuthFailThenSucceedAgent) Remove(_ context.Context, _ domain.Targ
 	if n == 1 {
 		go func() {
 			_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
-				State:   domain.DeliveryStateAuthFailed,
-				Message: "broker auth exchange: caller token is empty",
+				State:     domain.DeliveryStateAuthFailed,
+				Message:   "broker auth exchange: caller token is empty",
+				Operation: domain.DeliveryOperationRemove,
 			})
 		}()
 		return nil
 	}
 	go func() {
-		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{State: domain.DeliveryStateDelivered})
+		_ = a.reporter.ReportResult(context.Background(), deliveryID, generation, domain.DeliveryResult{
+			State:     domain.DeliveryStateDelivered,
+			Operation: domain.DeliveryOperationRemove,
+		})
 	}()
 	return nil
 }

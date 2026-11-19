@@ -94,6 +94,7 @@ func run() error {
 			in.CAFile = externalCA
 		}
 	}
+	in.Enrollment = aioinit.ResolveEnrollment(aioinit.EnrollmentFromEnv(), sandboxPKI.CACert, aioinit.ContainerEngineSocketPresent())
 
 	in = aioinit.ApplyServeDefaults(in)
 	args := aioinit.ServeArgs(in)

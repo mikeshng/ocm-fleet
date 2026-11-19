@@ -31,7 +31,7 @@ func TestServeArgs_PeerDexDefaultsForbidSandboxFlags(t *testing.T) {
 		"--oidc-registry-subject-expression\x00claims.preferred_username",
 		"--oidc-ca-file\x00/data/sandbox/pki/ca.crt",
 		"--log-level\x00error",
-		"--addons\x00kind,kubernetes",
+		"--addons\x00kind,kubernetes,ocm",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("args missing %q in %v", want, args)
@@ -48,6 +48,64 @@ func TestApplyServeDefaults_ExplicitAddonsWin(t *testing.T) {
 	in := aioinit.ApplyServeDefaults(aioinit.ServeConfig{Addons: "kubernetes,scripted"})
 	if in.Addons != "kubernetes,scripted" {
 		t.Fatalf("Addons = %q, want explicit addon selection", in.Addons)
+	}
+}
+
+// TestResolveEnrollment covers where existing clusters are told to present
+// themselves: the kind sandbox default, an explicit address taken as given,
+// and nothing at all without either.
+func TestResolveEnrollment(t *testing.T) {
+	const sandboxCA = "/data/sandbox/pki/ca.crt"
+
+	sandbox := aioinit.ResolveEnrollment(aioinit.EnrollmentConfig{AgentImage: "agent:1"}, sandboxCA, true)
+	want := aioinit.EnrollmentConfig{
+		ServerURL:      "https://ocm-fleet.localhost:8085",
+		CAFile:         sandboxCA,
+		ConnectAddress: "ocm-fleet:8085",
+		AgentImage:     "agent:1",
+	}
+	if sandbox != want {
+		t.Fatalf("kind sandbox default = %+v, want %+v", sandbox, want)
+	}
+
+	explicit := aioinit.EnrollmentConfig{ServerURL: "https://fleet.example.com", AgentImage: "agent:1"}
+	if got := aioinit.ResolveEnrollment(explicit, sandboxCA, true); got != explicit {
+		t.Fatalf("explicit address = %+v, want it untouched (its CA and connect address are the operator's)", got)
+	}
+
+	if got := aioinit.ResolveEnrollment(aioinit.EnrollmentConfig{}, sandboxCA, false); got != (aioinit.EnrollmentConfig{}) {
+		t.Fatalf("no engine socket, nothing explicit = %+v, want empty", got)
+	}
+}
+
+func TestServeArgs_Enrollment(t *testing.T) {
+	in := aioinit.ApplyServeDefaults(aioinit.ServeConfig{
+		Endpoints: aioinit.FixedEndpoints,
+		Issuer:    aioinit.PeerDexIssuer,
+		Enrollment: aioinit.EnrollmentConfig{
+			ServerURL:      "https://ocm-fleet.localhost:8085",
+			CAFile:         "/data/sandbox/pki/ca.crt",
+			ConnectAddress: "ocm-fleet:8085",
+			AgentImage:     "agent:1",
+		},
+	})
+	joined := strings.Join(aioinit.ServeArgs(in), "\x00")
+	for _, want := range []string{
+		"--enrollment-server-url\x00https://ocm-fleet.localhost:8085",
+		"--enrollment-ca-file\x00/data/sandbox/pki/ca.crt",
+		"--enrollment-connect-address\x00ocm-fleet:8085",
+		"--enrollment-agent-image\x00agent:1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args missing %q", want)
+		}
+	}
+
+	none := strings.Join(aioinit.ServeArgs(aioinit.ApplyServeDefaults(aioinit.ServeConfig{
+		Endpoints: aioinit.FixedEndpoints, Issuer: aioinit.PeerDexIssuer,
+	})), "\x00")
+	if strings.Contains(none, "--enrollment-") {
+		t.Fatalf("enrollment flags present without enrollment settings: %q", none)
 	}
 }
 

@@ -1,8 +1,11 @@
 import { useExtensionInstall } from "@ocm-fleet/common";
 import {
   Bullseye,
+  Button,
   EmptyState,
+  EmptyStateActions,
   EmptyStateBody,
+  EmptyStateFooter,
   Spinner,
 } from "@patternfly/react-core";
 import { CubesIcon } from "@patternfly/react-icons";
@@ -12,6 +15,7 @@ import { useCallback } from "react";
 import { useAppConfig } from "../contexts/AppConfigContext";
 import { useScope } from "../contexts/ScopeContext";
 import { pluginKeyFromName } from "../utils/extensions";
+import { reloadPage } from "../utils/reloadPage";
 import { ExtensionEnablePage } from "./ExtensionEnablePage";
 
 interface PluginPageProps {
@@ -75,6 +79,13 @@ export const PluginPage = ({ scope, module, pluginKey }: PluginPageProps) => {
           Failed to load extension state. The plugin may still work — try
           refreshing the page.
         </EmptyStateBody>
+        <EmptyStateFooter>
+          <EmptyStateActions>
+            <Button variant="primary" onClick={() => reloadPage()}>
+              Reload the page
+            </Button>
+          </EmptyStateActions>
+        </EmptyStateFooter>
       </EmptyState>
     );
   }
@@ -107,8 +118,16 @@ export const PluginPage = ({ scope, module, pluginKey }: PluginPageProps) => {
         >
           <EmptyStateBody>
             An error occurred loading <strong>{module}</strong> from{" "}
-            <strong>{scope}</strong>.
+            <strong>{scope}</strong>. Reloading the page loads its code again;
+            you stay signed in.
           </EmptyStateBody>
+          <EmptyStateFooter>
+            <EmptyStateActions>
+              <Button variant="primary" onClick={() => reloadPage()}>
+                Reload the page
+              </Button>
+            </EmptyStateActions>
+          </EmptyStateFooter>
         </EmptyState>
       }
       {...{ clusterIds }}

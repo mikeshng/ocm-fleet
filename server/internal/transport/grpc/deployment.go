@@ -2,19 +2,29 @@ package grpc
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	pb "github.com/stolostron/ocm-fleet/server/gen/ocm/v1alpha"
 	"github.com/stolostron/ocm-fleet/server/internal/application"
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
+	"github.com/stolostron/ocm-fleet/server/internal/kubelabels"
 )
 
 const deploymentCollectionID = "deployments"
+
+// Deployment pages use the same default and maximum as the query surface.
+const (
+	defaultDeploymentPageSize = 50
+	maxDeploymentPageSize     = 500
+)
 
 // DeploymentServer implements [pb.DeploymentServiceServer].
 type DeploymentServer struct {
@@ -25,6 +35,9 @@ type DeploymentServer struct {
 func (s *DeploymentServer) CreateDeployment(ctx context.Context, req *pb.CreateDeploymentRequest) (*pb.Deployment, error) {
 	if req.GetDeploymentId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "deployment_id is required")
+	}
+	if errs := validation.IsDNS1123Label(req.GetDeploymentId()); len(errs) > 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "deployment_id %q is not a DNS label: %s", req.GetDeploymentId(), strings.Join(errs, "; "))
 	}
 	if req.GetDeployment() == nil {
 		return nil, status.Error(codes.InvalidArgument, "deployment is required")
@@ -81,18 +94,62 @@ func (s *DeploymentServer) ResumeDeployment(ctx context.Context, req *pb.ResumeD
 	return deploymentToProto(view), nil
 }
 
-func (s *DeploymentServer) ListDeployments(ctx context.Context, _ *pb.ListDeploymentsRequest) (*pb.ListDeploymentsResponse, error) {
-	// TODO: implement pagination
-	views, err := s.Deployments.List(ctx)
+func (s *DeploymentServer) ListDeployments(ctx context.Context, req *pb.ListDeploymentsRequest) (*pb.ListDeploymentsResponse, error) {
+	size := int(req.GetPageSize())
+	if size < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid page_size: must not be negative")
+	}
+	if size == 0 {
+		size = defaultDeploymentPageSize
+	}
+	if size > maxDeploymentPageSize {
+		size = maxDeploymentPageSize
+	}
+
+	// The token names the last deployment of the page just read, and the
+	// repository starts strictly after that name, so a deployment deleted
+	// between calls does not shift the next page.
+	after := domain.ResourceName("")
+	if tok := req.GetPageToken(); tok != "" {
+		last, err := decodeDeploymentPageToken(tok)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page_token: %v", err)
+		}
+		after = last
+	}
+
+	page, err := s.Deployments.ListPage(ctx, after, size)
 	if err != nil {
 		return nil, domainError(err)
 	}
 
-	out := make([]*pb.Deployment, len(views))
-	for i, v := range views {
-		out[i] = deploymentToProto(v)
+	out := make([]*pb.Deployment, 0, len(page.Views))
+	for _, v := range page.Views {
+		out = append(out, deploymentToProto(v))
 	}
-	return &pb.ListDeploymentsResponse{Deployments: out}, nil
+	next := ""
+	if page.More && len(page.Views) > 0 {
+		next = encodeDeploymentPageToken(page.Views[len(page.Views)-1].Deployment.Name())
+	}
+	return &pb.ListDeploymentsResponse{Deployments: out, NextPageToken: next}, nil
+}
+
+// encodeDeploymentPageToken encodes the last deployment name of a page.
+func encodeDeploymentPageToken(name domain.ResourceName) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(name))
+}
+
+// decodeDeploymentPageToken reads a token written by
+// [encodeDeploymentPageToken].
+func decodeDeploymentPageToken(token string) (domain.ResourceName, error) {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", fmt.Errorf("not a deployment page token: %w", err)
+	}
+	if len(b) == 0 {
+		return "", fmt.Errorf("not a deployment page token: empty name")
+	}
+	return domain.ResourceName(b), nil
 }
 
 func (s *DeploymentServer) DeleteDeployment(ctx context.Context, req *pb.DeleteDeploymentRequest) (*pb.Deployment, error) {
@@ -211,6 +268,11 @@ func placementStrategyFromProto(p *pb.PlacementStrategy) (domain.PlacementStrate
 		if sel == nil {
 			return domain.PlacementStrategySpec{}, fmt.Errorf("target_selector is required for SELECTOR placement")
 		}
+		for k, v := range sel.GetMatchLabels() {
+			if !kubelabels.Valid(k, v) {
+				return domain.PlacementStrategySpec{}, fmt.Errorf("target_selector match_labels: %q=%q is not a valid Kubernetes label", k, v)
+			}
+		}
 		return domain.PlacementStrategySpec{
 			Type:           domain.PlacementStrategySelector,
 			TargetSelector: &domain.TargetSelector{MatchLabels: sel.GetMatchLabels()},
@@ -271,7 +333,69 @@ func deploymentToProto(v domain.DeploymentView) *pb.Deployment {
 
 	dep.Generation = int64(f.Generation())
 
+	dep.TargetStatuses = targetStatusesToProto(v.Deliveries)
+
 	return dep
+}
+
+// targetStatusesToProto maps the fulfillment's delivery records to the
+// per-target statuses the API exposes. Order is preserved from the
+// repository, which orders by target ID.
+func targetStatusesToProto(deliveries []domain.Delivery) []*pb.TargetDeliveryStatus {
+	if len(deliveries) == 0 {
+		return nil
+	}
+	out := make([]*pb.TargetDeliveryStatus, len(deliveries))
+	for i := range deliveries {
+		out[i] = targetStatusToProto(deliveries[i])
+	}
+	return out
+}
+
+func targetStatusToProto(d domain.Delivery) *pb.TargetDeliveryStatus {
+	s := &pb.TargetDeliveryStatus{
+		TargetId:  string(d.TargetID()),
+		State:     deliveryStateToProto(d.State()),
+		Message:   d.Message(),
+		Attempts:  int32(d.Attempts()),
+		Operation: deliveryOperationToProto(d.Operation()),
+	}
+	if !d.UpdatedAt().IsZero() {
+		s.UpdateTime = timestamppb.New(d.UpdatedAt())
+	}
+	return s
+}
+
+func deliveryOperationToProto(o domain.DeliveryOperation) pb.TargetDeliveryStatus_Operation {
+	switch o {
+	case domain.DeliveryOperationDeliver:
+		return pb.TargetDeliveryStatus_OPERATION_DELIVER
+	case domain.DeliveryOperationRemove:
+		return pb.TargetDeliveryStatus_OPERATION_REMOVE
+	default:
+		return pb.TargetDeliveryStatus_OPERATION_UNSPECIFIED
+	}
+}
+
+func deliveryStateToProto(s domain.DeliveryState) pb.TargetDeliveryStatus_State {
+	switch s {
+	case domain.DeliveryStatePending:
+		return pb.TargetDeliveryStatus_STATE_PENDING
+	case domain.DeliveryStateAccepted:
+		return pb.TargetDeliveryStatus_STATE_ACCEPTED
+	case domain.DeliveryStateProgressing:
+		return pb.TargetDeliveryStatus_STATE_PROGRESSING
+	case domain.DeliveryStateDelivered:
+		return pb.TargetDeliveryStatus_STATE_DELIVERED
+	case domain.DeliveryStateFailed:
+		return pb.TargetDeliveryStatus_STATE_FAILED
+	case domain.DeliveryStatePartial:
+		return pb.TargetDeliveryStatus_STATE_PARTIAL
+	case domain.DeliveryStateAuthFailed:
+		return pb.TargetDeliveryStatus_STATE_AUTH_FAILED
+	default:
+		return pb.TargetDeliveryStatus_STATE_UNSPECIFIED
+	}
 }
 
 func provenanceToProto(p *domain.Provenance) *pb.Provenance {

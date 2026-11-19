@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -33,12 +34,17 @@ const (
 	AddonKind       AddonName = "kind"
 	AddonKubernetes AddonName = "kubernetes"
 	AddonScripted   AddonName = "scripted"
+	// AddonOCM is the integration with Open Cluster Management hubs.
+	// It builds on the kubernetes add-on's enrollment capability when
+	// that add-on is enabled, and only observes hubs when it is not.
+	AddonOCM AddonName = "ocm"
 )
 
 var knownAddons = map[AddonName]struct{}{
 	AddonKind:       {},
 	AddonKubernetes: {},
 	AddonScripted:   {},
+	AddonOCM:        {},
 }
 
 // Database is the selected persistence backend. Values are produced only by
@@ -118,6 +124,11 @@ type ConfigInput struct {
 	OIDCRegistrySubjectExpression string
 	OIDCPublicKeyClaimExpression  string
 	Addons                        string
+	EnrollmentServerURL           string
+	EnrollmentCABundle            []byte // content read at the edge; empty when unused
+	EnrollmentConnectAddress      string
+	EnrollmentAgentImage          string
+	ClusterEgressAllow            string // comma-separated CIDRs, resolved at the edge
 }
 
 // Config is the normalized typed production configuration accepted by
@@ -154,6 +165,31 @@ type Config struct {
 
 	// Addons is the enabled addon name list (order preserved, duplicates removed).
 	Addons []AddonName
+
+	// Enrollment endpoint: where the access piece of an existing cluster
+	// presents itself, as that cluster reaches this server. All four are
+	// optional; without EnrollmentServerURL and EnrollmentAgentImage no
+	// enrollment manifest can be generated (enrollment by hand still
+	// works).
+	//
+	// EnrollmentServerURL is this server's https address as clusters
+	// address it: the name its certificate carries and its gateway
+	// accepts. EnrollmentCABundle is the PEM CA that signs that
+	// certificate (empty means the clusters' system roots).
+	// EnrollmentConnectAddress is the host:port clusters dial instead of
+	// resolving the URL's host, for when that name does not resolve
+	// from inside them. EnrollmentAgentImage is the enrollment agent's
+	// image.
+	EnrollmentServerURL      string
+	EnrollmentCABundle       []byte
+	EnrollmentConnectAddress string
+	EnrollmentAgentImage     string
+
+	// ClusterEgressAllow lists address ranges the resource manager may
+	// dial for a cluster or a hub although they are otherwise refused:
+	// loopback, link-local (where cloud instance metadata lives), and the
+	// other non-cluster ranges. Private cluster ranges need no entry.
+	ClusterEgressAllow []netip.Prefix
 }
 
 // NewConfig parses resolved edge input into a normalized Config. It performs
@@ -194,6 +230,11 @@ func NewConfig(in ConfigInput) (Config, error) {
 		return Config{}, fmt.Errorf("exactly one of SQLite path or database URL is required")
 	}
 
+	egressAllow, err := parseEgressAllowList(in.ClusterEgressAllow)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		GRPCAddr:                      in.GRPCAddr,
 		HTTPAddr:                      in.HTTPAddr,
@@ -209,6 +250,11 @@ func NewConfig(in ConfigInput) (Config, error) {
 		OIDCRegistrySubjectExpression: strings.TrimSpace(in.OIDCRegistrySubjectExpression),
 		OIDCPublicKeyClaimExpression:  strings.TrimSpace(in.OIDCPublicKeyClaimExpression),
 		Addons:                        normalizeAddonList(in.Addons),
+		EnrollmentServerURL:           strings.TrimRight(strings.TrimSpace(in.EnrollmentServerURL), "/"),
+		EnrollmentCABundle:            append([]byte(nil), in.EnrollmentCABundle...),
+		EnrollmentConnectAddress:      strings.TrimSpace(in.EnrollmentConnectAddress),
+		EnrollmentAgentImage:          strings.TrimSpace(in.EnrollmentAgentImage),
+		ClusterEgressAllow:            egressAllow,
 	}
 	if err := cfg.checkInvariants(); err != nil {
 		return Config{}, err
@@ -283,7 +329,67 @@ func (c Config) checkInvariants() error {
 		}
 	}
 
+	if c.EnrollmentServerURL != "" {
+		if err := parseEnrollmentServerURL(c.EnrollmentServerURL); err != nil {
+			return err
+		}
+	}
+	if len(c.EnrollmentCABundle) > 0 {
+		if err := parseCertificatePEM("enrollment CA data", c.EnrollmentCABundle); err != nil {
+			return err
+		}
+	}
+	if c.EnrollmentConnectAddress != "" {
+		host, port, err := net.SplitHostPort(c.EnrollmentConnectAddress)
+		if err != nil || host == "" || port == "" {
+			return fmt.Errorf("invalid enrollment connect address: must be host:port")
+		}
+	}
+
 	return nil
+}
+
+// parseEnrollmentServerURL validates that raw is an https URL with a host and
+// nothing else. Clusters send credentials to this address, so cleartext is
+// never accepted.
+func parseEnrollmentServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid enrollment server URL: %w", err)
+	}
+	if strings.ToLower(u.Scheme) != "https" || u.Host == "" {
+		return fmt.Errorf("invalid enrollment server URL: must be an https URL with a host")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return fmt.Errorf("invalid enrollment server URL: must not carry a path, query, or credentials")
+	}
+	return nil
+}
+
+// parseEgressAllowList parses a comma-separated list of CIDR prefixes, or
+// single addresses, that the cluster egress policy permits. Empty entries are
+// dropped; empty input yields nil.
+func parseEgressAllowList(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(entry); err == nil {
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cluster egress allow entry %q: must be a CIDR prefix or an address", entry)
+		}
+		out = append(out, netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()))
+	}
+	return out, nil
 }
 
 // normalizeAddonList splits a comma-separated addon wire string into a stable
@@ -406,6 +512,12 @@ func isLoopbackHost(host string) bool {
 // parseCAPEM requires data to contain at least one parseable PEM CERTIFICATE
 // block.
 func parseCAPEM(data []byte) error {
+	return parseCertificatePEM("OIDC CA data", data)
+}
+
+// parseCertificatePEM requires data to contain at least one parseable PEM
+// CERTIFICATE block. what names the input in the error.
+func parseCertificatePEM(what string, data []byte) error {
 	rest := data
 	found := false
 	for {
@@ -418,12 +530,12 @@ func parseCAPEM(data []byte) error {
 			continue
 		}
 		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-			return fmt.Errorf("invalid OIDC CA data: %w", err)
+			return fmt.Errorf("invalid %s: %w", what, err)
 		}
 		found = true
 	}
 	if !found {
-		return fmt.Errorf("invalid OIDC CA data: no PEM CERTIFICATE blocks found")
+		return fmt.Errorf("invalid %s: no PEM CERTIFICATE blocks found", what)
 	}
 	return nil
 }

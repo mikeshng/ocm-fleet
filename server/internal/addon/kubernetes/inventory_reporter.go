@@ -63,6 +63,47 @@ type InventoryReportBackend interface {
 	ReplaceBatch(ctx context.Context, resourceType domain.ResourceType, reports []InventoryObjectReport) error
 }
 
+// InventoryRecordStore is the application call surface for
+// inventory-only records an add-on owns outright: cluster records,
+// enrollment bundles, and the object rows of a cluster that is gone.
+// Besides [InventoryReportBackend] it offers the two parent-scoped
+// operations cleanup needs. Like [InventoryReportBackend] it is
+// declared at the point of use and adapted in server composition.
+type InventoryRecordStore interface {
+	InventoryReportBackend
+	// ListCollections returns the distinct collection names holding at
+	// least one resource of the type.
+	ListCollections(ctx context.Context, resourceType domain.ResourceType) ([]domain.CollectionName, error)
+	// PurgeCollectionPrefix removes every resource of the type whose
+	// collection name starts with prefix and returns how many.
+	PurgeCollectionPrefix(ctx context.Context, resourceType domain.ResourceType, prefix string) (int64, error)
+}
+
+// StaleObjectPurger is an optional capability of an [InventoryReporter].
+// An indexer that has read everything it can read of a cluster calls it
+// with the time it started: whatever no report has written since then
+// was not found again, and nothing will ever update or remove it. The
+// writer alone cannot see such objects: it compares each LIST only with
+// what it reported itself, so objects deleted while no indexer ran (a
+// restart, a cluster recreated under the same name) would otherwise
+// stay in the inventory for good.
+type StaleObjectPurger interface {
+	// PurgeObjectsNotReportedSince removes the objects of cluster
+	// (clusters/{id}) not written since the given time and returns how
+	// many.
+	PurgeObjectsNotReportedSince(ctx context.Context, cluster domain.ResourceName, since time.Time) (int64, error)
+}
+
+// StaleInventoryPurger is the application call surface behind
+// [StaleObjectPurger]. A backend that does not offer it leaves stale
+// objects in place.
+type StaleInventoryPurger interface {
+	// PurgeStaleCollectionPrefix removes every resource of the type
+	// whose collection name starts with prefix and that no report has
+	// written since notWrittenSince, and returns how many.
+	PurgeStaleCollectionPrefix(ctx context.Context, resourceType domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error)
+}
+
 // DirectInventoryReporter is the no-transport [InventoryReporter] used by
 // server-side indexing. It always reports under [ObjectResourceType] and
 // forwards to an [InventoryReportBackend].
@@ -99,4 +140,21 @@ func (r *DirectInventoryReporter) ApplyDelta(ctx context.Context, delta Inventor
 		return fmt.Errorf("direct inventory reporter apply delta: %w", err)
 	}
 	return nil
+}
+
+// PurgeObjectsNotReportedSince implements [StaleObjectPurger] when the
+// backend is a [StaleInventoryPurger]; otherwise it removes nothing.
+func (r *DirectInventoryReporter) PurgeObjectsNotReportedSince(ctx context.Context, cluster domain.ResourceName, since time.Time) (int64, error) {
+	backend, ok := r.backend.(StaleInventoryPurger)
+	if !ok {
+		return 0, nil
+	}
+	if err := requireClusterResourceName(cluster); err != nil {
+		return 0, err
+	}
+	n, err := backend.PurgeStaleCollectionPrefix(ctx, ObjectResourceType, string(cluster)+"/", since)
+	if err != nil {
+		return 0, fmt.Errorf("direct inventory reporter purge stale objects: %w", err)
+	}
+	return n, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -522,7 +524,7 @@ func TestStopIngress_ReleasesListenersAfterServe(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	if err := stopIngress(grpcServer, httpServer, 2*time.Second); err != nil {
+	if err := stopIngress(grpcServer, httpServer, nil, 2*time.Second); err != nil {
 		t.Fatalf("stopIngress: %v", err)
 	}
 
@@ -546,9 +548,61 @@ func TestStopIngress_ReleasesListenersAfterServe(t *testing.T) {
 	_ = rebindHTTP.Close()
 
 	// Second stop must remain safe for fail/Close overlap.
-	if err := stopIngress(grpcServer, httpServer, 2*time.Second); err != nil {
+	if err := stopIngress(grpcServer, httpServer, nil, 2*time.Second); err != nil {
 		t.Fatalf("second stopIngress: %v", err)
 	}
+}
+
+func TestStopIngress_ExpiredGraceForcesHTTPConnectionsClosed(t *testing.T) {
+	// Shutdown alone leaves in-flight connections open after its grace
+	// expires. A forced stop must release them, so a client that is
+	// waiting on a stalled handler is not held past the stop.
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen HTTP: %v", err)
+	}
+	entered := make(chan struct{}, 1)
+	hold := make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(hold) }) })
+
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-hold
+	})}
+	go func() { _ = httpServer.Serve(httpLis) }()
+
+	clientDone := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + httpLis.Addr().String() + "/")
+		if err == nil {
+			resp.Body.Close()
+		}
+		clientDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+
+	err = stopIngress(nil, httpServer, nil, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("stopIngress reported success although the grace expired with a request open")
+	}
+	select {
+	case clientErr := <-clientDone:
+		if clientErr == nil {
+			t.Fatal("the stalled request completed successfully after a forced stop")
+		}
+	case <-time.After(2 * time.Second):
+		release.Do(func() { close(hold) })
+		t.Fatal("the stalled request stayed open after a forced stop")
+	}
+	release.Do(func() { close(hold) })
 }
 
 func TestStopIngress_GracefulFallbackForcesStop(t *testing.T) {
@@ -619,7 +673,7 @@ func TestStopIngress_GracefulFallbackForcesStop(t *testing.T) {
 	}
 
 	stopDone := make(chan error, 1)
-	go func() { stopDone <- stopIngress(grpcServer, httpServer, 50*time.Millisecond) }()
+	go func() { stopDone <- stopIngress(grpcServer, httpServer, nil, 50*time.Millisecond) }()
 
 	select {
 	case err := <-stopDone:
@@ -645,6 +699,73 @@ func TestStopIngress_GracefulFallbackForcesStop(t *testing.T) {
 
 type hangServiceServer interface {
 	Hang(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
+}
+
+func TestHTTPServer_StalledBodyReadIsBounded(t *testing.T) {
+	// A client that sends complete headers and then withholds the body
+	// must not pin the handler: the server's read bound ends the read.
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen HTTP: %v", err)
+	}
+	handlerDone := make(chan struct{})
+	httpServer := newHTTPServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		close(handlerDone)
+	}), context.Background(), 100*time.Millisecond, time.Second)
+	go func() { _ = httpServer.Serve(httpLis) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+
+	conn, err := net.Dial("tcp", httpLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "POST /stall HTTP/1.1\r\nHost: test\r\nContent-Length: 1000\r\n\r\n"); err != nil {
+		t.Fatalf("write headers: %v", err)
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler stayed in the body read past the server's read bound")
+	}
+}
+
+func TestServer_CloseEndsOpenEventSocket(t *testing.T) {
+	// A browser holds the event socket open. net/http neither tracks nor
+	// closes hijacked connections, so Close must end the handler through
+	// the server's base context; the client then sees the socket close.
+	srv := startTestServer(t)
+	wsURL := "ws://" + srv.Endpoints().HTTP.Dial + "/api/ui/events/ws"
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	conn, _, err := websocket.Dial(dialCtx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial event socket: %v", err)
+	}
+	defer conn.CloseNow()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, err := conn.Read(context.Background())
+		readDone <- err
+	}()
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer closeCancel()
+	if err := srv.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("the event socket delivered a message after Close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the open event socket outlived Close")
+	}
 }
 
 type hangServer struct {

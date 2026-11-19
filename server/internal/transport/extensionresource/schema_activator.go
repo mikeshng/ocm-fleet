@@ -62,6 +62,14 @@ type DynamicSchemaActivator struct {
 	Registry *ActiveResourceRegistry
 
 	mu sync.Mutex
+
+	// routes holds one HTTP route table per service root, mounted on
+	// HTTPMux the first time a collection of that service is activated.
+	// The table dispatches each collection's URLs to its service, so
+	// services sharing a root (the hubs and managed clusters of one
+	// add-on, for instance) can serve resource names whose parent
+	// collections are siblings. Guarded by mu.
+	routes map[string]*routeTable
 }
 
 var _ application.SchemaActivator = (*DynamicSchemaActivator)(nil)
@@ -133,6 +141,7 @@ func (a *DynamicSchemaActivator) Activate(ctx context.Context, schema domain.Ext
 		caps.Management = &ManagementCapabilityConfig{
 			SpecMessage:    schema.Management.SpecMessage,
 			SpecDescriptor: compiled.Message,
+			ValidateID:     schema.Management.ValidateID,
 		}
 	}
 	if schema.Inventory != nil {
@@ -213,13 +222,18 @@ func (a *DynamicSchemaActivator) Activate(ctx context.Context, schema domain.Ext
 			}
 		}
 
-		a.GRPCMux.ReplaceDesc(svc.Desc)
+		// Mount before replacing the gRPC descriptor: mounting a service
+		// root that does not exist yet can fail, and until it succeeds the
+		// old registration must stay live. Replacing a collection that is
+		// already mounted cannot fail.
 		if a.HTTPMux != nil {
-			handler := BuildHTTPHandler(svc, a.HTTPMux.Conn(), canonicalPrefix)
-			a.HTTPMux.ReplacePrefixHandler(canonicalPrefix, handler)
-			if existing.HTTPPrefix != "" && existing.HTTPPrefix != canonicalPrefix {
-				a.HTTPMux.DeregisterByPrefix(existing.HTTPPrefix)
+			if err := a.mountExtensionService(cfg, svc); err != nil {
+				return "", fmt.Errorf("register HTTP: %w", err)
 			}
+		}
+		a.GRPCMux.ReplaceDesc(svc.Desc)
+		if a.HTTPMux != nil && existing.HTTPPrefix != "" && existing.HTTPPrefix != canonicalPrefix {
+			a.unmountExtensionPrefix(existing.HTTPPrefix)
 		}
 		if a.FileRegistry != nil {
 			if existing.DescriptorPath != "" && existing.DescriptorPath != descriptorPath {
@@ -232,20 +246,18 @@ func (a *DynamicSchemaActivator) Activate(ctx context.Context, schema domain.Ext
 		// the new service first; on rename the old service stays until
 		// after Registry.Register succeeds.
 		//
-		// When the canonical HTTP prefix is unchanged (typical package
-		// rename), RegisterPrefixHandler would fail on the already-
-		// registered route. Defer the in-place HTTP replace until after
-		// Registry.Register so a failed later step does not leave the
-		// shared prefix pointing at a rolled-back gRPC service, and so
-		// rollback does not DeregisterByPrefix the still-serving route.
+		// When the canonical HTTP route is unchanged (typical package
+		// rename), the collection's handler is replaced in place. Defer
+		// that replace until after Registry.Register so a failed later
+		// step does not point the shared route at a rolled-back gRPC
+		// service, and so rollback leaves the still-serving route alone.
 		sameHTTPPrefix = grpcRename && existing.HTTPPrefix != "" && existing.HTTPPrefix == canonicalPrefix
 
 		if err := a.GRPCMux.RegisterDesc(svc.Desc); err != nil {
 			return "", fmt.Errorf("register gRPC: %w", err)
 		}
 		if a.HTTPMux != nil && !sameHTTPPrefix {
-			handler := BuildHTTPHandler(svc, a.HTTPMux.Conn(), canonicalPrefix)
-			if err := a.HTTPMux.RegisterPrefixHandler(canonicalPrefix, handler); err != nil {
+			if err := a.mountExtensionService(cfg, svc); err != nil {
 				a.GRPCMux.Deregister(serviceName)
 				return "", fmt.Errorf("register HTTP: %w", err)
 			}
@@ -300,20 +312,17 @@ func (a *DynamicSchemaActivator) Activate(ctx context.Context, schema domain.Ext
 	}
 
 	if sameHTTPPrefix {
-		// Registry swap succeeded; point the shared prefix at the new
+		// Registry swap succeeded; point the shared collection at the new
 		// service, then retire the old gRPC/file identity without
 		// touching the HTTP route.
-		if a.HTTPMux != nil {
-			handler := BuildHTTPHandler(svc, a.HTTPMux.Conn(), canonicalPrefix)
-			a.HTTPMux.ReplacePrefixHandler(canonicalPrefix, handler)
-		}
+		a.replaceExtensionService(cfg, svc)
 		a.GRPCMux.Deregister(existing.GRPCServiceName)
 		if a.FileRegistry != nil && existing.DescriptorPath != "" && existing.DescriptorPath != descriptorPath {
 			a.FileRegistry.Deregister(existing.DescriptorPath)
 		}
 	} else if grpcRename {
 		// New registration is live; retire the previous identity
-		// (distinct HTTP prefix / descriptor path).
+		// (distinct HTTP route / descriptor path).
 		a.deregisterExtensionTransport(existing.GRPCServiceName, existing.HTTPPrefix, existing.DescriptorPath)
 	}
 	if grpcRename {
@@ -332,6 +341,18 @@ func (a *DynamicSchemaActivator) Activate(ctx context.Context, schema domain.Ext
 // one extension service. Must be called with a.mu held.
 func (a *DynamicSchemaActivator) deregisterExtensionTransport(grpcServiceName, httpPrefix, descriptorPath string) {
 	a.GRPCMux.Deregister(grpcServiceName)
+	a.unmountExtensionPrefix(httpPrefix)
+	if a.FileRegistry != nil {
+		a.FileRegistry.Deregister(descriptorPath)
+	}
+}
+
+// deregisterPlatformTransport removes gRPC/HTTP/file registrations for
+// one platform resource service. It unmounts the platform service's own
+// prefix, which is not part of an extension route table. Must be called
+// with a.mu held.
+func (a *DynamicSchemaActivator) deregisterPlatformTransport(grpcServiceName, httpPrefix, descriptorPath string) {
+	a.GRPCMux.Deregister(grpcServiceName)
 	if a.HTTPMux != nil {
 		a.HTTPMux.DeregisterByPrefix(httpPrefix)
 	}
@@ -341,16 +362,91 @@ func (a *DynamicSchemaActivator) deregisterExtensionTransport(grpcServiceName, h
 }
 
 // rollbackNewExtensionTransport undoes a partially registered *new*
-// extension transport. When skipHTTP is true the HTTP prefix is shared
+// extension transport. When skipHTTP is true the HTTP route is shared
 // with the still-live previous registration and must not be removed.
 func (a *DynamicSchemaActivator) rollbackNewExtensionTransport(grpcServiceName, httpPrefix, descriptorPath string, skipHTTP bool) {
 	a.GRPCMux.Deregister(grpcServiceName)
-	if a.HTTPMux != nil && !skipHTTP {
-		a.HTTPMux.DeregisterByPrefix(httpPrefix)
+	if !skipHTTP {
+		a.unmountExtensionPrefix(httpPrefix)
 	}
 	if a.FileRegistry != nil {
 		a.FileRegistry.Deregister(descriptorPath)
 	}
+}
+
+// mountExtensionService registers svc as the HTTP handler for its
+// collection. The service root's route table is created and mounted on
+// first use. Must be called with a.mu held.
+func (a *DynamicSchemaActivator) mountExtensionService(cfg *ResourceTypeConfig, svc *RegisteredService) error {
+	if a.HTTPMux == nil {
+		return nil
+	}
+	root := cfg.ServiceRoot()
+	table, ok := a.routes[root]
+	if !ok {
+		table = newRouteTable(root)
+		if err := a.HTTPMux.RegisterPrefixHandler(root, table.ServeHTTP); err != nil {
+			return err
+		}
+		if a.routes == nil {
+			a.routes = make(map[string]*routeTable)
+		}
+		a.routes[root] = table
+	}
+	table.set(cfg.CollectionID, &httpService{svc: svc, conn: a.HTTPMux.Conn()})
+	return nil
+}
+
+// replaceExtensionService points an already-mounted collection at svc.
+// A same-route rename uses this after the registry move succeeds; the
+// root's table must exist, because the previous registration mounted it.
+// Must be called with a.mu held.
+func (a *DynamicSchemaActivator) replaceExtensionService(cfg *ResourceTypeConfig, svc *RegisteredService) {
+	if a.HTTPMux == nil {
+		return
+	}
+	if table, ok := a.routes[cfg.ServiceRoot()]; ok {
+		table.set(cfg.CollectionID, &httpService{svc: svc, conn: a.HTTPMux.Conn()})
+	}
+}
+
+// unmountExtensionService removes the handler for one collection. The
+// root's dispatcher is deregistered once no collection is left. Must be
+// called with a.mu held.
+func (a *DynamicSchemaActivator) unmountExtensionService(root, collection string) {
+	table, ok := a.routes[root]
+	if !ok {
+		return
+	}
+	table.remove(collection)
+	if !table.empty() {
+		return
+	}
+	delete(a.routes, root)
+	if a.HTTPMux != nil {
+		a.HTTPMux.DeregisterByPrefix(root)
+	}
+}
+
+// unmountExtensionPrefix removes the handler registered under a
+// canonical collection prefix, /apis/{service}/{version}/{collection}.
+// Must be called with a.mu held.
+func (a *DynamicSchemaActivator) unmountExtensionPrefix(prefix string) {
+	root, collection, ok := splitCollectionPrefix(prefix)
+	if !ok {
+		return
+	}
+	a.unmountExtensionService(root, collection)
+}
+
+// splitCollectionPrefix splits /apis/{service}/{version}/{collection}
+// into its service root and collection.
+func splitCollectionPrefix(prefix string) (root, collection string, ok bool) {
+	i := strings.LastIndex(prefix, "/")
+	if i <= 0 || i == len(prefix)-1 {
+		return "", "", false
+	}
+	return prefix[:i], prefix[i+1:], true
 }
 
 func (a *DynamicSchemaActivator) platformAPIVersion() string {
@@ -412,13 +508,13 @@ func (a *DynamicSchemaActivator) acquirePlatform(schema domain.ExtensionResource
 	}
 	if a.FileRegistry != nil {
 		if err := a.FileRegistry.Register(platSvc.Descriptors.File); err != nil {
-			a.deregisterExtensionTransport(transport.GRPCServiceName, transport.HTTPPrefix, transport.DescriptorPath)
+			a.deregisterPlatformTransport(transport.GRPCServiceName, transport.HTTPPrefix, transport.DescriptorPath)
 			return fmt.Errorf("file descriptor: %w", err)
 		}
 	}
 
 	if _, err := a.Registry.AddPlatformOwner(key, ownerGRPC, transport); err != nil {
-		a.deregisterExtensionTransport(transport.GRPCServiceName, transport.HTTPPrefix, transport.DescriptorPath)
+		a.deregisterPlatformTransport(transport.GRPCServiceName, transport.HTTPPrefix, transport.DescriptorPath)
 		return err
 	}
 	return nil
@@ -430,7 +526,7 @@ func (a *DynamicSchemaActivator) acquirePlatform(schema domain.ExtensionResource
 func (a *DynamicSchemaActivator) releasePlatformOwner(key PlatformRegistrationKey, ownerGRPC string) {
 	dropped, last := a.Registry.RemovePlatformOwner(key, ownerGRPC)
 	if last {
-		a.deregisterExtensionTransport(dropped.GRPCServiceName, dropped.HTTPPrefix, dropped.DescriptorPath)
+		a.deregisterPlatformTransport(dropped.GRPCServiceName, dropped.HTTPPrefix, dropped.DescriptorPath)
 	}
 }
 
@@ -472,9 +568,7 @@ func (a *DynamicSchemaActivator) Deactivate(id application.SchemaActivationID) {
 	}
 
 	a.GRPCMux.Deregister(ver.GRPCServiceName)
-	if a.HTTPMux != nil {
-		a.HTTPMux.DeregisterByPrefix(ver.HTTPPrefix)
-	}
+	a.unmountExtensionPrefix(ver.HTTPPrefix)
 	if a.FileRegistry != nil {
 		a.FileRegistry.Deregister(ver.DescriptorPath)
 	}

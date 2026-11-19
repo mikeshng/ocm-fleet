@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,11 +16,35 @@ type DeploymentService struct {
 	DeleteWF      domain.DeleteDeploymentWorkflow
 	ResumeWF      domain.ResumeDeploymentWorkflow
 	ProvenanceSvc *domain.ProvenanceService
+	// TargetAdvisors are asked, in order, to explain a target name a
+	// placement uses that is not a registered target. Optional.
+	TargetAdvisors []PlacementTargetAdvisor
+}
+
+// PlacementTargetAdvisor explains a name that a caller used as a target
+// but that is not one. An integration that knows of clusters which are
+// not targets (for example clusters it only observes) implements it,
+// so that the refusal says what the name is and what to do about it.
+type PlacementTargetAdvisor interface {
+	// ExplainUnknownTarget returns a sentence for the caller, or ""
+	// when it knows nothing about the name.
+	ExplainUnknownTarget(ctx context.Context, id domain.TargetID) string
 }
 
 // Create starts the durable create-deployment workflow, which persists
-// the deployment and launches orchestration as a child workflow.
+// the deployment and launches orchestration as a child workflow. A name
+// that is already stored is the caller's duplicate and is refused with
+// [domain.ErrAlreadyExists]; the workflow's persistence is replay safe,
+// so an activity retry after a restart reports the stored deployment
+// instead of failing.
 func (s *DeploymentService) Create(ctx context.Context, in domain.CreateDeploymentInput) (domain.DeploymentView, error) {
+	if err := s.rejectDuplicate(ctx, in.Name); err != nil {
+		return domain.DeploymentView{}, err
+	}
+	if err := s.checkStaticPlacement(ctx, in.PlacementStrategy); err != nil {
+		return domain.DeploymentView{}, err
+	}
+
 	ac := AuthFromContext(ctx)
 	if ac != nil && ac.Subject != nil {
 		in.Auth = domain.DeliveryAuth{
@@ -69,6 +94,67 @@ func (s *DeploymentService) Create(ctx context.Context, in domain.CreateDeployme
 	return view, nil
 }
 
+// rejectDuplicate refuses a create whose name is already stored. The
+// persist activity treats an existing deployment as its own replay and
+// returns it as a success, so without this check a second caller's
+// create would succeed instead of reporting [domain.ErrAlreadyExists].
+func (s *DeploymentService) rejectDuplicate(ctx context.Context, name domain.ResourceName) error {
+	tx, err := s.Store.BeginReadOnly(ctx)
+	if err != nil {
+		return fmt.Errorf("begin read tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	if _, err := tx.Deployments().Get(ctx, name); err == nil {
+		return fmt.Errorf("%w: deployment %q", domain.ErrAlreadyExists, name)
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return fmt.Errorf("look up deployment %q: %w", name, err)
+	}
+	return tx.Commit()
+}
+
+// checkStaticPlacement refuses a deployment whose static placement
+// names a target that is not registered or that takes no deployments.
+// Orchestration would otherwise retry such a placement without end and
+// without a reason the caller can read. Placements by selector are not
+// checked: matching nothing yet is a valid state for them.
+func (s *DeploymentService) checkStaticPlacement(ctx context.Context, spec domain.PlacementStrategySpec) error {
+	if spec.Type != domain.PlacementStrategyStatic || len(spec.Targets) == 0 {
+		return nil
+	}
+	tx, err := s.Store.BeginReadOnly(ctx)
+	if err != nil {
+		return fmt.Errorf("begin read tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+	targets, err := tx.Targets().List(ctx)
+	if err != nil {
+		return fmt.Errorf("list targets: %w", err)
+	}
+	states := make(map[domain.TargetID]domain.TargetState, len(targets))
+	for _, t := range targets {
+		states[t.ID()] = t.State()
+	}
+	for _, id := range spec.Targets {
+		state, ok := states[id]
+		if !ok {
+			msg := fmt.Sprintf("placement names target %q, which is not a registered target", id)
+			for _, advisor := range s.TargetAdvisors {
+				if hint := advisor.ExplainUnknownTarget(ctx, id); hint != "" {
+					msg += ": " + hint
+					break
+				}
+			}
+			return fmt.Errorf("%w: %s", domain.ErrInvalidArgument, msg)
+		}
+		if state != domain.TargetStateReady && state != "" {
+			return fmt.Errorf("%w: placement names target %q, which is in state %q and takes no deployments",
+				domain.ErrInvalidArgument, id, state)
+		}
+	}
+	return nil
+}
+
 // Get retrieves a deployment by resource name.
 func (s *DeploymentService) Get(ctx context.Context, name domain.ResourceName) (domain.DeploymentView, error) {
 	tx, err := s.Store.BeginReadOnly(ctx)
@@ -97,6 +183,24 @@ func (s *DeploymentService) List(ctx context.Context) ([]domain.DeploymentView, 
 		return nil, err
 	}
 	return views, tx.Commit()
+}
+
+// ListPage returns one page of deployments, ordered by name, starting
+// strictly after after, plus whether more follow. The repository applies
+// the name predicate and the limit in storage, so a paged read of a large
+// fleet does not load every deployment for every page.
+func (s *DeploymentService) ListPage(ctx context.Context, after domain.ResourceName, limit int) (domain.DeploymentViewPage, error) {
+	tx, err := s.Store.BeginReadOnly(ctx)
+	if err != nil {
+		return domain.DeploymentViewPage{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.RollbackOnExit()
+
+	page, err := tx.Deployments().ListViewPage(ctx, after, limit)
+	if err != nil {
+		return domain.DeploymentViewPage{}, err
+	}
+	return page, tx.Commit()
 }
 
 // ResumeInput carries the optional re-signing parameters for resuming
@@ -194,12 +298,24 @@ func (s *DeploymentService) Delete(ctx context.Context, name domain.ResourceName
 	if err != nil {
 		return domain.DeploymentView{}, err
 	}
+
+	// The idempotent path returns the current view, including its
+	// deliveries, so the response matches a read of the same resource.
+	idempotent := fulfillment.State() == domain.FulfillmentStateDeleting && !fulfillment.Paused()
+	var deliveries []domain.Delivery
+	if idempotent {
+		deliveries, err = tx.Deliveries().ListByFulfillment(ctx, dep.FulfillmentID())
+		if err != nil {
+			return domain.DeploymentView{}, fmt.Errorf("list deliveries: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return domain.DeploymentView{}, fmt.Errorf("commit read tx: %w", err)
 	}
 
-	if fulfillment.State() == domain.FulfillmentStateDeleting && !fulfillment.Paused() {
-		return domain.DeploymentView{Deployment: dep, Fulfillment: *fulfillment}, nil
+	if idempotent {
+		return domain.DeploymentView{Deployment: dep, Fulfillment: *fulfillment, Deliveries: deliveries}, nil
 	}
 
 	exec, err := s.DeleteWF.Start(ctx, domain.DeleteDeploymentInput{

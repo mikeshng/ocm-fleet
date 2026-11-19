@@ -7,11 +7,7 @@ import {
   Title,
 } from "@patternfly/react-core";
 
-import {
-  type ClusterRow,
-  isFailureState,
-  isHealthyState,
-} from "./clusterTypes";
+import { type ClusterRow, clusterRowStatus } from "./clusterTypes";
 
 interface SummaryCard {
   label: string;
@@ -20,12 +16,9 @@ interface SummaryCard {
 }
 
 function buildSummary(rows: ClusterRow[]): SummaryCard[] {
-  const healthy = rows.filter((r) =>
-    isHealthyState(r.result.resource.state),
-  ).length;
-  const needsAttention = rows.filter((r) =>
-    isFailureState(r.result.resource.state),
-  ).length;
+  const statuses = rows.map(clusterRowStatus);
+  const healthy = statuses.filter((s) => s.healthy).length;
+  const needsAttention = statuses.filter((s) => s.attention).length;
 
   return [
     { label: "Total Clusters", value: rows.length },

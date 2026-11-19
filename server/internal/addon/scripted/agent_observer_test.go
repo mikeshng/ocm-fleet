@@ -6,7 +6,9 @@ import (
 	"errors"
 	"testing"
 	"testing/synctest"
+	"time"
 
+	"github.com/stolostron/ocm-fleet/server/internal/addon/kubernetes"
 	"github.com/stolostron/ocm-fleet/server/internal/addon/scripted"
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 )
@@ -34,6 +36,10 @@ func TestAgent_ObserverContextAndReportError(t *testing.T) {
 				if err := dispatch(t.Context(), scriptedTarget(), "first", manifests, domain.DeliveryAuth{}, nil, 1); err != nil {
 					t.Fatalf("dispatch: %v", err)
 				}
+				// A terminal report is retried under a bounded envelope;
+				// let the bubble's clock pass the deadline before the
+				// attempt probe can observe its end.
+				time.Sleep(kubernetes.ReportResultRetryDeadline + time.Second)
 				probe.waitEnded(t)
 				if len(probe.errors) != 1 || !errors.Is(probe.errors[0], reportErr) {
 					t.Fatalf("probe errors = %v, want result reporting error", probe.errors)

@@ -36,10 +36,6 @@ type FulfillmentObserver interface {
 	// PersistReconciliationStarted is called at the start of the
 	// persist-and-complete-reconciliation activity.
 	PersistReconciliationStarted(ctx context.Context, fulfillmentID FulfillmentID) (context.Context, PersistReconciliationProbe)
-
-	// ProcessOutputsStarted is called at the start of the
-	// process-delivery-outputs activity.
-	ProcessOutputsStarted(ctx context.Context) (context.Context, ProcessOutputsProbe)
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +73,12 @@ type FulfillmentRunProbe interface {
 	// RetryDelayStarted is called when the workflow begins a durable
 	// sleep before restarting via ContinueAsNew.
 	RetryDelayStarted(delay time.Duration)
+
+	// RetryDelayInterrupted is called when a generation check during the
+	// retry backoff finds that a mutation advanced the fulfillment
+	// generation. The remaining delay is abandoned so the restart
+	// reconciles the new generation.
+	RetryDelayInterrupted(startGen, currentGen Generation)
 
 	// ContinueAsNewTriggered is called when the workflow returns a
 	// [ContinueAsNew] error to restart with a fresh history.
@@ -167,21 +169,31 @@ type DeliverProbe interface {
 	// NewDelivery is called when a brand-new delivery record is created.
 	NewDelivery()
 
-	// Redispatched is called when an existing delivery is redispatched
-	// at an advanced generation.
+	// Redispatched is called when an existing delivery starts a new put
+	// cycle: at an advanced generation, or at the same generation when
+	// the record was a removal and the target re-entered placement.
 	Redispatched(previousGen Generation)
 
 	// Retried is called when an existing same-generation delivery is
 	// retried (still Pending from a previous failed dispatch).
 	Retried()
 
-	// ResetForRetry is called when a terminal delivery at the same
-	// generation is reset to Pending for re-dispatch.
+	// ResetForRetry is called when a failed delivery is reset to Pending
+	// for re-dispatch.
 	ResetForRetry(previousState DeliveryState)
 
 	// SkippedAlreadyAcked is called when the delivery has already
 	// progressed past Pending, so no re-dispatch is needed.
 	SkippedAlreadyAcked()
+
+	// SkippedTerminal is called when the delivery is terminal for the
+	// current cycle (delivered or partial), so it is not re-dispatched.
+	SkippedTerminal(state DeliveryState)
+
+	// SkippedStale is called when the delivery record belongs to a
+	// newer generation than the dispatch cycle, so the target is
+	// skipped and left to the next reconciliation.
+	SkippedStale(recordGen Generation)
 
 	// Error is called when the activity encounters an error.
 	Error(err error)
@@ -207,6 +219,11 @@ type RemoveProbe interface {
 	// re-dispatch is needed.
 	AlreadyPending()
 
+	// SkippedTerminal is called when the delivery already finished its
+	// removal at the current generation (delivered, partial, or
+	// auth-failed), so it is not re-dispatched.
+	SkippedTerminal(state DeliveryState)
+
 	// Error is called when the activity encounters an error.
 	Error(err error)
 
@@ -226,28 +243,6 @@ type PersistReconciliationProbe interface {
 	// DeleteCleanupSignaled is called after the delete cleanup signal
 	// is sent for a DELETING fulfillment.
 	DeleteCleanupSignaled()
-
-	// Error is called when the activity encounters an error.
-	Error(err error)
-
-	// End signals the activity is complete. Called via defer.
-	End()
-}
-
-// ProcessOutputsProbe tracks the process-delivery-outputs activity.
-// Observes secret storage, target registration, and skip decisions.
-type ProcessOutputsProbe interface {
-	// SecretsStored is called after produced secrets are stored in
-	// the vault.
-	SecretsStored(count int)
-
-	// TargetsRegistered is called after provisioned targets are
-	// upserted into inventory and the target store.
-	TargetsRegistered(count int)
-
-	// Skipped is called when the delivery result has no outputs to
-	// process.
-	Skipped()
 
 	// Error is called when the activity encounters an error.
 	Error(err error)
@@ -283,10 +278,6 @@ func (NoOpFulfillmentObserver) PersistReconciliationStarted(ctx context.Context,
 	return ctx, NoOpPersistReconciliationProbe{}
 }
 
-func (NoOpFulfillmentObserver) ProcessOutputsStarted(ctx context.Context) (context.Context, ProcessOutputsProbe) {
-	return ctx, NoOpProcessOutputsProbe{}
-}
-
 // NoOpFulfillmentRunProbe is a [FulfillmentRunProbe] that discards all events.
 type NoOpFulfillmentRunProbe struct{}
 
@@ -298,6 +289,7 @@ func (NoOpFulfillmentRunProbe) RolloutStepStarted(int, int, bool)               
 func (NoOpFulfillmentRunProbe) GenerationAdvancedMidRollout(Generation, Generation) {}
 func (NoOpFulfillmentRunProbe) ReconciliationRestarting(Generation)                 {}
 func (NoOpFulfillmentRunProbe) RetryDelayStarted(time.Duration)                     {}
+func (NoOpFulfillmentRunProbe) RetryDelayInterrupted(Generation, Generation)        {}
 func (NoOpFulfillmentRunProbe) ContinueAsNewTriggered()                             {}
 func (NoOpFulfillmentRunProbe) DeleteStarted(int)                                   {}
 func (NoOpFulfillmentRunProbe) ManifestsFiltered(TargetInfo, int, int)              {}
@@ -328,22 +320,25 @@ func (NoOpAcquireLockProbe) End()                  {}
 // NoOpDeliverProbe is a [DeliverProbe] that discards all events.
 type NoOpDeliverProbe struct{}
 
-func (NoOpDeliverProbe) NewDelivery()                {}
-func (NoOpDeliverProbe) Redispatched(Generation)     {}
-func (NoOpDeliverProbe) Retried()                    {}
-func (NoOpDeliverProbe) ResetForRetry(DeliveryState) {}
-func (NoOpDeliverProbe) SkippedAlreadyAcked()        {}
-func (NoOpDeliverProbe) Error(error)                 {}
-func (NoOpDeliverProbe) End()                        {}
+func (NoOpDeliverProbe) NewDelivery()                  {}
+func (NoOpDeliverProbe) Redispatched(Generation)       {}
+func (NoOpDeliverProbe) Retried()                      {}
+func (NoOpDeliverProbe) ResetForRetry(DeliveryState)   {}
+func (NoOpDeliverProbe) SkippedAlreadyAcked()          {}
+func (NoOpDeliverProbe) SkippedTerminal(DeliveryState) {}
+func (NoOpDeliverProbe) SkippedStale(Generation)       {}
+func (NoOpDeliverProbe) Error(error)                   {}
+func (NoOpDeliverProbe) End()                          {}
 
 // NoOpRemoveProbe is a [RemoveProbe] that discards all events.
 type NoOpRemoveProbe struct{}
 
-func (NoOpRemoveProbe) TargetNotFound() {}
-func (NoOpRemoveProbe) Withdrawn()      {}
-func (NoOpRemoveProbe) AlreadyPending() {}
-func (NoOpRemoveProbe) Error(error)     {}
-func (NoOpRemoveProbe) End()            {}
+func (NoOpRemoveProbe) TargetNotFound()               {}
+func (NoOpRemoveProbe) Withdrawn()                    {}
+func (NoOpRemoveProbe) AlreadyPending()               {}
+func (NoOpRemoveProbe) SkippedTerminal(DeliveryState) {}
+func (NoOpRemoveProbe) Error(error)                   {}
+func (NoOpRemoveProbe) End()                          {}
 
 // NoOpPersistReconciliationProbe is a [PersistReconciliationProbe] that
 // discards all events.
@@ -353,13 +348,3 @@ func (NoOpPersistReconciliationProbe) Persisted(FulfillmentState, bool) {}
 func (NoOpPersistReconciliationProbe) DeleteCleanupSignaled()           {}
 func (NoOpPersistReconciliationProbe) Error(error)                      {}
 func (NoOpPersistReconciliationProbe) End()                             {}
-
-// NoOpProcessOutputsProbe is a [ProcessOutputsProbe] that discards
-// all events.
-type NoOpProcessOutputsProbe struct{}
-
-func (NoOpProcessOutputsProbe) SecretsStored(int)     {}
-func (NoOpProcessOutputsProbe) TargetsRegistered(int) {}
-func (NoOpProcessOutputsProbe) Skipped()              {}
-func (NoOpProcessOutputsProbe) Error(error)           {}
-func (NoOpProcessOutputsProbe) End()                  {}

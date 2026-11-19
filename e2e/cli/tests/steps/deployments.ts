@@ -26,6 +26,15 @@ export interface DeploymentView {
   state: string;
 }
 
+interface DeploymentDeliveryView {
+  targetStatuses?: {
+    targetId?: string;
+    state?: string;
+    attempts?: number;
+    message?: string;
+  }[];
+}
+
 function deploymentName(id: string): string {
   return id.startsWith("deployments/") ? id : `deployments/${id}`;
 }
@@ -102,6 +111,45 @@ export class DeploymentSteps {
 
   async waitUntilActive(id: string): Promise<void> {
     await this.#waitUntilActive(id, deploymentTerminalFailure);
+  }
+
+  async waitUntilDeliveryAttemptFails(
+    id: string,
+    targetId: string,
+    reasonFragment: string,
+  ): Promise<void> {
+    await expect
+      .poll(
+        async () => {
+          const result = await this.#client.succeed(["deployment", "get", id]);
+          const deployment = parseJSON<DeploymentDeliveryView>(result.stdout);
+          const status = (deployment.targetStatuses ?? []).find(
+            (item) => item.targetId === targetId,
+          );
+          return {
+            failed: (status?.attempts ?? 0) > 0,
+            message: status?.message ?? "",
+          };
+        },
+        { intervals: [POLL_INTERVAL_MS], timeout: WAIT_TIMEOUT_MS },
+      )
+      .toMatchObject({
+        failed: true,
+        message: expect.stringContaining(reasonFragment),
+      });
+  }
+
+  async listPage(pageSize: number): Promise<{
+    names: string[];
+    table: string;
+  }> {
+    const args = ["deployment", "list", "--page-size", String(pageSize)];
+    const table = await this.#client.succeed(args, { output: "component" });
+    const json = await this.#client.succeed(args);
+    return {
+      names: parseDeploymentList(json.stdout).map(({ name }) => name),
+      table: table.stdout,
+    };
   }
 
   async waitUntilPausedForDeliveryAuth(id: string): Promise<void> {

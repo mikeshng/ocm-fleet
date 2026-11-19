@@ -1,3 +1,4 @@
+import { extractClusterId, PluginLink } from "@ocm-fleet/common";
 import {
   Alert,
   Bullseye,
@@ -32,12 +33,23 @@ import {
 } from "@patternfly/react-table";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { listDeployments } from "./api";
+import { listDeployments, listTargets, type MgmtTarget } from "./api";
+import {
+  deliveryColor,
+  deliveryStateLabel,
+  deploymentsByTarget,
+  isRemoval,
+  isRemovalCompleted,
+  type TargetDeployment,
+} from "./targetDeliveries";
 
-interface TargetInfo {
-  id: string;
-  type: string;
-  deployments: string[];
+interface TargetInfo extends MgmtTarget {
+  deployments: TargetDeployment[];
+}
+
+function stateColor(state: string): "green" | "orange" | "grey" {
+  if (state === "ready") return "green";
+  return state ? "orange" : "grey";
 }
 
 export default function TargetsPage() {
@@ -51,25 +63,17 @@ export default function TargetsPage() {
     setLoading(true);
     setError(null);
     try {
-      const resp = await listDeployments();
-      const deployments = resp.deployments ?? [];
+      const [targetsResp, deploymentsResp] = await Promise.all([
+        listTargets(),
+        listDeployments(),
+      ]);
 
-      const targetMap = new Map<string, string[]>();
-      targetMap.set("kind-local", []);
-
-      for (const dep of deployments) {
-        for (const tid of dep.resolvedTargetIds ?? []) {
-          const existing = targetMap.get(tid) ?? [];
-          existing.push(dep.name);
-          targetMap.set(tid, existing);
-        }
-      }
+      const byTarget = deploymentsByTarget(deploymentsResp.deployments ?? []);
 
       setTargets(
-        Array.from(targetMap.entries()).map(([id, deps]) => ({
-          id,
-          type: id.startsWith("kind") ? "kind" : "kubernetes",
-          deployments: deps,
+        (targetsResp.targets ?? []).map((t) => ({
+          ...t,
+          deployments: byTarget.get(t.id) ?? [],
         })),
       );
     } catch (err) {
@@ -116,13 +120,17 @@ export default function TargetsPage() {
           <Title headingLevel="h1">Targets</Title>
         </FlexItem>
         <FlexItem>
-          <span className="pf-v6-u-font-size-sm pf-v6-u-text-color-subtle">
-            {targets.length} registered
-          </span>
+          {/* A count is a reading, and a read that failed has none: while the list has never
+              been read, the page shows the error alone rather than "0 registered". */}
+          {(!error || targets.length > 0) && (
+            <span className="pf-v6-u-font-size-sm pf-v6-u-text-color-subtle">
+              {targets.length} registered
+            </span>
+          )}
         </FlexItem>
       </Flex>
 
-      {error && (
+      {error && targets.length > 0 && (
         <Alert
           variant="warning"
           title={error}
@@ -131,11 +139,18 @@ export default function TargetsPage() {
         />
       )}
 
-      {targets.length === 0 ? (
+      {error && targets.length === 0 ? (
+        <EmptyState titleText="The targets did not load" headingLevel="h2">
+          <EmptyStateBody>{error}</EmptyStateBody>
+          <Button variant="primary" onClick={fetchTargets}>
+            Retry
+          </Button>
+        </EmptyState>
+      ) : targets.length === 0 ? (
         <EmptyState titleText="No targets found" headingLevel="h2">
           <EmptyStateBody>
-            Targets are registered automatically when the management plane
-            starts.
+            Targets are registered when the management plane starts, when a
+            cluster is created, and when a cluster is enrolled.
           </EmptyStateBody>
           <Button variant="primary" onClick={fetchTargets}>
             Refresh
@@ -188,6 +203,8 @@ export default function TargetsPage() {
                   <Th screenReaderText="Row expansion" />
                   <Th>Target ID</Th>
                   <Th>Type</Th>
+                  <Th>State</Th>
+                  <Th>Cluster</Th>
                   <Th>Deployments</Th>
                 </Tr>
               </Thead>
@@ -209,12 +226,44 @@ export default function TargetsPage() {
                         {t.type}
                       </Label>
                     </Td>
+                    <Td dataLabel="State">
+                      <Label color={stateColor(t.state)} isCompact>
+                        {t.state || "unknown"}
+                      </Label>
+                    </Td>
+                    <Td dataLabel="Cluster">
+                      {t.cluster ? (
+                        <PluginLink
+                          scope="core-plugin"
+                          module="ClustersModule"
+                          to={extractClusterId(t.cluster)}
+                          fallback={extractClusterId(t.cluster)}
+                        >
+                          {extractClusterId(t.cluster)}
+                        </PluginLink>
+                      ) : (
+                        <span className="pf-v6-u-text-color-subtle">—</span>
+                      )}
+                    </Td>
                     <Td dataLabel="Deployments">
                       {t.deployments.length > 0 ? (
                         <LabelGroup>
                           {t.deployments.map((d) => (
-                            <Label key={d} color="green" isCompact>
-                              {d.replace("deployments/", "")}
+                            <Label
+                              key={d.name}
+                              color={deliveryColor(
+                                d.status?.state,
+                                d.status?.operation,
+                              )}
+                              isCompact
+                            >
+                              {d.name.replace("deployments/", "")}
+                              {(d.status?.state !== "STATE_DELIVERED" ||
+                                isRemoval(d.status)) &&
+                                ` · ${deliveryStateLabel(
+                                  d.status?.state,
+                                  d.status?.operation,
+                                )}`}
                             </Label>
                           ))}
                         </LabelGroup>
@@ -225,7 +274,7 @@ export default function TargetsPage() {
                   </Tr>
                   <Tr isExpanded={expandedId === t.id}>
                     <Td />
-                    <Td colSpan={3}>
+                    <Td colSpan={5}>
                       <ExpandableRowContent>
                         <DescriptionList isHorizontal isCompact>
                           <DescriptionListGroup>
@@ -237,14 +286,58 @@ export default function TargetsPage() {
                             </DescriptionListDescription>
                           </DescriptionListGroup>
                           <DescriptionListGroup>
+                            <DescriptionListTerm>Origin</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {t.origin}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          {t.accessForm && (
+                            <DescriptionListGroup>
+                              <DescriptionListTerm>
+                                Access form
+                              </DescriptionListTerm>
+                              <DescriptionListDescription>
+                                {t.accessForm}
+                              </DescriptionListDescription>
+                            </DescriptionListGroup>
+                          )}
+                          {t.deliveryCredential && (
+                            <DescriptionListGroup>
+                              <DescriptionListTerm>
+                                Stored credential delivers
+                              </DescriptionListTerm>
+                              <DescriptionListDescription>
+                                {t.deliveryCredential}
+                              </DescriptionListDescription>
+                            </DescriptionListGroup>
+                          )}
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>Labels</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {Object.keys(t.labels ?? {}).length > 0 ? (
+                                <LabelGroup numLabels={8}>
+                                  {Object.entries(t.labels).map(([k, v]) => (
+                                    <Label key={k} color="grey" isCompact>
+                                      {k}={v}
+                                    </Label>
+                                  ))}
+                                </LabelGroup>
+                              ) : (
+                                <span className="pf-v6-u-text-color-subtle">
+                                  None
+                                </span>
+                              )}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
                             <DescriptionListTerm>
                               Accepted Resource Types
                             </DescriptionListTerm>
                             <DescriptionListDescription>
                               <Label color="grey" isCompact>
-                                {t.id === "kind-local"
-                                  ? "api.kind.cluster"
-                                  : "kubernetes/*"}
+                                {(t.acceptedManifestTypes ?? []).length > 0
+                                  ? t.acceptedManifestTypes.join(", ")
+                                  : "any"}
                               </Label>
                             </DescriptionListDescription>
                           </DescriptionListGroup>
@@ -253,7 +346,61 @@ export default function TargetsPage() {
                               Active Deployments
                             </DescriptionListTerm>
                             <DescriptionListDescription>
-                              {t.deployments.length}
+                              {
+                                t.deployments.filter(
+                                  (d) => !isRemovalCompleted(d.status),
+                                ).length
+                              }
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>
+                              Delivery status
+                            </DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {t.deployments.length === 0 ? (
+                                <span className="pf-v6-u-text-color-subtle">
+                                  No deployments target this cluster
+                                </span>
+                              ) : (
+                                t.deployments.map((d) => (
+                                  <div
+                                    key={d.name}
+                                    className="pf-v6-u-mb-sm"
+                                    data-testid={`delivery-${d.name.replace(
+                                      "deployments/",
+                                      "",
+                                    )}`}
+                                  >
+                                    <span className="pf-v6-u-font-family-monospace">
+                                      {d.name.replace("deployments/", "")}
+                                    </span>{" "}
+                                    <Label
+                                      color={deliveryColor(
+                                        d.status?.state,
+                                        d.status?.operation,
+                                      )}
+                                      isCompact
+                                    >
+                                      {deliveryStateLabel(
+                                        d.status?.state,
+                                        d.status?.operation,
+                                      )}
+                                    </Label>
+                                    {(d.status?.attempts ?? 0) > 0 && (
+                                      <span className="pf-v6-u-ml-sm pf-v6-u-text-color-subtle">
+                                        {d.status?.attempts} failed attempt
+                                        {d.status?.attempts === 1 ? "" : "s"}
+                                      </span>
+                                    )}
+                                    {d.status?.message && (
+                                      <div className="pf-v6-u-text-color-subtle">
+                                        {d.status.message}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))
+                              )}
                             </DescriptionListDescription>
                           </DescriptionListGroup>
                         </DescriptionList>

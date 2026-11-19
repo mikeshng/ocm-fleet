@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,6 +224,97 @@ func TestCreateThenList(t *testing.T) {
 	if len(resp.GetDeployments()) != 2 {
 		t.Fatalf("got %d deployments, want 2", len(resp.GetDeployments()))
 	}
+	if got := resp.GetDeployments()[0].GetName(); got != "deployments/dep-a" {
+		t.Errorf("first name = %q, want deployments/dep-a (listed by name)", got)
+	}
+}
+
+func TestListDeploymentsPages(t *testing.T) {
+	client := setup(t)
+	ctx := context.Background()
+
+	raw, _ := json.Marshal(map[string]string{"k": "v"})
+	for _, id := range []string{"dep-a", "dep-b", "dep-c"} {
+		_, err := client.CreateDeployment(ctx, &pb.CreateDeploymentRequest{
+			DeploymentId: id,
+			Deployment: &pb.Deployment{
+				ManifestStrategy: &pb.ManifestStrategy{
+					Type:      pb.ManifestStrategy_TYPE_INLINE,
+					Manifests: []*pb.Manifest{{ManifestType: "t", Raw: raw}},
+				},
+				PlacementStrategy: &pb.PlacementStrategy{
+					Type:      pb.PlacementStrategy_TYPE_STATIC,
+					TargetIds: []string{"t1"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateDeployment(%s): %v", id, err)
+		}
+	}
+
+	var names []string
+	token := ""
+	for page := 0; ; page++ {
+		if page > 3 {
+			t.Fatal("paging did not terminate")
+		}
+		resp, err := client.ListDeployments(ctx, &pb.ListDeploymentsRequest{
+			PageSize:  1,
+			PageToken: token,
+		})
+		if err != nil {
+			t.Fatalf("ListDeployments(page %d): %v", page, err)
+		}
+		if len(resp.GetDeployments()) != 1 {
+			t.Fatalf("page %d returned %d deployments, want 1", page, len(resp.GetDeployments()))
+		}
+		names = append(names, resp.GetDeployments()[0].GetName())
+		token = resp.GetNextPageToken()
+		if token == "" {
+			break
+		}
+	}
+	want := []string{"deployments/dep-a", "deployments/dep-b", "deployments/dep-c"}
+	if len(names) != len(want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("names = %v, want %v", names, want)
+		}
+	}
+
+	// A page size above the maximum still returns the whole set here,
+	// and the last page carries no token.
+	all, err := client.ListDeployments(ctx, &pb.ListDeploymentsRequest{PageSize: 1000})
+	if err != nil {
+		t.Fatalf("ListDeployments(oversized): %v", err)
+	}
+	if len(all.GetDeployments()) != 3 || all.GetNextPageToken() != "" {
+		t.Errorf("oversized page = %d deployments, token %q; want 3, empty", len(all.GetDeployments()), all.GetNextPageToken())
+	}
+
+	// A page size of zero means the default, not an empty page.
+	def, err := client.ListDeployments(ctx, &pb.ListDeploymentsRequest{PageSize: 0})
+	if err != nil {
+		t.Fatalf("ListDeployments(default): %v", err)
+	}
+	if len(def.GetDeployments()) != 3 {
+		t.Errorf("default page = %d deployments, want 3", len(def.GetDeployments()))
+	}
+
+	// A negative page size is invalid, not a request for the default.
+	_, err = client.ListDeployments(ctx, &pb.ListDeploymentsRequest{PageSize: -1})
+	if s, ok := status.FromError(err); !ok || s.Code() != codes.InvalidArgument {
+		t.Errorf("negative page size error = %v, want InvalidArgument", err)
+	}
+
+	// A token this server did not issue is rejected.
+	_, err = client.ListDeployments(ctx, &pb.ListDeploymentsRequest{PageToken: "not-a-token!"})
+	if s, ok := status.FromError(err); !ok || s.Code() != codes.InvalidArgument {
+		t.Errorf("invalid token error = %v, want InvalidArgument", err)
+	}
 }
 
 func TestGetNotFound(t *testing.T) {
@@ -364,5 +456,74 @@ func TestDeleteNotFound(t *testing.T) {
 	}
 	if s, ok := status.FromError(err); !ok || s.Code() != codes.NotFound {
 		t.Errorf("code = %v, want NotFound", status.Code(err))
+	}
+}
+
+func TestCreateDeploymentInvalidID(t *testing.T) {
+	client := setup(t)
+	ctx := context.Background()
+	deployment := func() *pb.Deployment {
+		raw, _ := json.Marshal(map[string]string{"k": "v"})
+		return &pb.Deployment{
+			ManifestStrategy: &pb.ManifestStrategy{
+				Type:      pb.ManifestStrategy_TYPE_INLINE,
+				Manifests: []*pb.Manifest{{ManifestType: "test.resource", Raw: raw}},
+			},
+			PlacementStrategy: &pb.PlacementStrategy{Type: pb.PlacementStrategy_TYPE_ALL},
+		}
+	}
+	for name, id := range map[string]string{
+		"dots":          "..",
+		"uppercase":     "Dep-1",
+		"space":         "dep 1",
+		"leading dash":  "-dep",
+		"64 characters": strings.Repeat("d", 64),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := client.CreateDeployment(ctx, &pb.CreateDeploymentRequest{DeploymentId: id, Deployment: deployment()})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("CreateDeployment id %q = %v, want InvalidArgument", id, err)
+			}
+		})
+	}
+}
+
+func TestCreateDeploymentInvalidSelectorLabels(t *testing.T) {
+	client := setup(t)
+	ctx := context.Background()
+	raw, _ := json.Marshal(map[string]string{"k": "v"})
+	deployment := func(matchLabels map[string]string) *pb.Deployment {
+		return &pb.Deployment{
+			ManifestStrategy: &pb.ManifestStrategy{
+				Type:      pb.ManifestStrategy_TYPE_INLINE,
+				Manifests: []*pb.Manifest{{ManifestType: "test.resource", Raw: raw}},
+			},
+			PlacementStrategy: &pb.PlacementStrategy{
+				Type:           pb.PlacementStrategy_TYPE_SELECTOR,
+				TargetSelector: &pb.TargetSelector{MatchLabels: matchLabels},
+			},
+		}
+	}
+	for name, matchLabels := range map[string]map[string]string{
+		"three parts":    {"a/b/c": "v"},
+		"empty name":     {"example.com/": "v"},
+		"space in value": {"app": "has space"},
+		"value too long": {"app": strings.Repeat("v", 64)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := client.CreateDeployment(ctx, &pb.CreateDeploymentRequest{
+				DeploymentId: "dep-labels-" + strings.ReplaceAll(name, " ", "-"),
+				Deployment:   deployment(matchLabels),
+			})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("CreateDeployment selector %v = %v, want InvalidArgument", matchLabels, err)
+			}
+		})
+	}
+	if _, err := client.CreateDeployment(ctx, &pb.CreateDeploymentRequest{
+		DeploymentId: "dep-labels-ok",
+		Deployment:   deployment(map[string]string{"app.kubernetes.io/name": "web", "env": "prod"}),
+	}); err != nil {
+		t.Fatalf("a valid selector = %v", err)
 	}
 }

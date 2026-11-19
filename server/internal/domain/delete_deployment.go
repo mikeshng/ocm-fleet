@@ -69,6 +69,14 @@ func (s *DeleteDeploymentWorkflowSpec) MutateToDeleting() Activity[DeleteDeploym
 			return deploymentMutationResult{}, err
 		}
 
+		// Deliveries are part of the returned view (and its etag), so the
+		// response snapshot matches what a subsequent read reports.
+		deliveries, err := tx.Deliveries().ListByFulfillment(ctx, dep.FulfillmentID())
+		if err != nil {
+			probe.Error(err)
+			return deploymentMutationResult{}, fmt.Errorf("list deliveries: %w", err)
+		}
+
 		f.TransitionToDeleting(in.Auth)
 		if err := tx.Fulfillments().Update(ctx, f); err != nil {
 			probe.Error(err)
@@ -79,7 +87,7 @@ func (s *DeleteDeploymentWorkflowSpec) MutateToDeleting() Activity[DeleteDeploym
 			return deploymentMutationResult{}, fmt.Errorf("commit: %w", err)
 		}
 		return deploymentMutationResult{
-			View:          DeploymentView{Deployment: dep, Fulfillment: *f},
+			View:          DeploymentView{Deployment: dep, Fulfillment: *f, Deliveries: deliveries},
 			FulfillmentID: dep.FulfillmentID(),
 			MyGen:         f.Generation(),
 		}, nil

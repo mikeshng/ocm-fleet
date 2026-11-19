@@ -34,6 +34,7 @@ type Tx interface {
 	Fulfillments() FulfillmentRepository
 	Deployments() DeploymentRepository
 	Deliveries() DeliveryRepository
+	DeliveryCompletions() DeliveryCompletionRepository
 	Inventory() InventoryRepository
 	ExtensionResources() ExtensionResourceRepository
 	SignerEnrollments() SignerEnrollmentRepository

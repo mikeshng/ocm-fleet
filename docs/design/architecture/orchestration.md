@@ -127,6 +127,22 @@ Placement and manifest strategies can become stale. Re-evaluation happens in two
 
 In both cases, a generation advance triggers a new reconciliation pass through the pipeline.
 
+### Target fleet changes
+
+A third cause leaves the fulfillment itself unchanged: the target fleet moves under it. A target is registered or removed, its labels change, or its state changes. The platform compares the placement each converged deployment holds with what its strategy resolves against the fleet now, and starts a reconciliation pass for the ones that differ. The comparison runs when an addon reports a fleet change and again on an interval, so a change nobody reported is followed too. It reads stored state only: running it twice does nothing the second time, and a pass that could not start because the previous one was still finishing is started by a later comparison. Each run reads every deployment and every target, a cost that grows with the fleet and is not tuned for large ones.
+
+The generation does not advance. The pass delivers to the targets that joined and removes from the ones the strategy no longer selects. A target whose delivery is complete at the current generation gets nothing dispatched again, signed intent stays valid for the generation it was signed for, and a stored caller credential is used only for the targets that moved.
+
+### Target states in placement
+
+Readiness decides which targets take new work. It does not decide which targets lose the work they hold.
+
+- A **ready** target can be selected by any fulfillment.
+- A target that is **not ready** is selected by nothing new. A fulfillment that already holds it keeps it, whatever its strategy resolves, until the target is ready again. No removal is planned for a target that may be out of reach, and a static placement that names it still resolves.
+- A **terminated** target is leaving the fleet. It is selected by nothing, and nothing is dispatched to it: neither a delivery nor the removal of what it holds. A target that is no longer registered is treated the same way, in a pass and in a deletion.
+
+A static placement that names a target outside this view does not resolve. Resolution depends only on the strategy and the targets it is given, so the pass ends at once instead of repeating it. The orchestration then waits, reloads the targets, and resolves again, which picks up a target that is registered later.
+
 ### Downstream effects by axis
 
 - **Placement changes.** The platform re-runs `Resolve`, computes a new delta, removes departed targets, and feeds the new delta through rollout.

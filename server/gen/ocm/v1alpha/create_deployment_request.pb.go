@@ -30,8 +30,8 @@ type CreateDeploymentRequest struct {
 	// The ID to use for the deployment, which becomes the final component
 	// of the deployment's resource name.
 	//
-	// This value should be 4-63 characters, and valid characters
-	// are /[a-z][0-9]-/.
+	// This value should be 1-63 characters, and must match the regular
+	// expression /[a-z0-9]([-a-z0-9]*[a-z0-9])?/.
 	DeploymentId string `protobuf:"bytes,1,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
 	// The deployment to create.
 	Deployment *Deployment `protobuf:"bytes,2,opt,name=deployment,proto3" json:"deployment,omitempty"`

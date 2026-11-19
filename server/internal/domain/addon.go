@@ -164,6 +164,13 @@ type ExtensionResourceSchema struct {
 type ManagementSchema struct {
 	SpecMessage protoreflect.FullName
 	Relation    FulfillmentRelation
+
+	// ValidateID checks a create request's resource id before the
+	// platform persists the resource. An addon whose provider cannot
+	// accept every id the generic name rules allow sets it, so a refused
+	// id is refused at create instead of failing later at delivery. Nil
+	// means the generic name rules alone apply.
+	ValidateID func(id string) error
 }
 
 // InventorySchema is a capability marker for inventory-reportable

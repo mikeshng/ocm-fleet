@@ -1,6 +1,8 @@
 import { createResourceApi, type ResourceResult } from "@ocm-fleet/common";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { withNetworkRetry } from "./networkRetry";
+
 export interface K8sObservationMetadata {
   uid: string;
   namespace: string;
@@ -73,18 +75,25 @@ export function useClusterResources(
         parts.push(`resource.observation.kind == "${kind}"`);
       }
       const filter = parts.join(" && ");
-      const all: ResourceResult<K8sObjectResource>[] = [];
-      let pageToken: string | undefined;
-      do {
-        const response = await k8sApi.search({
-          filter,
-          pageSize: 200,
-          pageToken,
-        });
-        if (id !== requestIdRef.current) return;
-        all.push(...response.resources);
-        pageToken = response.nextPageToken || undefined;
-      } while (pageToken);
+      const read = async (): Promise<
+        ResourceResult<K8sObjectResource>[] | null
+      > => {
+        const all: ResourceResult<K8sObjectResource>[] = [];
+        let pageToken: string | undefined;
+        do {
+          const response = await k8sApi.search({
+            filter,
+            pageSize: 200,
+            pageToken,
+          });
+          if (id !== requestIdRef.current) return null;
+          all.push(...response.resources);
+          pageToken = response.nextPageToken || undefined;
+        } while (pageToken);
+        return all;
+      };
+      const all = await withNetworkRetry(read);
+      if (all === null || id !== requestIdRef.current) return;
       setResources(all);
     } catch (e) {
       if (id !== requestIdRef.current) return;
@@ -101,8 +110,25 @@ export function useClusterResources(
   return { resources, loading, error, refetch: fetch };
 }
 
+/**
+ * What a cluster resource tab says when its table is empty: whether
+ * nothing is indexed at all, or the current filters excluded everything.
+ */
+export function resourceEmptyMessage(
+  indexed: number,
+  clusterId: string | undefined,
+  plural: string,
+): string {
+  if (indexed === 0) {
+    return clusterId
+      ? `No ${plural} are currently indexed for this cluster.`
+      : `No ${plural} are currently indexed on any cluster.`;
+  }
+  return `No ${plural} match the current filter criteria.`;
+}
+
 const CANONICAL_RE =
-  /\/\/kubernetes\.ocm-fleet\.io\/clusters\/([^/]+)\/apiResources\/[^/]+\/objects\/[^/]+/;
+  /\/\/kubernetes\.open-cluster-management\.io\/clusters\/([^/]+)\/(?:namespaces\/[^/]+\/)?apiResources\/[^/]+\/objects\/[^/]+/;
 
 export function extractClusterId(resourceName: string): string {
   const m = CANONICAL_RE.exec(resourceName);

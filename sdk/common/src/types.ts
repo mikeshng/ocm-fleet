@@ -22,6 +22,10 @@ export interface ClusterProviderCardProps {
 
 export interface ClusterProviderWizardProps {
   onClose?: () => void;
+  /** Called once a cluster exists, before the wizard closes itself. */
+  onCreated?: () => void;
+  /** Reports a create in flight so the host can keep the wizard open. */
+  onBusyChange?: (busy: boolean) => void;
   onSetupNext?: () => void;
   onSetupSkip?: () => void;
 }
@@ -38,6 +42,8 @@ export interface OnboardingActionFormProps {
 
 export interface ClusterDetailTabProps {
   clusterId: string | undefined;
+  /** Id of the hub the page shows for the cluster, when a hub reports it. */
+  hub?: string;
 }
 
 export interface SearchEntry {

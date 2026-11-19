@@ -34,6 +34,10 @@ function isCodeRef(value: unknown): value is EncodedCodeRef {
 
 const CODEREF_PATTERN = /^[A-Za-z_]\w*\.[A-Za-z_]\w*$/;
 
+// A resource type as the API names it: a DNS-subdomain group and a Kind.
+const RESOURCE_TYPE_PATTERN =
+  /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\/[A-Za-z][A-Za-z0-9]*$/;
+
 export function validateCodeRef(
   ref: unknown,
   field: string,
@@ -154,6 +158,20 @@ export function validateClusterProviderProperties(
   return errors;
 }
 
+function validateResourceType(
+  value: unknown,
+  field: string,
+  context: string,
+): string[] {
+  if (value === undefined) return [];
+  if (typeof value !== "string" || !RESOURCE_TYPE_PATTERN.test(value)) {
+    return [
+      `${context}: "${field}" must be a resource type such as "group/Kind" (got ${JSON.stringify(value)})`,
+    ];
+  }
+  return [];
+}
+
 export function validateOnboardingActionProperties(
   props: OnboardingActionProperties,
 ): string[] {
@@ -163,6 +181,11 @@ export function validateOnboardingActionProperties(
     ...validateCodeRef(props.icon, "icon", ctx),
     ...validateCodeRef(props.card, "card", ctx),
     ...validateCodeRef(props.form, "form", ctx),
+    ...validateResourceType(
+      props.completeWhenResourceExists,
+      "completeWhenResourceExists",
+      ctx,
+    ),
   ];
 }
 

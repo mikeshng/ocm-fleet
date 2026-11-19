@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stolostron/ocm-fleet/server/internal/addon/kubernetes"
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 )
 
@@ -294,6 +295,13 @@ func (a *Agent) runAckAndCompletion(
 	}
 	defer probe.End()
 
+	// Reports must name the cycle they belong to: the platform discards
+	// results whose operation does not match the delivery record.
+	op := domain.DeliveryOperationDeliver
+	if operation == OperationRemove {
+		op = domain.DeliveryOperationRemove
+	}
+
 	// Terminal reports can trigger the next attempt before ReportResult returns.
 	// Release before publishing a result, and on early exits. Once prevents the
 	// deferred cleanup from removing a newer attempt's slot.
@@ -314,9 +322,10 @@ func (a *Agent) runAckAndCompletion(
 		// Return nil to allow the orchestration to retry with a fresh attempt.
 		failMsg := fmt.Sprintf("scripted %s acknowledgement failed", operation)
 		releaseSlot()
-		if err := a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-			State:   domain.DeliveryStateFailed,
-			Message: failMsg,
+		if err := a.reportResult(ctx, deliveryID, generation, domain.DeliveryResult{
+			Operation: op,
+			State:     domain.DeliveryStateFailed,
+			Message:   failMsg,
 		}); err != nil {
 			probe.Error(err)
 			a.log.Warn("scripted: report ack failure", "deliveryID", deliveryID, "error", err)
@@ -346,9 +355,10 @@ func (a *Agent) runAckAndCompletion(
 	if compDecision.Outcome == OutcomeFailure {
 		failMsg := fmt.Sprintf("scripted %s completion failed", operation)
 		releaseSlot()
-		if err := a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-			State:   domain.DeliveryStateFailed,
-			Message: failMsg,
+		if err := a.reportResult(ctx, deliveryID, generation, domain.DeliveryResult{
+			Operation: op,
+			State:     domain.DeliveryStateFailed,
+			Message:   failMsg,
 		}); err != nil {
 			probe.Error(err)
 			a.log.Warn("scripted: report completion failure", "deliveryID", deliveryID, "error", err)
@@ -372,12 +382,23 @@ func (a *Agent) runAckAndCompletion(
 	}
 
 	releaseSlot()
-	if err := a.reporter.ReportResult(ctx, deliveryID, generation, domain.DeliveryResult{
-		State: domain.DeliveryStateDelivered,
+	if err := a.reportResult(ctx, deliveryID, generation, domain.DeliveryResult{
+		Operation: op,
+		State:     domain.DeliveryStateDelivered,
 	}); err != nil {
 		probe.Error(err)
 		a.log.Warn("scripted: report completion success", "deliveryID", deliveryID, "error", err)
 	}
+}
+
+// reportResult reports a terminal outcome, retrying briefly: a delivery
+// result lost to a transient platform error would leave the delivery
+// record open until a re-dispatch. The retry envelope bounds the work;
+// nothing waits on a report that keeps failing.
+func (a *Agent) reportResult(ctx context.Context, deliveryID domain.DeliveryID, generation domain.Generation, result domain.DeliveryResult) error {
+	return kubernetes.RetryLocalEnvelope(ctx, kubernetes.ReportResultRetryDeadline, func(attemptCtx context.Context) error {
+		return a.reporter.ReportResult(attemptCtx, deliveryID, generation, result)
+	})
 }
 
 // projectInventoryWithRetry idempotently replaces the managed resource's labels

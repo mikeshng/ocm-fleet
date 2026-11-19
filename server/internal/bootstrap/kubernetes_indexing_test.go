@@ -214,7 +214,10 @@ func (t *listFailTx) Fulfillments() domain.FulfillmentRepository {
 }
 func (t *listFailTx) Deployments() domain.DeploymentRepository { panic("Deployments unused") }
 func (t *listFailTx) Deliveries() domain.DeliveryRepository    { panic("Deliveries unused") }
-func (t *listFailTx) Inventory() domain.InventoryRepository    { panic("Inventory unused") }
+func (t *listFailTx) DeliveryCompletions() domain.DeliveryCompletionRepository {
+	panic("DeliveryCompletions unused")
+}
+func (t *listFailTx) Inventory() domain.InventoryRepository { panic("Inventory unused") }
 func (t *listFailTx) ExtensionResources() domain.ExtensionResourceRepository {
 	panic("ExtensionResources unused")
 }

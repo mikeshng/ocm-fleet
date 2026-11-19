@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 
+import { loadAll } from "js-yaml";
+
 import { flagString, type ParsedArgs } from "../../argv";
 import type { CliClient } from "../../client";
 import { clientForArgs } from "../context";
@@ -12,9 +14,10 @@ export function deploymentClient(args: ParsedArgs): Promise<CliClient> {
   return clientForArgs(args);
 }
 
+/** The manifests of one file: a JSON file is one, a YAML file one per document. */
 export interface ManifestInput {
-  content: unknown;
-  raw: string;
+  contents: unknown[];
+  raws: string[];
 }
 
 export interface SigningPlacement {
@@ -57,12 +60,22 @@ export function parsePlacement(args: ParsedArgs): SigningPlacement {
 }
 
 export async function readManifest(path: string): Promise<ManifestInput> {
-  const content =
-    path === "-" ? await readStdin() : await readFile(path, "utf8");
-  return {
-    content: JSON.parse(content),
-    raw: Buffer.from(content).toString("base64"),
-  };
+  const text = path === "-" ? await readStdin() : await readFile(path, "utf8");
+  try {
+    return {
+      contents: [JSON.parse(text)],
+      raws: [Buffer.from(text).toString("base64")],
+    };
+  } catch {
+    const contents = loadAll(text).filter((document) => document != null);
+    if (contents.length === 0) throw new Error(`${path} holds no manifest`);
+    return {
+      contents,
+      raws: contents.map((content) =>
+        Buffer.from(JSON.stringify(content)).toString("base64"),
+      ),
+    };
+  }
 }
 
 async function readStdin(): Promise<string> {
@@ -75,7 +88,7 @@ async function readStdin(): Promise<string> {
 
 export function deploymentBody(
   args: ParsedArgs,
-  rawManifest: string,
+  rawManifests: string[],
 ): Record<string, unknown> {
   const placement = parsePlacement(args);
   const placementStrategy: Record<string, unknown> = {
@@ -83,7 +96,7 @@ export function deploymentBody(
   };
   if (placement.targets) placementStrategy.targetIds = placement.targets;
   if (placement.match_labels)
-    placementStrategy.targetSelector = placement.match_labels;
+    placementStrategy.targetSelector = { matchLabels: placement.match_labels };
   const rolloutType = flagString(
     args,
     "rollout-type",
@@ -95,9 +108,10 @@ export function deploymentBody(
   return {
     manifestStrategy: {
       type: "TYPE_INLINE",
-      manifests: [
-        { manifestType: flagString(args, "resource-type"), raw: rawManifest },
-      ],
+      manifests: rawManifests.map((raw) => ({
+        manifestType: flagString(args, "resource-type"),
+        raw,
+      })),
     },
     placementStrategy,
     rolloutStrategy: { type: "TYPE_IMMEDIATE" },

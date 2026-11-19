@@ -130,9 +130,14 @@ type Deployment struct {
 	// Non-empty when reconciliation is paused (e.g. expired delivery
 	// credentials). Contains the reason for the pause. The lifecycle
 	// state is preserved independently.
-	PauseReason   string `protobuf:"bytes,14,opt,name=pause_reason,json=pauseReason,proto3" json:"pause_reason,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PauseReason string `protobuf:"bytes,14,opt,name=pause_reason,json=pauseReason,proto3" json:"pause_reason,omitempty"`
+	// Delivery state per target, ordered by target ID. There is one entry
+	// for every target the fulfillment has recorded work for, including a
+	// target whose work is being removed or was removed; `operation` says
+	// which. When a target's last attempt failed, its message says why.
+	TargetStatuses []*TargetDeliveryStatus `protobuf:"bytes,15,rep,name=target_statuses,json=targetStatuses,proto3" json:"target_statuses,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Deployment) Reset() {
@@ -263,11 +268,18 @@ func (x *Deployment) GetPauseReason() string {
 	return ""
 }
 
+func (x *Deployment) GetTargetStatuses() []*TargetDeliveryStatus {
+	if x != nil {
+		return x.TargetStatuses
+	}
+	return nil
+}
+
 var File_ocm_v1alpha_deployment_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_deployment_proto_rawDesc = "" +
 	"\n" +
-	"\x1cocm/v1alpha/deployment.proto\x12\vocm.v1alpha\x1a\x1fgoogle/api/field_behavior.proto\x1a\x19google/api/resource.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1docm/v1alpha/attestation.proto\x1a#ocm/v1alpha/manifest_strategy.proto\x1a$ocm/v1alpha/placement_strategy.proto\x1a\"ocm/v1alpha/rollout_strategy.proto\"\xb7\a\n" +
+	"\x1cocm/v1alpha/deployment.proto\x12\vocm.v1alpha\x1a\x1fgoogle/api/field_behavior.proto\x1a\x19google/api/resource.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1docm/v1alpha/attestation.proto\x1a#ocm/v1alpha/manifest_strategy.proto\x1a$ocm/v1alpha/placement_strategy.proto\x1a\"ocm/v1alpha/rollout_strategy.proto\x1a(ocm/v1alpha/target_delivery_status.proto\"\x88\b\n" +
 	"\n" +
 	"Deployment\x12\x17\n" +
 	"\x04name\x18\x01 \x01(\tB\x03\xe0A\bR\x04name\x12\x15\n" +
@@ -290,7 +302,8 @@ const file_ocm_v1alpha_deployment_proto_rawDesc = "" +
 	"\n" +
 	"generation\x18\r \x01(\x03B\x03\xe0A\x03R\n" +
 	"generation\x12&\n" +
-	"\fpause_reason\x18\x0e \x01(\tB\x03\xe0A\x03R\vpauseReason\"\x83\x01\n" +
+	"\fpause_reason\x18\x0e \x01(\tB\x03\xe0A\x03R\vpauseReason\x12O\n" +
+	"\x0ftarget_statuses\x18\x0f \x03(\v2!.ocm.v1alpha.TargetDeliveryStatusB\x03\xe0A\x03R\x0etargetStatuses\"\x83\x01\n" +
 	"\x05State\x12\x15\n" +
 	"\x11STATE_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATE_CREATING\x10\x01\x12\x10\n" +
@@ -321,6 +334,7 @@ var file_ocm_v1alpha_deployment_proto_goTypes = []any{
 	(*RolloutStrategy)(nil),       // 4: ocm.v1alpha.RolloutStrategy
 	(*timestamppb.Timestamp)(nil), // 5: google.protobuf.Timestamp
 	(*Provenance)(nil),            // 6: ocm.v1alpha.Provenance
+	(*TargetDeliveryStatus)(nil),  // 7: ocm.v1alpha.TargetDeliveryStatus
 }
 var file_ocm_v1alpha_deployment_proto_depIdxs = []int32{
 	2, // 0: ocm.v1alpha.Deployment.manifest_strategy:type_name -> ocm.v1alpha.ManifestStrategy
@@ -330,11 +344,12 @@ var file_ocm_v1alpha_deployment_proto_depIdxs = []int32{
 	5, // 4: ocm.v1alpha.Deployment.create_time:type_name -> google.protobuf.Timestamp
 	5, // 5: ocm.v1alpha.Deployment.update_time:type_name -> google.protobuf.Timestamp
 	6, // 6: ocm.v1alpha.Deployment.provenance:type_name -> ocm.v1alpha.Provenance
-	7, // [7:7] is the sub-list for method output_type
-	7, // [7:7] is the sub-list for method input_type
-	7, // [7:7] is the sub-list for extension type_name
-	7, // [7:7] is the sub-list for extension extendee
-	0, // [0:7] is the sub-list for field type_name
+	7, // 7: ocm.v1alpha.Deployment.target_statuses:type_name -> ocm.v1alpha.TargetDeliveryStatus
+	8, // [8:8] is the sub-list for method output_type
+	8, // [8:8] is the sub-list for method input_type
+	8, // [8:8] is the sub-list for extension type_name
+	8, // [8:8] is the sub-list for extension extendee
+	0, // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_ocm_v1alpha_deployment_proto_init() }
@@ -346,6 +361,7 @@ func file_ocm_v1alpha_deployment_proto_init() {
 	file_ocm_v1alpha_manifest_strategy_proto_init()
 	file_ocm_v1alpha_placement_strategy_proto_init()
 	file_ocm_v1alpha_rollout_strategy_proto_init()
+	file_ocm_v1alpha_target_delivery_status_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

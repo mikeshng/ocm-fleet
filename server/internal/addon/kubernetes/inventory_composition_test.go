@@ -84,6 +84,10 @@ func (b *storeReportBackend) ReplaceBatch(ctx context.Context, resourceType doma
 	return b.reports.ReplaceBatch(ctx, in)
 }
 
+func (b *storeReportBackend) PurgeStaleCollectionPrefix(ctx context.Context, resourceType domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error) {
+	return b.reports.PurgeStaleCollectionPrefix(ctx, resourceType, prefix, notWrittenSince)
+}
+
 func newStoreBackedReporter(store domain.Store) InventoryReporter {
 	reports := application.NewInventoryReportService(store)
 	return NewDirectInventoryReporter(&storeReportBackend{reports: reports})
@@ -712,5 +716,75 @@ func TestServeStyleComposition_EnsureIndexerIndexesTarget(t *testing.T) {
 	}
 	if !host.HasIndexer("serve-smoke") {
 		t.Fatal("expected EnsureIndexer to start indexer")
+	}
+}
+
+// TestIndexerStart_RemovesObjectsThatAreGone verifies that an indexer,
+// once it has read everything it can, removes the rows an earlier
+// process left for objects of its cluster that no longer exist -- and
+// nothing else: not the objects that still exist, not another cluster's
+// rows. (The writer alone does not do this; see
+// TestStartupList_DoesNotDeleteDBOnlyRows.)
+func TestIndexerStart_RemovesObjectsThatAreGone(t *testing.T) {
+	store := &sqlite.Store{DB: sqlite.OpenTestDB(t)}
+	seedObjectType(t, store)
+
+	pods := podsGVR()
+	dyn, disc := fakeClientsForPodsAndConfigMaps(t)
+	createPod(t, dyn, "uid-live", "live")
+
+	gone := mustNamedObjectName(t, "serve-ghosts", pods, ObjectScopeNamespaced, "default", "gone", "uid-gone")
+	live := mustNamedObjectName(t, "serve-ghosts", pods, ObjectScopeNamespaced, "default", "live", "uid-live")
+	elsewhere := mustNamedObjectName(t, "elsewhere", pods, ObjectScopeNamespaced, "default", "gone", "uid-elsewhere")
+	ctx := context.Background()
+	obs := json.RawMessage(`{"kind":"Pod"}`)
+	seeded := application.InventoryReplacementBatchInput{}
+	for _, name := range []domain.ResourceName{gone, live, elsewhere} {
+		seeded.Reports = append(seeded.Reports, application.InventoryReplacementInput{
+			ResourceType: ObjectResourceType,
+			Name:         &name,
+			Observation:  &obs,
+			ObservedAt:   time.Now(),
+		})
+	}
+	if err := application.NewInventoryReportService(store).ReplaceBatch(ctx, seeded); err != nil {
+		t.Fatalf("seed rows of an earlier process: %v", err)
+	}
+	// The earlier process ended before this one began.
+	time.Sleep(20 * time.Millisecond)
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	cfg := IndexConfig{
+		Schema: IndexSchema{Entries: map[schema.GroupVersionResource]SchemaEntry{
+			pods: {GVR: pods},
+		}},
+		AllowList:           []Resource{{ApiGroups: []string{""}, Resources: []string{"pods"}}},
+		BatchInterval:       50 * time.Millisecond,
+		SettleCheckInterval: 20 * time.Millisecond,
+	}
+	host := newCompositionHost(runCtx, store, dyn, disc, cfg)
+	ensureCompositionIndexer(t, host, compositionTarget("serve-ghosts"), cfg)
+
+	objs := awaitStoreObjects(t, store, 5*time.Second, func(objs []*domain.ExtensionResource) bool {
+		for _, obj := range objs {
+			if obj.Name() == gone {
+				return false
+			}
+		}
+		return true
+	})
+	have := map[domain.ResourceName]bool{}
+	for _, obj := range objs {
+		have[obj.Name()] = true
+	}
+	if !have[live] {
+		t.Error("the object that still exists was removed")
+	}
+	if !have[elsewhere] {
+		t.Error("a row of another cluster was removed")
+	}
+	if err := host.StopIndexer(ctx, "serve-ghosts"); err != nil {
+		t.Fatalf("StopIndexer: %v", err)
 	}
 }

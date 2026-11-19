@@ -33,7 +33,9 @@ responsiveness:
 The model checks these guarantees for both supported processor designs:
 
 1. **No target generation regression.** Once generation `g` has affected the
-   target, a generation below `g` cannot affect it later.
+   target, a generation below `g` cannot affect it later. This is generation
+   ordering only: the model carries no operation dimension, so it does not
+   represent a removal and a delivery at the same generation.
 2. **At-least-once delivery is safe.** Duplicate full-level delivery and apply
    are idempotent.
 3. **Ack-before-completion can be safe.** The target may acknowledge promptly
@@ -53,7 +55,10 @@ assumptions encoded in the model and listed below.
 ### Required processor guarantee
 
 The target needs a durable generation high-water mark at acceptance **plus one**
-of these processor designs:
+of these processor designs. The model expresses acceptance and effect fencing in
+generations: it does not model an operation switch at one generation, and a
+processor for the contract's cycle identity must fence on the cycle, not on the
+generation alone.
 
 1. **Strict at-most-one processor.** No second process can begin target work
    while the first may still produce effects.
@@ -81,7 +86,9 @@ A target implementation that claims reliable continuous reconciliation must:
 1. Treat a delivery as a full declarative level, not an imperative patch.
 2. Persist accepted generation and full intent before acknowledging acceptance.
 3. Make apply and delete idempotent under retry and partial completion.
-4. Reject generations below its durable high-water mark.
+4. Reject generations below its durable high-water mark. Where a delivery and a
+   removal share a generation, order them by the operation as well; the model
+   does not check that case.
 5. Use strict at-most-one processing or validate a monotonic fence on every
    target-side effect.
 6. Deterministically recover every concrete resource identity it owns. This can
@@ -94,7 +101,9 @@ A target implementation that claims reliable continuous reconciliation must:
 9. Report terminal success only after observed reality matches the intended
    level. Acceptance and terminal delivery should be distinct protocol points.
 10. Surface permanent failures while continuing retry according to an explicit
-    policy; fairness cannot be obtained from storage alone.
+    policy; fairness cannot be obtained from storage alone. A partial result is
+    terminal for its cycle, so the policy states that it is not retried until a
+    new generation is dispatched.
 
 For a journal, a single "last desired inventory" value is not a sufficient
 concrete design for non-atomic targets. The write-ahead record must retain the
@@ -200,6 +209,10 @@ The model intentionally omits:
 - multiple Fulfillments contending for the same resource
 - partial ordering within a multi-resource apply
 - target API failures, backoff, and permanent-failure policy
+- the delivery lifecycle state machine: failed, partial, and auth_failed
+  outcomes, attempt and reason accounting, and terminal-partial non-retry
+- same-generation operation switches: a delivery and a removal at one
+  generation, and cycle-identity fencing
 - terminal status/report deduplication and platform failover races
 - non-idempotent external side effects and compensation
 

@@ -184,7 +184,9 @@ export default function ClusterNodesTab({
                 <Td colSpan={columns.length}>
                   <EmptyState headingLevel="h3" titleText="No nodes found">
                     <EmptyStateBody>
-                      No nodes are currently indexed for this cluster.
+                      {clusterId
+                        ? "No nodes are currently indexed for this cluster."
+                        : "No nodes are currently indexed on any cluster."}
                     </EmptyStateBody>
                   </EmptyState>
                 </Td>

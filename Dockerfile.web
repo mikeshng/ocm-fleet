@@ -22,6 +22,7 @@ COPY client/web/package.json client/web/project.json client/web/
 COPY extensions/core/client/package.json extensions/core/client/project.json extensions/core/client/
 COPY extensions/kind/client/package.json extensions/kind/client/project.json extensions/kind/client/
 COPY extensions/kind/server/project.json extensions/kind/server/
+COPY extensions/ocm/client/package.json extensions/ocm/client/project.json extensions/ocm/client/
 # Non-UI project.json files needed for Nx project graph resolution.
 COPY server/project.json server/
 COPY proto/project.json proto/
@@ -35,6 +36,7 @@ COPY sdk/build-utils/ sdk/build-utils/
 COPY client/web/ client/web/
 COPY extensions/core/client/ extensions/core/client/
 COPY extensions/kind/client/ extensions/kind/client/
+COPY extensions/ocm/client/ extensions/ocm/client/
 COPY tools/merge-web.mjs tools/merge-web.mjs
 COPY tools/generate-plugin-registry.mjs tools/generate-plugin-registry.mjs
 COPY tools/generate-icons.mjs tools/generate-icons.mjs
@@ -59,10 +61,11 @@ RUN --mount=type=cache,target=/root/.npm \
     -w @ocm-fleet/web \
     -w @ocm-fleet/mock-ui-plugins \
     -w @ocm-fleet/kind-plugin \
+    -w @ocm-fleet/ocm-plugin \
     && ulimit -n 65536 \
     && NX=./node_modules/.bin/nx \
     && export NX_SELF_HOSTED_REMOTE_CACHE_SERVER="${NX_SELF_HOSTED_REMOTE_CACHE_SERVER/localhost/host.containers.internal}" \
-    && $NX run-many --target=build --projects=plugins,@ocm-fleet/kind-plugin \
+    && $NX run-many --target=build --projects=plugins,@ocm-fleet/kind-plugin,@ocm-fleet/ocm-plugin \
     && node tools/generate-plugin-registry.mjs \
     && $NX run web:build \
     && node tools/merge-web.mjs

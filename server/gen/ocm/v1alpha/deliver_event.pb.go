@@ -157,7 +157,7 @@ var File_ocm_v1alpha_deliver_event_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_deliver_event_proto_rawDesc = "" +
 	"\n" +
-	"\x1focm/v1alpha/deliver_event.proto\x12\vocm.v1alpha\x1a#ocm/v1alpha/delivery_accepted.proto\x1a#ocm/v1alpha/delivery_progress.proto\x1a$ocm/v1alpha/delivery_completed.proto\x1a\"ocm/v1alpha/remove_completed.proto\x1a+ocm/v1alpha/delivery_condition_report.proto\"\xa2\x03\n" +
+	"\x1focm/v1alpha/deliver_event.proto\x12\vocm.v1alpha\x1a#ocm/v1alpha/delivery_accepted.proto\x1a$ocm/v1alpha/delivery_completed.proto\x1a+ocm/v1alpha/delivery_condition_report.proto\x1a#ocm/v1alpha/delivery_progress.proto\x1a\"ocm/v1alpha/remove_completed.proto\"\xa2\x03\n" +
 	"\fDeliverEvent\x12L\n" +
 	"\x11delivery_accepted\x18\x01 \x01(\v2\x1d.ocm.v1alpha.DeliveryAcceptedH\x00R\x10deliveryAccepted\x12L\n" +
 	"\x11delivery_progress\x18\x02 \x01(\v2\x1d.ocm.v1alpha.DeliveryProgressH\x00R\x10deliveryProgress\x12O\n" +
@@ -206,10 +206,10 @@ func file_ocm_v1alpha_deliver_event_proto_init() {
 		return
 	}
 	file_ocm_v1alpha_delivery_accepted_proto_init()
-	file_ocm_v1alpha_delivery_progress_proto_init()
 	file_ocm_v1alpha_delivery_completed_proto_init()
-	file_ocm_v1alpha_remove_completed_proto_init()
 	file_ocm_v1alpha_delivery_condition_report_proto_init()
+	file_ocm_v1alpha_delivery_progress_proto_init()
+	file_ocm_v1alpha_remove_completed_proto_init()
 	file_ocm_v1alpha_deliver_event_proto_msgTypes[0].OneofWrappers = []any{
 		(*DeliverEvent_DeliveryAccepted)(nil),
 		(*DeliverEvent_DeliveryProgress)(nil),

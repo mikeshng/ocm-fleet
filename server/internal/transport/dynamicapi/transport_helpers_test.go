@@ -32,6 +32,7 @@ func TestHTTPError_AllCodes(t *testing.T) {
 		{codes.NotFound, http.StatusNotFound},
 		{codes.AlreadyExists, http.StatusConflict},
 		{codes.Aborted, http.StatusConflict},
+		{codes.Unauthenticated, http.StatusUnauthorized},
 		// codes.OK is not a real error path; asserts the defensive default for unhandled codes.
 		{codes.OK, http.StatusInternalServerError},
 		{codes.PermissionDenied, http.StatusForbidden},

@@ -1,5 +1,5 @@
 import type { ResourceResult, SearchResultResolve } from "@ocm-fleet/common";
-import { createResourceApi } from "@ocm-fleet/common";
+import { createResourceApi, foldLinkedClusterResults } from "@ocm-fleet/common";
 import {
   useExtensions,
   useResolvedExtensions,
@@ -20,6 +20,7 @@ import { highlightText } from "../components/Search/highlightUtils";
 import type { SearchResultItem } from "../components/Search/searchIndex";
 import type { SearchResultRendererExtension } from "../extensions/isSearchResultRendererExtension";
 import { isSearchResultRendererExtension } from "../extensions/isSearchResultRendererExtension";
+import { inventorySearchFilters } from "../utils/inventoryFilters";
 
 interface ResolvedRenderer {
   label: string;
@@ -131,22 +132,31 @@ export function useInventorySearch(): {
     async (term: string): Promise<SearchResultItem[]> => {
       if (!loaded) return [];
       try {
-        const escaped = term.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-        const clusterFilter = [
-          `(resourceType == "kind.open-cluster-management.io/Cluster")`,
-          `&& (resource.name.startsWith("${escaped}") || resource.name.startsWith("clusters/${escaped}"))`,
-        ].join(" ");
-        const k8sFilter = [
-          `resourceType == "kubernetes.open-cluster-management.io/Object"`,
-          `&& (resource.observation.kind == "Pod" || resource.observation.kind == "Namespace" || resource.observation.kind == "Node")`,
-          `&& resource.observation.metadata.name.startsWith("${escaped}")`,
-        ].join(" ");
-        const [clusterResponse, k8sResponse] = await Promise.all([
+        const {
+          clusters: clusterFilter,
+          enrolled: enrolledFilter,
+          observed: observedFilter,
+          kubernetes: k8sFilter,
+        } = inventorySearchFilters(term);
+        const [
+          clusterResponse,
+          enrolledResponse,
+          observedResponse,
+          k8sResponse,
+        ] = await Promise.all([
           client.search({ filter: clusterFilter, pageSize: 5 }),
+          client.search({ filter: enrolledFilter, pageSize: 5 }),
+          client.search({ filter: observedFilter, pageSize: 5 }),
           client.search({ filter: k8sFilter, pageSize: 5 }),
         ]);
+        // A cluster that a hub reports appears once, as the hub's record
+        // of it, which names the hub and leads to the cluster's page.
         const allResults = [
-          ...clusterResponse.resources,
+          ...foldLinkedClusterResults([
+            ...clusterResponse.resources,
+            ...enrolledResponse.resources,
+            ...observedResponse.resources,
+          ]),
           ...k8sResponse.resources,
         ];
         return allResults.map((r) => mapResult(r, term));

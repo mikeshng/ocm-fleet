@@ -20,7 +20,7 @@ func (s *StaticPlacement) Resolve(_ context.Context, pool []PlacementTarget) ([]
 	for _, id := range s.Targets {
 		t, ok := index[id]
 		if !ok {
-			return nil, fmt.Errorf("%w: target %q not found in pool", ErrNotFound, id)
+			return nil, fmt.Errorf("%w: %w: target %q not found in pool", ErrPlacementUnresolved, ErrNotFound, id)
 		}
 		result = append(result, t)
 	}
@@ -59,4 +59,39 @@ func matchLabels(labels, selector map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// PlacementMoved reports whether a fulfillment's placement, resolved
+// against pool the way an orchestration pass resolves it (see
+// [PlacementPool]), is a different set of targets than the placement
+// the fulfillment holds. It returns the resolution error when the
+// placement does not resolve against pool.
+func PlacementMoved(ctx context.Context, strategies StrategyFactory, f *Fulfillment, pool []TargetInfo) (bool, error) {
+	strategy, err := strategies.PlacementStrategy(f.PlacementStrategy())
+	if err != nil {
+		return false, err
+	}
+	placementPool := NewPlacementPool(pool, f.ResolvedTargets())
+	resolved, err := strategy.Resolve(ctx, placementPool.Candidates)
+	if err != nil {
+		return false, err
+	}
+
+	held := make(map[TargetID]struct{}, len(f.ResolvedTargets()))
+	for _, id := range f.ResolvedTargets() {
+		held[id] = struct{}{}
+	}
+	want := make(map[TargetID]struct{}, len(resolved))
+	for _, t := range placementPool.Settle(resolved) {
+		want[t.ID] = struct{}{}
+	}
+	if len(want) != len(held) {
+		return true, nil
+	}
+	for id := range want {
+		if _, ok := held[id]; !ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }

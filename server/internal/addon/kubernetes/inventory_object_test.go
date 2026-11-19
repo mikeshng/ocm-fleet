@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -464,6 +465,57 @@ func TestObjectLabels(t *testing.T) {
 			t.Fatal("ObjectLabels must not share the object's label map")
 		}
 	})
+}
+
+func TestObjectObservation_LeavesOutTheAppliedCopy(t *testing.T) {
+	// kubectl apply keeps a copy of the applied object in an annotation.
+	// For a Secret that copy is the secret: it must not reach the inventory.
+	const applied = `{"apiVersion":"v1","kind":"Secret","stringData":{"token":"very-secret-value"}}`
+	id := kubernetes.KubernetesObjectIdentity{
+		ClusterResourceName: "clusters/prod",
+		GVR:                 schema.GroupVersionResource{Version: "v1", Resource: "secrets"},
+		ScopeNamespace:      mustTestScopeNamespace(t, kubernetes.ObjectScopeNamespaced, "default"),
+		Kind:                "Secret",
+		Name:                "enrollment",
+		UID:                 "s-uid",
+	}
+	annotationsOf := func(source map[string]string) (any, string) {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion("v1")
+		obj.SetKind("Secret")
+		obj.SetNamespace("default")
+		obj.SetName("enrollment")
+		obj.SetAnnotations(source)
+		raw := kubernetes.ObjectObservation(id, obj, nil)
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("unmarshal observation: %v", err)
+		}
+		if len(source) > 0 && len(obj.GetAnnotations()) != len(source) {
+			t.Fatal("ObjectObservation changed the watched object's annotations")
+		}
+		meta, _ := got["metadata"].(map[string]any)
+		return meta["annotations"], string(raw)
+	}
+
+	annotations, raw := annotationsOf(map[string]string{
+		"kubectl.kubernetes.io/last-applied-configuration": applied,
+		"note": "kept",
+	})
+	if strings.Contains(raw, "very-secret-value") {
+		t.Fatalf("the observation carries the applied copy: %s", raw)
+	}
+	if m, _ := annotations.(map[string]any); len(m) != 1 || m["note"] != "kept" {
+		t.Errorf("annotations = %#v, want only the other annotation", annotations)
+	}
+
+	annotations, raw = annotationsOf(map[string]string{"kubectl.kubernetes.io/last-applied-configuration": applied})
+	if annotations != nil || strings.Contains(raw, "very-secret-value") {
+		t.Errorf("annotations = %#v, want none when only the applied copy was there", annotations)
+	}
+	if annotations, _ = annotationsOf(nil); annotations != nil {
+		t.Errorf("annotations = %#v for an object without any", annotations)
+	}
 }
 
 func TestObjectObservation(t *testing.T) {

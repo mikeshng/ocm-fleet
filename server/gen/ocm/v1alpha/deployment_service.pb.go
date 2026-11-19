@@ -25,7 +25,7 @@ var File_ocm_v1alpha_deployment_service_proto protoreflect.FileDescriptor
 
 const file_ocm_v1alpha_deployment_service_proto_rawDesc = "" +
 	"\n" +
-	"$ocm/v1alpha/deployment_service.proto\x12\vocm.v1alpha\x1a\x1cgoogle/api/annotations.proto\x1a\x17google/api/client.proto\x1a\x1cocm/v1alpha/deployment.proto\x1a+ocm/v1alpha/create_deployment_request.proto\x1a(ocm/v1alpha/get_deployment_request.proto\x1a*ocm/v1alpha/list_deployments_request.proto\x1a+ocm/v1alpha/list_deployments_response.proto\x1a+ocm/v1alpha/resume_deployment_request.proto\x1a+ocm/v1alpha/delete_deployment_request.proto2\xb0\x05\n" +
+	"$ocm/v1alpha/deployment_service.proto\x12\vocm.v1alpha\x1a\x1cgoogle/api/annotations.proto\x1a\x17google/api/client.proto\x1a+ocm/v1alpha/create_deployment_request.proto\x1a+ocm/v1alpha/delete_deployment_request.proto\x1a\x1cocm/v1alpha/deployment.proto\x1a(ocm/v1alpha/get_deployment_request.proto\x1a*ocm/v1alpha/list_deployments_request.proto\x1a+ocm/v1alpha/list_deployments_response.proto\x1a+ocm/v1alpha/resume_deployment_request.proto2\xb0\x05\n" +
 	"\x11DeploymentService\x12\x96\x01\n" +
 	"\x10CreateDeployment\x12$.ocm.v1alpha.CreateDeploymentRequest\x1a\x17.ocm.v1alpha.Deployment\"C\xdaA\x18deployment,deployment_id\x82\xd3\xe4\x93\x02\":\n" +
 	"deployment\"\x14/v1alpha/deployments\x12y\n" +
@@ -66,13 +66,13 @@ func file_ocm_v1alpha_deployment_service_proto_init() {
 	if File_ocm_v1alpha_deployment_service_proto != nil {
 		return
 	}
-	file_ocm_v1alpha_deployment_proto_init()
 	file_ocm_v1alpha_create_deployment_request_proto_init()
+	file_ocm_v1alpha_delete_deployment_request_proto_init()
+	file_ocm_v1alpha_deployment_proto_init()
 	file_ocm_v1alpha_get_deployment_request_proto_init()
 	file_ocm_v1alpha_list_deployments_request_proto_init()
 	file_ocm_v1alpha_list_deployments_response_proto_init()
 	file_ocm_v1alpha_resume_deployment_request_proto_init()
-	file_ocm_v1alpha_delete_deployment_request_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

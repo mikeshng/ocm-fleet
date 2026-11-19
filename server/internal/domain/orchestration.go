@@ -70,7 +70,30 @@ type DeliverInput struct {
 	Manifests     []Manifest
 	Auth          DeliveryAuth
 	Attestation   *Attestation // nil for token-passthrough deliveries
-	Generation    Generation   // fulfillment generation at dispatch; used for stale-delivery fencing
+	// EvidenceError explains why the signer's assertion could not be
+	// assembled (the signer has no enrollment). It is set only when the
+	// fulfillment's provenance requires one; a delivery that would
+	// dispatch pauses instead of going out unauthenticated.
+	EvidenceError string
+	Generation    Generation // fulfillment generation at dispatch; used for stale-delivery fencing
+}
+
+// DeliverOutput is the result of the deliver-to-target activity.
+//
+// Dispatched indicates whether the target must be awaited: true when a
+// delivery was dispatched or was already accepted and is still running;
+// false when there is nothing to wait for (no delivery record, or a
+// record already terminal in the current cycle).
+//
+// PauseReason is set when the record is terminal in
+// [DeliveryStateAuthFailed], or when the delivery would dispatch but
+// [DeliverInput.EvidenceError] says the signer's assertion is missing.
+// The activity does not re-dispatch such a delivery with the same
+// expired credentials, nor dispatch it unauthenticated; the
+// orchestration pauses the fulfillment instead.
+type DeliverOutput struct {
+	Dispatched  bool
+	PauseReason string
 }
 
 // RemoveInput is the input to the remove-from-target activity.
@@ -81,24 +104,27 @@ type RemoveInput struct {
 	Manifests     []Manifest
 	Auth          DeliveryAuth
 	Attestation   *Attestation // nil for token-passthrough deliveries
-	Generation    Generation   // fulfillment generation at dispatch; used for stale-delivery fencing
+	// EvidenceError explains why the signer's assertion could not be
+	// assembled (the signer has no enrollment). It is set only when the
+	// fulfillment's provenance requires one; a removal that would
+	// dispatch pauses instead of going out unauthenticated.
+	EvidenceError string
+	Generation    Generation // fulfillment generation at dispatch; used for stale-delivery fencing
 }
 
 // RemoveOutput is the result of the remove-from-target activity.
 // Dispatched indicates whether a removal was actually dispatched (true)
-// or skipped (false). A skip occurs when no delivery record exists or
-// the delivery already progressed past Pending (addon already acked
-// the removal and a completion signal is queued).
+// or skipped (false). A skip occurs when no delivery record exists, the
+// delivery already progressed past Pending (addon already acked the
+// removal and a completion signal is queued), or the removal already
+// reached a terminal state at this generation. PauseReason is set when
+// the removal is terminal in auth_failed and the fulfillment must pause
+// for fresh credentials instead of waiting on it, or when the removal
+// would dispatch but [RemoveInput.EvidenceError] says the signer's
+// assertion is missing.
 type RemoveOutput struct {
-	Dispatched bool
-}
-
-// DeliveryOutputsInput carries the delivery identity alongside the
-// produced outputs so inventory registration can retain output
-// ownership metadata.
-type DeliveryOutputsInput struct {
-	DeliveryID DeliveryID
-	Result     DeliveryResult
+	Dispatched  bool
+	PauseReason string
 }
 
 // ResolvePlacementInput is the input to the resolve-placement activity.
@@ -123,6 +149,12 @@ type ReconciliationSnapshot struct {
 	Fulfillment Fulfillment
 	Pool        []TargetInfo
 	Evidence    *ResolvedEvidence
+	// EvidenceError is set when the fulfillment's provenance names a
+	// signer whose enrollment is gone, so no attestation can be
+	// assembled. The pipeline decides whether this pass needs one: a
+	// deletion with no targets left does not and must still finish,
+	// while a delivery or removal pauses with this reason.
+	EvidenceError string
 }
 
 // PersistAndCompleteInput carries the reconciliation result and the
@@ -170,7 +202,18 @@ type OrchestrationWorkflowSpec struct {
 	// registered yet. The durable sleep gives external processes
 	// (e.g. a provisioning delivery) time to register the target
 	// before the next attempt reloads the pool. Zero defaults to 5 s.
+	//
+	// For a failed delivery the same value is the base of an
+	// exponential backoff: the wait doubles once per failed attempt
+	// recorded on the delivery, capped by [MaxRetryDelay].
 	RetryDelay time.Duration
+
+	// MaxRetryDelay caps the backoff applied after a failed
+	// delivery, so a target that stays broken is retried at a
+	// steady, modest rate instead of ever more slowly. Zero defaults
+	// to 5 minutes. It does not affect the fixed [RetryDelay] used
+	// for other errors.
+	MaxRetryDelay time.Duration
 }
 
 // OrchestrationWorkflowOption configures optional fields on
@@ -205,9 +248,16 @@ func WithAckRetryInterval(d time.Duration) OrchestrationWorkflowOption {
 }
 
 // WithRetryDelay sets how long the orchestration sleeps before
-// restarting via ContinueAsNew after a non-terminal pipeline error.
+// restarting via ContinueAsNew after a non-terminal pipeline error,
+// and the base of the exponential backoff after a failed delivery.
 func WithRetryDelay(d time.Duration) OrchestrationWorkflowOption {
 	return func(s *OrchestrationWorkflowSpec) { s.RetryDelay = d }
+}
+
+// WithMaxRetryDelay sets the cap on the backoff after a failed
+// delivery.
+func WithMaxRetryDelay(d time.Duration) OrchestrationWorkflowOption {
+	return func(s *OrchestrationWorkflowSpec) { s.MaxRetryDelay = d }
 }
 
 // NewOrchestrationWorkflowSpec creates an [OrchestrationWorkflowSpec]
@@ -260,6 +310,34 @@ func (s *OrchestrationWorkflowSpec) retryDelay() time.Duration {
 	return 5 * time.Second
 }
 
+func (s *OrchestrationWorkflowSpec) maxRetryDelay() time.Duration {
+	if s.MaxRetryDelay > 0 {
+		return s.MaxRetryDelay
+	}
+	return 5 * time.Minute
+}
+
+// deliveryRetryDelay computes the durable sleep before restarting after
+// a failed delivery. The first recorded failure waits [RetryDelay];
+// each further attempt doubles the wait, capped at [MaxRetryDelay].
+func (s *OrchestrationWorkflowSpec) deliveryRetryDelay(attempts int) time.Duration {
+	delay := s.retryDelay()
+	limit := s.maxRetryDelay()
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 1; i < attempts; i++ {
+		if delay >= limit/2 {
+			return limit
+		}
+		delay *= 2
+	}
+	if delay > limit {
+		return limit
+	}
+	return delay
+}
+
 func (s *OrchestrationWorkflowSpec) Name() string { return "orchestrate-fulfillment" }
 
 // Each method returns a typed [Activity] derived from the spec's own
@@ -308,10 +386,14 @@ func (s *OrchestrationWorkflowSpec) AcquireLockAndLoad() Activity[FulfillmentID,
 		}
 		probe.PoolLoaded(len(pool))
 
-		evidence, err := s.Attestation.Resolve(ctx, tx, f)
-		if err != nil {
-			probe.Error(err)
-			return ReconciliationSnapshot{}, err
+		// A missing signer enrollment is not a retryable pipeline
+		// failure: the pipeline decides whether this pass needs an
+		// attestation at all (a deletion with nothing left to remove
+		// does not).
+		evidence, evidenceErr := s.Attestation.Resolve(ctx, tx, f)
+		if evidenceErr != nil && !errors.Is(evidenceErr, ErrSignerEnrollmentMissing) {
+			probe.Error(evidenceErr)
+			return ReconciliationSnapshot{}, evidenceErr
 		}
 		probe.EvidenceResolved(evidence != nil)
 
@@ -319,11 +401,15 @@ func (s *OrchestrationWorkflowSpec) AcquireLockAndLoad() Activity[FulfillmentID,
 			probe.Error(err)
 			return ReconciliationSnapshot{}, fmt.Errorf("commit: %w", err)
 		}
-		return ReconciliationSnapshot{
+		snapshot := ReconciliationSnapshot{
 			Fulfillment: *f,
 			Pool:        pool,
 			Evidence:    evidence,
-		}, nil
+		}
+		if evidenceErr != nil {
+			snapshot.EvidenceError = evidenceErr.Error()
+		}
+		return snapshot, nil
 	})
 }
 
@@ -366,10 +452,19 @@ func (s *OrchestrationWorkflowSpec) GenerateManifests() Activity[GenerateManifes
 }
 
 // DeliverToTarget delivers manifests to a target. It persists a
-// [Delivery] record in [DeliveryStatePending] (creating a new record
-// or using [Delivery.Redispatch] if one exists), then dispatches to
-// the [DeliveryAgent]. The agent reports progress and results back
-// via its injected [DeliveryReporter].
+// [Delivery] record in [DeliveryStatePending] (creating a new record,
+// redispatched for a new cycle, or retried within the current one),
+// then dispatches to the [DeliveryAgent]. The agent reports progress
+// and results back via its injected [DeliveryReporter].
+//
+// A delivery cycle is identified by the fulfillment generation and the
+// operation. A record from another cycle — the generation advanced, or
+// the target re-entered placement after a removal — is redispatched as
+// a fresh put cycle. Within the current put cycle, a failed delivery is
+// retried with its recorded attempts driving the backoff, while
+// delivered, partial, and auth_failed are terminal: the first two are
+// not re-dispatched until a new generation, and auth_failed re-pauses
+// the fulfillment instead of retrying with expired credentials.
 //
 // The delivery receives [context.Background] rather than the activity
 // context. Delivery agents run asynchronously (returning immediately
@@ -383,15 +478,15 @@ func (s *OrchestrationWorkflowSpec) GenerateManifests() Activity[GenerateManifes
 // [DeliveryReporter.ReportResult]. This eliminates the dual-path
 // problem where synchronous returns could bypass the reporter and
 // leave delivery records in a stale state.
-func (s *OrchestrationWorkflowSpec) DeliverToTarget() Activity[DeliverInput, struct{}] {
-	return NewActivity("deliver-to-target", func(ctx context.Context, in DeliverInput) (struct{}, error) {
+func (s *OrchestrationWorkflowSpec) DeliverToTarget() Activity[DeliverInput, DeliverOutput] {
+	return NewActivity("deliver-to-target", func(ctx context.Context, in DeliverInput) (DeliverOutput, error) {
 		ctx, probe := s.observer().DeliverStarted(ctx, in)
 		defer probe.End()
 
 		tx, err := s.Store.Begin(ctx)
 		if err != nil {
 			probe.Error(err)
-			return struct{}{}, fmt.Errorf("begin tx: %w", err)
+			return DeliverOutput{}, fmt.Errorf("begin tx: %w", err)
 		}
 		defer tx.RollbackOnExit()
 
@@ -399,58 +494,102 @@ func (s *OrchestrationWorkflowSpec) DeliverToTarget() Activity[DeliverInput, str
 		existing, err := tx.Deliveries().GetByFulfillmentTarget(ctx, in.FulfillmentID, in.Target.ID())
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			probe.Error(err)
-			return struct{}{}, fmt.Errorf("load delivery record: %w", err)
+			return DeliverOutput{}, fmt.Errorf("load delivery record: %w", err)
 		}
 
 		var d Delivery
-		if errors.Is(err, ErrNotFound) {
+		switch {
+		case errors.Is(err, ErrNotFound):
 			probe.NewDelivery()
 			d = NewDelivery(in.DeliveryID, in.FulfillmentID, in.Target.ID(), in.Manifests, in.Generation, now)
-		} else {
+		default:
 			d = existing
-			if in.Generation > d.Generation() {
+			switch {
+			case in.Generation < d.Generation():
+				// A stale invocation: the record belongs to a newer
+				// generation. Waiting for a completion at this generation
+				// would never end, so the target is skipped and the next
+				// reconciliation dispatches it.
+				probe.SkippedStale(d.Generation())
+				return DeliverOutput{}, nil
+			case in.Generation > d.Generation() || d.Operation() != DeliveryOperationDeliver:
+				// A new put cycle: the generation advanced, or the record
+				// was removing the target and the target re-entered
+				// placement at the same generation.
 				probe.Redispatched(d.Generation())
 				if err := d.Redispatch(in.Manifests, in.Generation, now); err != nil {
 					probe.Error(err)
-					return struct{}{}, fmt.Errorf("redispatch delivery %s: %w", d.ID(), err)
+					return DeliverOutput{}, fmt.Errorf("redispatch delivery %s: %w", d.ID(), err)
 				}
-			} else if !d.Retry(in.Generation, now) {
-				if d.Generation() == in.Generation && d.State().IsTerminal() {
-					// Delivery reached a terminal state during a previous
-					// workflow run. ContinueAsNew restarted the workflow;
-					// reset to Pending for retry — addons are idempotent
-					// and the platform provides at-least-once delivery.
-					// This mirrors Withdraw for the remove path.
+			default:
+				switch d.State() {
+				case DeliveryStatePending:
+					// The previous dispatch failed before the addon
+					// received it; dispatch again at the same cycle.
+					d.Retry(in.Generation, now)
+					probe.Retried()
+				case DeliveryStateFailed:
+					// The addon reported a failed attempt; retry it with
+					// the reason and attempt count kept for the backoff
+					// and for the API.
 					probe.ResetForRetry(d.State())
 					if err := d.ResetForRetry(now); err != nil {
 						probe.Error(err)
-						return struct{}{}, fmt.Errorf("reset delivery %s for retry: %w", d.ID(), err)
+						return DeliverOutput{}, fmt.Errorf("reset delivery %s for retry: %w", d.ID(), err)
 					}
-				} else {
-					// Delivery already progressed past Pending (addon received
-					// and acked). The ack signal is queued; no re-dispatch needed.
+				case DeliveryStateDelivered, DeliveryStatePartial:
+					// Terminal observations of this cycle. Delivered is
+					// observed convergence; partial is processed with its
+					// reason reported per target. Neither is retried until
+					// a new generation is dispatched.
+					probe.SkippedTerminal(d.State())
+					return DeliverOutput{}, nil
+				case DeliveryStateAuthFailed:
+					// Retrying with the same expired credentials is
+					// pointless: pause the fulfillment for fresh ones.
+					// The pause is signaled through the reason, so it must
+					// never be empty — a report without a message still has
+					// to pause rather than be silently skipped.
+					reason := d.Message()
+					if reason == "" {
+						reason = "authentication failed"
+					}
+					return DeliverOutput{PauseReason: reason}, nil
+				default:
+					// Accepted or Progressing: the addon received the
+					// delivery and a completion signal is queued or will
+					// be. No re-dispatch is needed; wait for it.
 					probe.SkippedAlreadyAcked()
-					return struct{}{}, nil
+					return DeliverOutput{Dispatched: true}, nil
 				}
-			} else {
-				probe.Retried()
 			}
+		}
+
+		if in.Attestation == nil && in.EvidenceError != "" {
+			// The record is about to be persisted and the target called,
+			// and the assertion a signed intent needs is missing. Stop
+			// here so nothing goes out unauthenticated; the caller turns
+			// the reason into a pause. Records that were not going to
+			// dispatch never reach this point, so a finished delivery is
+			// not held by the missing enrollment.
+			probe.Error(fmt.Errorf("dispatch needs the signer's assertion: %s", in.EvidenceError))
+			return DeliverOutput{PauseReason: "the signer's assertion is missing: " + in.EvidenceError}, nil
 		}
 
 		if err := tx.Deliveries().Put(ctx, d); err != nil {
 			probe.Error(err)
-			return struct{}{}, fmt.Errorf("persist delivery record: %w", err)
+			return DeliverOutput{}, fmt.Errorf("persist delivery record: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			probe.Error(err)
-			return struct{}{}, fmt.Errorf("commit: %w", err)
+			return DeliverOutput{}, fmt.Errorf("commit: %w", err)
 		}
 
 		if err := s.Delivery.Deliver(context.Background(), in.Target, in.DeliveryID, in.Manifests, in.Auth, in.Attestation, in.Generation); err != nil {
 			probe.Error(err)
-			return struct{}{}, fmt.Errorf("dispatch delivery %s: %w", in.DeliveryID, err)
+			return DeliverOutput{}, fmt.Errorf("dispatch delivery %s: %w", in.DeliveryID, err)
 		}
-		return struct{}{}, nil
+		return DeliverOutput{Dispatched: true}, nil
 	})
 }
 
@@ -499,6 +638,23 @@ func (s *OrchestrationWorkflowSpec) RemoveFromTarget() Activity[RemoveInput, Rem
 			return RemoveOutput{}, fmt.Errorf("withdraw delivery %s: %w", delivery.ID(), err)
 		}
 		if !modified {
+			// The record already belongs to a removal cycle at this
+			// generation and did not fail. A terminal removal completed
+			// its work: it is skipped rather than re-dispatched, since a
+			// completion signal consumed by an earlier workflow run cannot
+			// be awaited again. An auth failure pauses for fresh
+			// credentials instead of waiting on the expired ones.
+			if delivery.State().IsTerminal() {
+				probe.SkippedTerminal(delivery.State())
+				if delivery.State() == DeliveryStateAuthFailed {
+					reason := delivery.Message()
+					if reason == "" {
+						reason = "authentication failed"
+					}
+					return RemoveOutput{PauseReason: reason}, nil
+				}
+				return RemoveOutput{Dispatched: false}, nil
+			}
 			if !delivery.Retry(in.Generation, s.now()) {
 				// In-progress at current generation — already
 				// dispatched and acked. Return without re-dispatching;
@@ -508,6 +664,17 @@ func (s *OrchestrationWorkflowSpec) RemoveFromTarget() Activity[RemoveInput, Rem
 			}
 		}
 		probe.Withdrawn()
+
+		if in.Attestation == nil && in.EvidenceError != "" {
+			// The removal would be persisted and dispatched, and the
+			// assertion a signed intent needs is missing. Stop here so
+			// nothing goes out unauthenticated; the caller turns the
+			// reason into a pause. A removal with no record, or one
+			// already terminal at this generation, returned above and is
+			// not held by the missing enrollment.
+			probe.Error(fmt.Errorf("dispatch needs the signer's assertion: %s", in.EvidenceError))
+			return RemoveOutput{PauseReason: "the signer's assertion is missing: " + in.EvidenceError}, nil
+		}
 
 		if err := tx.Deliveries().Put(ctx, delivery); err != nil {
 			probe.Error(err)
@@ -599,6 +766,14 @@ func (s *OrchestrationWorkflowSpec) CleanupDeliveryData() Activity[FulfillmentID
 // advances [Fulfillment.ObservedGeneration]. Returns needsRestart when
 // the generation has advanced during the pipeline.
 //
+// A generation past the reconciled one means a mutation was committed
+// while the pass ran. The pass loaded the fulfillment before that
+// mutation, so its result is applied only as far as it does not undo
+// it; see [Fulfillment.ApplySupersededReconciliationResult]. Applied
+// whole, the result of a pass that a delete overtook would put the
+// fulfillment back to active, and the restart would reconcile it as an
+// active one: the delete would be lost.
+//
 // For [FulfillmentStateDeleting] results, the activity also signals the
 // fulfillment-scoped cleanup workflow after the commit succeeds.
 // Combining the
@@ -628,7 +803,11 @@ func (s *OrchestrationWorkflowSpec) PersistAndCompleteReconciliation() Activity[
 			return false, fmt.Errorf("get fulfillment: %w", err)
 		}
 
-		fresh.ApplyReconciliationResult(in.Result)
+		if fresh.Generation() > in.ReconciledGen {
+			fresh.ApplySupersededReconciliationResult(in.Result)
+		} else {
+			fresh.ApplyReconciliationResult(in.Result)
+		}
 		needsRestart := fresh.CompleteReconciliation(in.ReconciledGen, s.now())
 
 		if err := tx.Fulfillments().Update(ctx, fresh); err != nil {
@@ -652,83 +831,6 @@ func (s *OrchestrationWorkflowSpec) PersistAndCompleteReconciliation() Activity[
 		}
 
 		return needsRestart, nil
-	})
-}
-
-// ProcessDeliveryOutputs stores produced secrets in the [Vault] and
-// registers provisioned targets. Secrets are stored first so that
-// target properties referencing vault refs are valid at registration
-// time. Inventory items retain the originating delivery identity so
-// delete-time cleanup can remove delivery-owned outputs generically.
-// Results with no outputs are skipped.
-//
-// All writes use upsert semantics so the activity is replay-safe:
-// delivery agents may be re-invoked after a transient failure and
-// produce the same outputs on each attempt.
-func (s *OrchestrationWorkflowSpec) ProcessDeliveryOutputs() Activity[DeliveryOutputsInput, struct{}] {
-	return NewActivity("process-delivery-outputs", func(ctx context.Context, in DeliveryOutputsInput) (struct{}, error) {
-		ctx, probe := s.observer().ProcessOutputsStarted(ctx)
-		defer probe.End()
-
-		if len(in.Result.ProducedSecrets) == 0 && len(in.Result.ProvisionedTargets) == 0 {
-			probe.Skipped()
-			return struct{}{}, nil
-		}
-
-		if s.Vault != nil {
-			for _, secret := range in.Result.ProducedSecrets {
-				if err := s.Vault.Put(ctx, secret.Ref, secret.Value); err != nil {
-					probe.Error(err)
-					return struct{}{}, fmt.Errorf("store secret %q: %w", secret.Ref, err)
-				}
-			}
-			probe.SecretsStored(len(in.Result.ProducedSecrets))
-		}
-
-		tx, err := s.Store.Begin(ctx)
-		if err != nil {
-			probe.Error(err)
-			return struct{}{}, fmt.Errorf("begin tx: %w", err)
-		}
-		defer tx.RollbackOnExit()
-
-		// TODO: revisit the "TargetRegistrar" thing – should we make that upsert instead? remove that?
-		now := s.now()
-		for _, pt := range in.Result.ProvisionedTargets {
-			props, _ := json.Marshal(pt.Properties)
-			invID := InventoryItemID("target:" + string(pt.ID))
-			if err := tx.Inventory().CreateOrUpdate(ctx, NewInventoryItem(
-				invID,
-				InventoryItemType(pt.Type),
-				pt.Name,
-				props,
-				pt.Labels,
-				&in.DeliveryID,
-				now,
-			)); err != nil {
-				probe.Error(err)
-				return struct{}{}, fmt.Errorf("upsert inventory item for target %q: %w", pt.ID, err)
-			}
-
-			if err := tx.Targets().CreateOrUpdate(ctx, NewTargetInfo(
-				pt.ID,
-				pt.Type,
-				pt.Name,
-				"",
-				pt.Labels,
-				pt.Properties,
-				pt.AcceptedManifestTypes,
-			)); err != nil {
-				probe.Error(err)
-				return struct{}{}, fmt.Errorf("upsert target %q: %w", pt.ID, err)
-			}
-		}
-		probe.TargetsRegistered(len(in.Result.ProvisionedTargets))
-		if err := tx.Commit(); err != nil {
-			probe.Error(err)
-			return struct{}{}, err
-		}
-		return struct{}{}, nil
 	})
 }
 
@@ -773,6 +875,26 @@ func (s *OrchestrationWorkflowSpec) CheckGeneration() Activity[FulfillmentID, Ge
 	})
 }
 
+// DeliveryRetryDelay returns how long the orchestration should wait
+// before re-dispatching a delivery whose last attempt failed. It reads
+// the delivery's recorded attempt count and applies the exponential
+// backoff of [OrchestrationWorkflowSpec.deliveryRetryDelay].
+func (s *OrchestrationWorkflowSpec) DeliveryRetryDelay() Activity[DeliveryID, time.Duration] {
+	return NewActivity("delivery-retry-delay", func(ctx context.Context, id DeliveryID) (time.Duration, error) {
+		tx, err := s.Store.BeginReadOnly(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("begin tx: %w", err)
+		}
+		defer tx.RollbackOnExit()
+
+		d, err := tx.Deliveries().Get(ctx, id)
+		if err != nil {
+			return 0, err
+		}
+		return s.deliveryRetryDelay(d.Attempts()), tx.Commit()
+	})
+}
+
 func (s *OrchestrationWorkflowSpec) observer() FulfillmentObserver {
 	return s.Observer
 }
@@ -796,7 +918,10 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 			if IsTerminal(err) {
 				return struct{}{}, nil
 			}
-			return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe)
+			// The generation was not loaded; a zero startGen makes the
+			// backoff check treat any readable generation as advanced,
+			// which is fine: the restart reconciles whatever is current.
+			return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe, 0, s.retryDelay())
 		}
 		f, pool := loaded.Fulfillment, loaded.Pool
 		startGen := f.Generation()
@@ -805,7 +930,7 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 
 		switch f.State() {
 		case FulfillmentStateDeleting:
-			if err := s.executeDelete(record, f, pool, fulfillmentID, probe, loaded.Evidence); err != nil {
+			if err := s.executeDelete(record, f, pool, fulfillmentID, probe, loaded.Evidence, loaded.EvidenceError); err != nil {
 				probe.Error(err)
 				if errors.Is(err, errAuthPaused) {
 					result = ReconciliationResult{
@@ -815,7 +940,7 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 						Auth:            f.Auth(),
 					}
 				} else if !IsTerminal(err) {
-					return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe)
+					return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe, startGen, s.retryDelayFor(record, err, probe))
 				} else {
 					result = ReconciliationResult{
 						FulfillmentID:   fulfillmentID,
@@ -828,7 +953,7 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 			} else {
 				if _, err := RunActivity(record, s.CleanupDeliveryData(), fulfillmentID); err != nil {
 					probe.Error(err)
-					return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe)
+					return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe, startGen, s.retryDelay())
 				}
 				result = ReconciliationResult{
 					FulfillmentID: fulfillmentID,
@@ -838,24 +963,35 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 			}
 
 		default:
-			resolvedIDs, err := s.executePlacementPipeline(record, f, pool, fulfillmentID, startGen, probe, loaded.Evidence)
+			resolvedIDs, err := s.executePlacementPipeline(record, f, pool, fulfillmentID, startGen, probe, loaded.Evidence, loaded.EvidenceError)
 			if errors.Is(err, errAuthPaused) {
 				probe.Error(err)
+				// The plan did not finish, so the placement it was
+				// converging to is not materialized: recording it would
+				// compute the next delta from targets whose delivery or
+				// removal never dispatched, and the resumed pass would
+				// never plan them again. Keep the placement the last
+				// completed pass left behind; the pending work is still
+				// in the delivery records.
 				result = ReconciliationResult{
 					FulfillmentID:   fulfillmentID,
 					PauseReason:     err.Error(),
-					ResolvedTargets: resolvedIDs,
+					ResolvedTargets: f.ResolvedTargets(),
 					Auth:            f.Auth(),
 				}
 			} else if err != nil {
 				probe.Error(err)
 				if !IsTerminal(err) {
-					return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe)
+					return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe, startGen, s.retryDelayFor(record, err, probe))
 				}
+				// As with a pause, the failed pass did not finish its
+				// plan. The target set it would have recorded is not the
+				// set the platform has converged to, and a later retry
+				// or deletion still has to act on the difference.
 				result = ReconciliationResult{
 					FulfillmentID:   fulfillmentID,
 					State:           FulfillmentStateFailed,
-					ResolvedTargets: resolvedIDs,
+					ResolvedTargets: f.ResolvedTargets(),
 					StatusReason:    err.Error(),
 					Auth:            f.Auth(),
 				}
@@ -880,7 +1016,7 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 		})
 		if err != nil {
 			probe.Error(err)
-			return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe)
+			return struct{}{}, s.releaseLockAndContinue(record, fulfillmentID, probe, startGen, s.retryDelay())
 		}
 
 		if !needsRestart {
@@ -890,25 +1026,97 @@ func (s *OrchestrationWorkflowSpec) Run(record Record, fulfillmentID Fulfillment
 	}
 }
 
-// releaseLockAndContinue sleeps for [RetryDelay], releases the
+// retryDelaySlice bounds the durable sleep between generation checks
+// during a retry backoff. The attempt-based backoff can reach
+// [OrchestrationWorkflowSpec.MaxRetryDelay] (five minutes by default),
+// and this execution stays active for the whole sleep: a mutation's
+// convergence loop cannot start the orchestration and waits on it. With
+// slices, a generation advanced by Delete or Resume is noticed within
+// one slice instead of the whole delay, so the restart reconciles the
+// new generation promptly.
+const retryDelaySlice = 5 * time.Second
+
+// releaseLockAndContinue sleeps for the given delay, releases the
 // orchestration lock, and returns a [ContinueAsNew] error to restart
-// with a fresh history. The sleep prevents tight retry loops when the
-// error is deterministic for the current pool state (e.g. a target
-// that has not been registered yet).
+// with a fresh history. The sleep prevents tight retry loops: it is
+// [RetryDelay] for deterministic pipeline errors (e.g. a target that
+// has not been registered yet), and the attempt-based backoff computed
+// by [OrchestrationWorkflowSpec.retryDelayFor] after a failed delivery.
+//
+// The sleep is sliced and checks the fulfillment generation between
+// slices. startGen is the generation this run acquired the lock at;
+// when a mutation has advanced past it, the rest of the delay is
+// abandoned — the new generation supersedes the failed one.
 func (s *OrchestrationWorkflowSpec) releaseLockAndContinue(
 	record Record,
 	fulfillmentID FulfillmentID,
 	probe FulfillmentRunProbe,
+	startGen Generation,
+	delay time.Duration,
 ) error {
-	probe.RetryDelayStarted(s.retryDelay())
-	if err := record.Sleep(s.retryDelay()); err != nil {
-		probe.Error(err)
-	}
+	probe.RetryDelayStarted(delay)
+	s.sleepRetryDelay(record, fulfillmentID, startGen, delay, probe)
 	if _, err := RunActivity(record, s.ReleaseLock(), fulfillmentID); err != nil {
 		probe.Error(err)
 	}
 	probe.ContinueAsNewTriggered()
 	return ContinueAsNew(fulfillmentID)
+}
+
+// sleepRetryDelay waits for delay, checking between slices whether the
+// fulfillment generation has advanced past startGen. An unreadable
+// generation (e.g. the fulfillment was deleted) also ends the wait: the
+// restart discovers the terminal state.
+func (s *OrchestrationWorkflowSpec) sleepRetryDelay(
+	record Record,
+	fulfillmentID FulfillmentID,
+	startGen Generation,
+	delay time.Duration,
+	probe FulfillmentRunProbe,
+) {
+	for remaining := delay; remaining > 0; {
+		slice := min(remaining, retryDelaySlice)
+		if err := record.Sleep(slice); err != nil {
+			probe.Error(err)
+			return
+		}
+		remaining -= slice
+		if remaining <= 0 {
+			return
+		}
+		currentGen, err := RunActivity(record, s.CheckGeneration(), fulfillmentID)
+		if err != nil {
+			probe.Error(err)
+			return
+		}
+		if currentGen > startGen {
+			probe.RetryDelayInterrupted(startGen, currentGen)
+			return
+		}
+	}
+}
+
+// retryDelayFor returns the durable sleep before restarting after err.
+// A failed delivery backs off with the delivery's recorded attempt
+// count; every other error uses the fixed [RetryDelay].
+func (s *OrchestrationWorkflowSpec) retryDelayFor(
+	record Record,
+	err error,
+	probe FulfillmentRunProbe,
+) time.Duration {
+	var failure *deliveryFailureError
+	if !errors.As(err, &failure) {
+		return s.retryDelay()
+	}
+	delay, aerr := RunActivity(record, s.DeliveryRetryDelay(), failure.deliveryID)
+	if aerr != nil {
+		// The delivery could not be read (e.g. it was deleted with its
+		// fulfillment); fall back to the base delay rather than failing
+		// the workflow a second time.
+		probe.Error(aerr)
+		return s.retryDelay()
+	}
+	return delay
 }
 
 // executePlacementPipeline runs the full resolve → delta → plan → execute
@@ -921,19 +1129,20 @@ func (s *OrchestrationWorkflowSpec) executePlacementPipeline(
 	startGen Generation,
 	probe FulfillmentRunProbe,
 	evidence *ResolvedEvidence,
+	evidenceError string,
 ) ([]TargetID, error) {
+	placementPool := NewPlacementPool(pool, f.ResolvedTargets())
 	resolved, err := RunActivity(record, s.ResolvePlacement(), ResolvePlacementInput{
 		Spec: f.PlacementStrategy(),
-		Pool: PlacementTargets(pool),
+		Pool: placementPool.Candidates,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve placement: %w", err)
 	}
+	resolved = placementPool.Settle(resolved)
 
-	if len(resolved) == 0 {
-		return nil, nil
-	}
-
+	// An empty resolution still runs the delta: the targets the
+	// fulfillment held and no longer resolves to are removed from.
 	ids := make([]TargetID, len(resolved))
 	for i, t := range resolved {
 		ids[i] = t.ID
@@ -950,15 +1159,41 @@ func (s *OrchestrationWorkflowSpec) executePlacementPipeline(
 		return ids, fmt.Errorf("plan rollout: %w", err)
 	}
 
-	if err := s.executeRolloutPlan(record, f, plan, fulfillmentID, startGen, probe, evidence); err != nil {
+	if err := s.executeRolloutPlan(record, f, plan, fulfillmentID, startGen, probe, evidence, evidenceError); err != nil {
 		return ids, err
 	}
 
 	return ids, nil
 }
 
-// executeDelete removes the fulfillment from all currently resolved
-// targets. Delivery-data cleanup is handled by [CleanupDeliveryData]
+// PendingWithdrawalTargets returns the targets a deletion still has to
+// withdraw according to the delivery records: those whose record
+// describes work that may stand on the target. See
+// [Delivery.NeedsWithdrawal] for what counts.
+func (s *OrchestrationWorkflowSpec) PendingWithdrawalTargets() Activity[FulfillmentID, []TargetID] {
+	return NewActivity("pending-withdrawal-targets", func(ctx context.Context, id FulfillmentID) ([]TargetID, error) {
+		tx, err := s.Store.BeginReadOnly(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("begin tx: %w", err)
+		}
+		defer tx.RollbackOnExit()
+
+		deliveries, err := tx.Deliveries().ListByFulfillment(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("list deliveries: %w", err)
+		}
+		var ids []TargetID
+		for _, d := range deliveries {
+			if d.NeedsWithdrawal() {
+				ids = append(ids, d.TargetID())
+			}
+		}
+		return ids, tx.Commit()
+	})
+}
+
+// executeDelete removes the fulfillment from every target it may have
+// reached. Delivery-data cleanup is handled by [CleanupDeliveryData]
 // in the DELETING branch of [Run]. The delete-ready signal and the
 // actual row hard-deletes are handled by
 // [PersistAndCompleteReconciliation] and an abstraction-specific
@@ -970,8 +1205,34 @@ func (s *OrchestrationWorkflowSpec) executeDelete(
 	fulfillmentID FulfillmentID,
 	probe FulfillmentRunProbe,
 	evidence *ResolvedEvidence,
+	evidenceError string,
 ) error {
-	targets := targetInfosByID(f.ResolvedTargets(), pool)
+	// The materialized placement names the targets the last completed
+	// pass covered. A pass that paused or failed before finishing does
+	// not record the placement it was converging to, so a target
+	// dispatched before the interruption can be absent from that set.
+	// The delivery records are the evidence of what reached a target:
+	// any record whose work may still stand — a put that may have
+	// applied, or a removal that did not finish — is withdrawn too.
+	targetIDs := slices.Clone(f.ResolvedTargets())
+	pending, err := RunActivity(record, s.PendingWithdrawalTargets(), fulfillmentID)
+	if err != nil {
+		probe.Error(err)
+		return fmt.Errorf("load targets to withdraw: %w", err)
+	}
+	seen := make(map[TargetID]struct{}, len(targetIDs)+len(pending))
+	for _, id := range targetIDs {
+		seen[id] = struct{}{}
+	}
+	for _, id := range pending {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		targetIDs = append(targetIDs, id)
+	}
+
+	targets := targetInfosByID(targetIDs, pool)
 	probe.DeleteStarted(len(targets))
 
 	inputs := make(map[DeliveryID]RemoveInput, len(targets))
@@ -983,6 +1244,7 @@ func (s *OrchestrationWorkflowSpec) executeDelete(
 			FulfillmentID: fulfillmentID,
 			Auth:          f.Auth(),
 			Generation:    f.Generation(),
+			EvidenceError: evidenceError,
 		}
 		if evidence != nil {
 			in.Attestation = assembleRemoveAttestation(f, evidence)
@@ -991,7 +1253,7 @@ func (s *OrchestrationWorkflowSpec) executeDelete(
 		ids = append(ids, in.DeliveryID)
 	}
 
-	_, err := s.dispatchAndAwait(record, func(id DeliveryID) (bool, error) {
+	return s.dispatchAndAwait(record, func(id DeliveryID) (bool, error) {
 		out, err := RunActivity(record, s.RemoveFromTarget(), inputs[id])
 		if err != nil {
 			if errors.Is(err, ErrAuthExpired) {
@@ -999,9 +1261,11 @@ func (s *OrchestrationWorkflowSpec) executeDelete(
 			}
 			return false, fmt.Errorf("remove delivery for target %s: %w", inputs[id].Target.ID(), err)
 		}
+		if out.PauseReason != "" {
+			return false, fmt.Errorf("%w: removal %s: %s", errAuthPaused, id, out.PauseReason)
+		}
 		return out.Dispatched, nil
-	}, ids, f.Generation(), probe)
-	return err
+	}, ids, f.Generation(), DeliveryOperationRemove, probe)
 }
 
 // executeRolloutPlan runs each step in a [RolloutPlan]. For deliver
@@ -1018,6 +1282,7 @@ func (s *OrchestrationWorkflowSpec) executeRolloutPlan(
 	startGen Generation,
 	probe FulfillmentRunProbe,
 	evidence *ResolvedEvidence,
+	evidenceError string,
 ) error {
 	policy := f.RolloutStrategy().EffectiveVersionConflictPolicy()
 
@@ -1035,6 +1300,7 @@ func (s *OrchestrationWorkflowSpec) executeRolloutPlan(
 					FulfillmentID: fulfillmentID,
 					Auth:          f.Auth(),
 					Generation:    startGen,
+					EvidenceError: evidenceError,
 				}
 				if evidence != nil {
 					in.Attestation = assembleRemoveAttestation(f, evidence)
@@ -1043,13 +1309,19 @@ func (s *OrchestrationWorkflowSpec) executeRolloutPlan(
 				removeIDs = append(removeIDs, in.DeliveryID)
 			}
 
-			if _, err := s.dispatchAndAwait(record, func(id DeliveryID) (bool, error) {
+			if err := s.dispatchAndAwait(record, func(id DeliveryID) (bool, error) {
 				out, err := RunActivity(record, s.RemoveFromTarget(), removeInputs[id])
 				if err != nil {
+					if errors.Is(err, ErrAuthExpired) {
+						return false, fmt.Errorf("%w: target %s: %v", errAuthPaused, removeInputs[id].Target.ID(), err)
+					}
 					return false, fmt.Errorf("remove delivery for target %s: %w", removeInputs[id].Target.ID(), err)
 				}
+				if out.PauseReason != "" {
+					return false, fmt.Errorf("%w: removal %s: %s", errAuthPaused, id, out.PauseReason)
+				}
 				return out.Dispatched, nil
-			}, removeIDs, startGen, probe); err != nil {
+			}, removeIDs, startGen, DeliveryOperationRemove, probe); err != nil {
 				return err
 			}
 		}
@@ -1081,6 +1353,7 @@ func (s *OrchestrationWorkflowSpec) executeRolloutPlan(
 					Manifests:     manifests,
 					Auth:          f.Auth(),
 					Generation:    startGen,
+					EvidenceError: evidenceError,
 				}
 				if evidence != nil {
 					in.Attestation = AssembleDeliverAttestation(f, manifests, evidence)
@@ -1093,22 +1366,21 @@ func (s *OrchestrationWorkflowSpec) executeRolloutPlan(
 			for id := range inputs {
 				ids = append(ids, id)
 			}
-			results, err := s.dispatchAndAwait(record, func(id DeliveryID) (bool, error) {
-				_, err := RunActivity(record, s.DeliverToTarget(), inputs[id])
-				return err == nil, err
-			}, ids, startGen, probe)
-			if err != nil {
-				return err
-			}
-			for _, result := range results {
-				if len(result.Result.ProvisionedTargets) > 0 || len(result.Result.ProducedSecrets) > 0 {
-					if _, err := RunActivity(record, s.ProcessDeliveryOutputs(), DeliveryOutputsInput{
-						DeliveryID: result.DeliveryID,
-						Result:     result.Result,
-					}); err != nil {
-						return fmt.Errorf("process delivery outputs: %w", err)
+			if err := s.dispatchAndAwait(record, func(id DeliveryID) (bool, error) {
+				out, err := RunActivity(record, s.DeliverToTarget(), inputs[id])
+				if err != nil {
+					if errors.Is(err, ErrAuthExpired) {
+						return false, fmt.Errorf("%w: delivery %s: %v", errAuthPaused, id, err)
 					}
+					return false, err
 				}
+				if out.PauseReason != "" {
+					return false, fmt.Errorf("%w: delivery %s: %s",
+						errAuthPaused, id, out.PauseReason)
+				}
+				return out.Dispatched, nil
+			}, ids, startGen, DeliveryOperationDeliver, probe); err != nil {
+				return err
 			}
 		}
 
@@ -1132,22 +1404,23 @@ func (s *OrchestrationWorkflowSpec) executeRolloutPlan(
 // (true, nil) when the target was dispatched, or (false, nil) to
 // indicate the target should be skipped (e.g. no delivery record
 // exists). Skipped targets are removed from tracking immediately.
-// Returns accumulated results once every tracked delivery has reached
-// a terminal state.
+// Returns once every tracked delivery has reached a terminal state.
 //
-// The expectedGen parameter identifies the generation this dispatch
-// cycle is operating on. Events whose generation does not match are
-// silently discarded to prevent stale signals (from a prior generation
-// whose delivery ID is the same) from affecting the current cycle.
+// The expectedGen and expectedOp parameters identify the delivery cycle
+// this dispatch is operating on. Events whose generation or operation
+// does not match are silently discarded: a target's put and removal
+// share a delivery ID at a single generation, so a stale signal from
+// the other operation must not complete or acknowledge this one.
 func (s *OrchestrationWorkflowSpec) dispatchAndAwait(
 	record Record,
 	dispatch func(DeliveryID) (bool, error),
 	ids []DeliveryID,
 	expectedGen Generation,
+	expectedOp DeliveryOperation,
 	runProbe FulfillmentRunProbe,
-) ([]DeliveryCompletionEvent, error) {
+) error {
 	if len(ids) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	probe := runProbe.DispatchCycleStarted(len(ids), expectedGen)
@@ -1159,7 +1432,6 @@ func (s *OrchestrationWorkflowSpec) dispatchAndAwait(
 		unacked[id] = struct{}{}
 		remaining[id] = struct{}{}
 	}
-	var results []DeliveryCompletionEvent
 
 	iteration := 0
 	for len(remaining) > 0 {
@@ -1167,7 +1439,7 @@ func (s *OrchestrationWorkflowSpec) dispatchAndAwait(
 			dispatched, err := dispatch(id)
 			if err != nil {
 				probe.Error(err)
-				return nil, err
+				return err
 			}
 			if !dispatched {
 				probe.Skipped(id)
@@ -1195,32 +1467,46 @@ func (s *OrchestrationWorkflowSpec) dispatchAndAwait(
 			}
 			if err != nil {
 				probe.Error(err)
-				return nil, fmt.Errorf("await delivery signal: %w", err)
+				return fmt.Errorf("await delivery signal: %w", err)
 			}
-			if err := s.processDeliveryEvent(event, expectedGen, unacked, remaining, &results, probe); err != nil {
-				return nil, err
+			if err := s.processDeliveryEvent(event, expectedGen, expectedOp, unacked, remaining, probe); err != nil {
+				return err
 			}
 		}
 		iteration++
 	}
-	return results, nil
+	return nil
+}
+
+// deliveryFailureError reports a delivery that the addon completed in
+// [DeliveryStateFailed]. It carries the delivery ID so [Run] can read
+// the recorded attempt count and back off accordingly before
+// restarting, and the reason the addon gave so the failure is legible
+// in logs.
+type deliveryFailureError struct {
+	deliveryID DeliveryID
+	reason     string
+}
+
+func (e *deliveryFailureError) Error() string {
+	return fmt.Sprintf("delivery %s failed: %s", e.deliveryID, e.reason)
 }
 
 // processDeliveryEvent handles a single FulfillmentEvent, updating the
-// unacked/remaining tracking maps and accumulating results. Events for
-// deliveries not in the current batch or whose generation does not
-// match expectedGen are silently ignored to prevent stale or unrelated
-// signals from affecting this dispatch cycle.
+// unacked/remaining tracking maps. Events for deliveries not in the
+// current batch or whose generation or operation does not match the
+// dispatch cycle are silently ignored to prevent stale or unrelated
+// signals from affecting it.
 func (s *OrchestrationWorkflowSpec) processDeliveryEvent(
 	event FulfillmentEvent,
 	expectedGen Generation,
+	expectedOp DeliveryOperation,
 	unacked map[DeliveryID]struct{},
 	remaining map[DeliveryID]struct{},
-	results *[]DeliveryCompletionEvent,
 	probe DispatchCycleProbe,
 ) error {
 	if event.DeliveryAcked != nil {
-		if event.DeliveryAcked.Generation != expectedGen {
+		if event.DeliveryAcked.Generation != expectedGen || event.DeliveryAcked.Operation != expectedOp {
 			probe.StaleEventDiscarded(event, expectedGen)
 			return nil
 		}
@@ -1230,7 +1516,7 @@ func (s *OrchestrationWorkflowSpec) processDeliveryEvent(
 		}
 	}
 	if event.DeliveryCompleted != nil {
-		if event.DeliveryCompleted.Generation != expectedGen {
+		if event.DeliveryCompleted.Generation != expectedGen || event.DeliveryCompleted.Operation != expectedOp {
 			probe.StaleEventDiscarded(event, expectedGen)
 			return nil
 		}
@@ -1243,13 +1529,14 @@ func (s *OrchestrationWorkflowSpec) processDeliveryEvent(
 		probe.Completed(did, event.DeliveryCompleted.Result.State)
 		switch event.DeliveryCompleted.Result.State {
 		case DeliveryStateFailed:
-			return fmt.Errorf("delivery %s failed: %s",
-				did, event.DeliveryCompleted.Result.Message)
+			return &deliveryFailureError{
+				deliveryID: did,
+				reason:     event.DeliveryCompleted.Result.Message,
+			}
 		case DeliveryStateAuthFailed:
 			return fmt.Errorf("%w: delivery %s: %s",
 				errAuthPaused, did, event.DeliveryCompleted.Result.Message)
 		}
-		*results = append(*results, *event.DeliveryCompleted)
 	}
 	return nil
 }
@@ -1340,8 +1627,10 @@ func deliveryIDFor(fID FulfillmentID, tgtID TargetID) DeliveryID {
 	return DeliveryID(string(fID) + ":" + string(tgtID))
 }
 
-// targetInfosByID looks up each id in pool and returns the matching
-// [TargetInfo] values. Unknown IDs are silently skipped.
+// targetInfosByID looks up each id in pool and returns the [TargetInfo]
+// values a removal can be dispatched to. An ID that is not registered
+// and a [TargetStateTerminated] target are skipped: no delivery agent
+// reaches the first, and what the second holds stays on it.
 func targetInfosByID(ids []TargetID, pool []TargetInfo) []TargetInfo {
 	index := make(map[TargetID]TargetInfo, len(pool))
 	for _, t := range pool {
@@ -1349,7 +1638,7 @@ func targetInfosByID(ids []TargetID, pool []TargetInfo) []TargetInfo {
 	}
 	out := make([]TargetInfo, 0, len(ids))
 	for _, id := range ids {
-		if t, ok := index[id]; ok {
+		if t, ok := index[id]; ok && t.State() != TargetStateTerminated {
 			out = append(out, t)
 		}
 	}
@@ -1358,6 +1647,12 @@ func targetInfosByID(ids []TargetID, pool []TargetInfo) []TargetInfo {
 
 // ComputeTargetDelta calculates the difference between the previous
 // resolved target set and the newly resolved set.
+//
+// Removed holds the previous targets a removal can be dispatched to.
+// A previous target that is no longer registered, or that is
+// [TargetStateTerminated], leaves the placement without one: no
+// delivery agent reaches the first, and what the second holds stays
+// on it.
 func ComputeTargetDelta(previousIDs []TargetID, resolved []TargetInfo, pool []TargetInfo) TargetDelta {
 	prevSet := make(map[TargetID]struct{}, len(previousIDs))
 	for _, id := range previousIDs {
@@ -1383,12 +1678,11 @@ func ComputeTargetDelta(previousIDs []TargetID, resolved []TargetInfo, pool []Ta
 		poolIndex[t.ID()] = t
 	}
 	for _, id := range previousIDs {
-		if _, stillResolved := resolvedSet[id]; !stillResolved {
-			if t, ok := poolIndex[id]; ok {
-				delta.Removed = append(delta.Removed, t)
-			} else {
-				delta.Removed = append(delta.Removed, TargetInfoFromSnapshot(TargetInfoSnapshot{ID: id}))
-			}
+		if _, stillResolved := resolvedSet[id]; stillResolved {
+			continue
+		}
+		if t, ok := poolIndex[id]; ok && t.State() != TargetStateTerminated {
+			delta.Removed = append(delta.Removed, t)
 		}
 	}
 

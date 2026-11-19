@@ -77,6 +77,11 @@ type ManagementCapabilityConfig struct {
 	// If set, SpecMessage is used only for identification; the descriptor
 	// is used directly without consulting the global registry.
 	SpecDescriptor protoreflect.MessageDescriptor
+
+	// ValidateID checks a create request's resource id before the
+	// resource is persisted. Nil means the generic name rules alone
+	// apply.
+	ValidateID func(id string) error
 }
 
 // InventoryCapabilityConfig holds the fields needed to build an
@@ -101,14 +106,24 @@ func (c *ResourceTypeConfig) ResourceMessageName() string {
 	return c.Singular
 }
 
+// ServiceRoot returns the HTTP route root shared by every collection
+// this service serves, e.g. "/apis/kind.open-cluster-management.io/v1alpha".
+// URLs below it are /apis/{service}/{version}/{resource path} (AIP-127):
+// a collection address lists or creates, and a resource name reads or
+// deletes one record.
+func (c *ResourceTypeConfig) ServiceRoot() string {
+	return "/apis/" + string(c.ResourceType.ServiceName()) + "/" + c.Version
+}
+
 // CanonicalHTTPPrefix returns the extension-specific HTTP route prefix
-// (e.g. "/apis/kind.open-cluster-management.io/v1alpha/clusters"). The service name
-// segment (derived from [ResourceType]) differentiates this extension's
-// routes from both other extensions and the platform's own canonical
-// routes (which would be at "/apis/open-cluster-management.io/v1alpha/clusters" for the
-// same identity domain).
+// for this collection (e.g. "/apis/kind.open-cluster-management.io/v1alpha/clusters").
+// The service name segment (derived from [ResourceType]) differentiates
+// this extension's routes from both other extensions and the platform's
+// own canonical routes (which would be at
+// "/apis/open-cluster-management.io/v1alpha/clusters" for the same
+// identity domain).
 func (c *ResourceTypeConfig) CanonicalHTTPPrefix() string {
-	return "/apis/" + string(c.ResourceType.ServiceName()) + "/" + c.Version + "/" + c.CollectionID
+	return c.ServiceRoot() + "/" + c.CollectionID
 }
 
 // Collection returns the relative resource name collection prefix

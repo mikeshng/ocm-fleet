@@ -25,6 +25,7 @@ Read this when you are working on the kubernetes addon, extending its delivery o
 - Fleet-wide indexing model and the inventory item shape: [../architecture/resource_indexing.md](../architecture/resource_indexing.md)
 - Addon lifecycle and capability model: [../architecture/addon_integration.md](../architecture/addon_integration.md)
 - Core vocabulary (fulfillment, strategies, delivery agents): [../architecture/core_model.md](../architecture/core_model.md)
+- Taking in a cluster the platform did not create, and working beside OCM hubs: [existing-clusters-and-ocm-hubs.md](existing-clusters-and-ocm-hubs.md)
 
 ## Related docs
 
@@ -48,7 +49,7 @@ credentials are supplied, and how inventory reports reach the platform.
 
 ## Addon descriptor and capabilities
 
-The addon declares two capabilities: delivery for the `kubernetes` target type, and inventory reporting for the generic Kubernetes object resource type.
+The addon declares delivery for the `kubernetes` target type, and inventory reporting for three resource types: the generic Kubernetes object, and the two records of enrollment, an enrolled cluster and an enrollment bundle (see [existing-clusters-and-ocm-hubs.md](existing-clusters-and-ocm-hubs.md)).
 
 ```go
 AddonDescriptor{
@@ -57,6 +58,8 @@ AddonDescriptor{
     Capabilities: []Capability{
         DeliveryCapability{TargetType: "kubernetes"},
         InventoryResourceCapability{ResourceType: "kubernetes.open-cluster-management.io/Object"},
+        InventoryResourceCapability{ResourceType: "kubernetes.open-cluster-management.io/Cluster"},
+        InventoryResourceCapability{ResourceType: "kubernetes.open-cluster-management.io/EnrollmentBundle"},
     },
 }
 ```
@@ -65,9 +68,9 @@ Delivery capability means the addon can apply and remove manifests via server-si
 
 At Connect time, the addon provides its delivery agent and the inventory-only schema for `Object`. The platform validates delivery and registers the schema for reporting authorization. Indexing runtime lifecycle is **not** part of Connect: the addon manager does not start or stop indexers.
 
-In the current POC, the descriptor is compiled into the server binary. Enable and Connect happen at startup. The in-process indexing runtime is composed in server wiring and injected into producers (Kind) that start and stop indexers. In a future external agent model, the same inventory report contract would be used over a transport, and an agent pod on the target cluster would own its own lifecycle rather than being hosted in-process.
+In the current POC, the descriptor is compiled into the server binary. Enable and Connect happen at startup. The in-process indexing runtime is composed in server wiring and injected into producers (Kind) and into the addon's own enrollment service, which start and stop indexers. In a future external agent model, the same inventory report contract would be used over a transport, and an agent pod on the target cluster would own its own lifecycle rather than being hosted in-process.
 
-The addon does not declare a managed resource capability for watched cluster objects. Kubernetes delivery targets are registered through the platform's target management / delivery-output path. Watched objects are inventory-only extension resources under `kubernetes.open-cluster-management.io/Object`.
+The addon does not declare a managed resource capability for watched cluster objects. Kubernetes delivery targets are registered through the platform's target management / delivery-output path, or, for a cluster that already exists, by the addon's enrollment service. Watched objects are inventory-only extension resources under `kubernetes.open-cluster-management.io/Object`.
 
 ## Agent
 
@@ -108,9 +111,9 @@ ensured:
 - **Client construction**: builds Kubernetes clients from API server, CA, and bearer credential
 - **Unexpected-exit restart**: when a vault-backed credential ref is present, a small number of local restarts with backoff; re-resolves the credential from vault (raw token bytes are not retained after start handoff)
 
-Producers own start/stop for provisioned clusters: Kind ensures an indexer before reporting delivery success, and stops it at cluster teardown. After addon Connect, a one-shot startup replay lists persisted kubernetes targets with resolvable credentials and starts indexers so server restart recovers indexing. There is no store-driven reconcile loop and no orchestration hooks for indexing.
+Producers own start/stop for provisioned clusters: Kind ensures an indexer before reporting delivery success, and stops it at cluster teardown. Enrollment does the same for a cluster it takes in: it ensures an indexer when the cluster is enrolled and when its credential is renewed, and stops it at withdrawal. After addon Connect, a one-shot startup replay lists persisted kubernetes targets with resolvable credentials and starts indexers so server restart recovers indexing. There is no store-driven reconcile loop and no orchestration hooks for indexing.
 
-The host does not manage inventory cleanup. Stopping an indexer only stops watching; target-scoped indexed inventory cleanup after target deletion is currently deferred (stale inventory can remain until a future cleanup path lands).
+The host does not manage inventory cleanup, and stopping an indexer only stops watching. Cleanup happens around it, in three places: withdrawal of an enrolled cluster removes that cluster's indexed objects; a periodic sweep in the addon removes the objects of every cluster that has neither a kubernetes target nor a running indexer, once two sweeps in a row have seen it so; and each indexer run removes what it did not find again (see [absence reconciliation](#watch-continuity-and-absence-reconciliation-across-restart)).
 
 Ensure is idempotent for the same generation and fingerprint — concurrent matching calls join rather than creating duplicates. A higher generation or changed fingerprint (API server, CA, credential identity, index-config digest) stop-and-replaces. A lower generation is rejected as stale.
 
@@ -134,7 +137,7 @@ The actual fleetlet channel integration is not yet built, but no structural chan
 
 ## Delivery pipeline
 
-The delivery agent handles manifest apply and removal. It supports two delivery modes based on whether an attestation is present.
+The delivery agent handles manifest apply and removal. Which credential it uses depends on whether an attestation is present and on the rule the target declares for its stored credential.
 
 ### Attested delivery
 
@@ -150,13 +153,33 @@ The trust bundle is a JSON array of trusted issuers stored as a target property.
 
 When no attestation is provided, the delivery falls through to passthrough mode. The caller must provide a bearer token. The delivery uses the caller's credentials directly, so the caller's own Kubernetes RBAC governs what gets applied. The platform's service account is never used.
 
+### Granted platform delivery
+
+A target can carry an explicit grant (`delivery_credential: platform`), which enrollment records with who gave it. On such a target, intent without an attestation from an authenticated caller is applied with the platform's stored credential instead of the caller's token. The grant is the only way the stored credential applies unattested intent: without it, a refusal of the caller's token stands, and the stored credential is never tried in its place.
+
 ### Server-side apply
 
-Both modes use the same apply path. Manifests are applied sequentially via server-side apply with field manager `resource-manager`. Progress events are reported per manifest. A failure on any manifest stops the delivery. Kubernetes 401/403 errors map to `AuthFailed`; all other errors map to `Failed`.
+All modes use the same apply path. Manifests are applied sequentially via server-side apply with field manager `resource-manager`. Progress events are reported per manifest. A failure on any manifest stops the delivery.
+
+A cluster that forbids a call (403), or that does not recognize the caller's token (401), maps to `AuthFailed`, which pauses the fulfillment until a caller resumes it with fresh credentials. A cluster that does not recognize the platform's stored credential (401) maps to `Failed`, like every other error, and is retried with backoff: no caller can replace that credential, and it comes back when the platform renews it or the cluster's side presents a new one. Removal classifies a refusal the same way.
+
+One 403 is not about the credential: a cluster refuses new content in a namespace that is still being deleted. A deployment that leaves a cluster and is placed on it again before its namespace is gone meets that answer. It maps to `Failed` and is retried with backoff, whatever the credential, because the same call succeeds once the namespace is gone.
+
+### Objects out of reach
+
+Some objects on a target are not for deliveries, whatever the credential allows: the namespace that holds the platform's own access to an enrolled cluster, and what another addon declares. An addon registers a guard with the delivery agent; a guard is asked about a target and answers, for one object (its API group, kind, namespace, and name), with the reason it is out of reach there or with nothing. The kubernetes addon's own guard covers the namespace of the access account on an enrolled target. The ocm addon's guard covers Open Cluster Management on a cluster a hub manages, and a hub's own objects on the cluster it runs on (see [existing clusters and OCM hubs](existing-clusters-and-ocm-hubs.md#what-a-deployment-cannot-reach)).
+
+Every manifest of a delivery is checked before the first one is applied. A delivery that names an object out of reach maps to `Failed`, with a message that names the manifest and the reason, and nothing of it is applied; it is retried with backoff, so it goes through once the manifest no longer names such an object.
 
 ### Removal
 
-Removal follows the same attestation-or-passthrough flow as delivery, then deletes each resource. Resources that are already gone (404) are silently treated as success, making removal idempotent.
+Removal chooses its credential the same way as delivery, then deletes each resource. Resources that are already gone (404) are silently treated as success, making removal idempotent.
+
+Removal only deletes objects this resource manager wrote. The cluster records which field manager applied which fields; an object with no managed-fields entry for the addon's field manager (see [Server-side apply](#server-side-apply)) was written by someone else. That happens legitimately: a removal can be dispatched for a delivery that failed before it applied anything, and its manifest then names another manager's object. Deleting by name would take that object away from its owner, so the removal leaves it in place and names it in the result.
+
+A cluster answers "forbidden" to a delete it does not allow whether or not the object exists. With the caller's credential that refusal stands, because the caller can come back with more rights. With the stored credential nobody can, so a forbidden delete is looked at: if the object is not there, there is nothing to remove; if the credential may not read that kind either, the object is left and named in the result; if the object is there and readable, the refusal stands.
+
+An object that is out of reach of deliveries on the target (see [Objects out of reach](#objects-out-of-reach)) is not deleted either: it is left in place and named in the result, like another manager's object.
 
 ### Async dispatch
 
@@ -320,6 +343,8 @@ Each informer implements LIST+WATCH for a single GVR with minimal memory overhea
 
 **Retry**: on LIST or WATCH errors, the informer retries with exponential backoff. Retries reset on a successful watch start.
 
+**Refused resources**: a LIST or WATCH that the cluster's authorization refuses is a state, not a failure. It is noted once, the informer counts as initialized so the informers after it do not wait, and it asks again after 30 seconds, doubling up to 15 minutes. After three refusals in a row, the objects of that resource which the informer had indexed are taken out of the inventory. This is what lets a cluster be indexed with a credential that may read only part of it.
+
 ### Writer
 
 The writer batches informer events, performs two-tier extraction, computes edges, and flushes results to the inventory reporter at a configurable interval (default 5s).
@@ -339,7 +364,7 @@ The writer batches informer events, performs two-tier extraction, computes edges
 4. Send upserts and deletes in one mixed inventory report batch
 5. On success, advance the acknowledged-UID set and version dedup state; then flush edges to the edge sink (skipped when disabled)
 
-**Resync** (on LIST snapshot): extract all resources for the GVR, compute deletes as acknowledged UIDs minus LIST UIDs for the **current process/GVR generation only**, and send one mixed report batch. On success, replace the acknowledged-UID baseline with the LIST set and ack the informer so WATCH can start. On failure, retain the batch for ticker retry; do not advance the baseline or ack. A first LIST after process start has an empty acknowledged set, so it upserts only — it does not prune database-only rows left by an earlier process.
+**Resync** (on LIST snapshot): extract all resources for the GVR, compute deletes as acknowledged UIDs minus LIST UIDs for the **current process/GVR generation only**, and send one mixed report batch. On success, replace the acknowledged-UID baseline with the LIST set and ack the informer so WATCH can start. On failure, retain the batch for ticker retry; do not advance the baseline or ack. A first LIST after process start has an empty acknowledged set, so it upserts only — the writer does not prune database-only rows left by an earlier process. The indexer run removes those once, after its informers have settled (see [absence reconciliation](#watch-continuity-and-absence-reconciliation-across-restart)).
 
 **Error recovery**: on write failure, the writer retries with exponential backoff (up to 3 attempts: 1s, 2s, 4s). If all retries are exhausted, the failed batch remains pending and is retried on the next batch tick. Deduplication and the acknowledged-UID baseline advance only after a successful write, so failed items are never silently lost. Memory during extended outages is bounded by unique UIDs on the cluster.
 
@@ -353,7 +378,9 @@ The inventory reporter is the addon-to-platform direction of the indexing protoc
 
 - one mixed batch of complete-object upserts and exact-name deletes — the sole live write path for Kubernetes object inventory
 
-There are no separate platform resync/collection-delete/subtree-delete methods on this boundary. Same-process LIST omission reconciliation is expressed as ordinary deletes computed from the in-memory acknowledged-UID set. Target-wide subtree cleanup is deferred and not exposed here.
+There are no separate platform resync/collection-delete/subtree-delete methods on the live write path. Same-process LIST omission reconciliation is expressed as ordinary deletes computed from the in-memory acknowledged-UID set.
+
+Two cleanup operations sit beside that path, outside the report shape. A reporter may offer to remove the objects of one cluster that no report has written since a given time; an indexer run calls it once (see [absence reconciliation](#watch-continuity-and-absence-reconciliation-across-restart)). The addon's record store can remove a whole cluster subtree, which withdrawal and the sweep for clusters without a target use. Neither is a transport contract yet: an external agent would need the first one carried by its reporter.
 
 In-process, a direct adapter always reports under `kubernetes.open-cluster-management.io/Object` and maps both upserts and deletes into one platform replacement batch. In the external model, a transport adapter would implement the same report shape.
 
@@ -403,7 +430,7 @@ Every watched resource gets the following projected into the inventory report, w
 | Observation extracted             | empty object unless enriched tier fills it                                                                                                                       |
 | Controlling owner UID (in-memory) | controlling `metadata.ownerReferences` entry (used for recursive edge building)                                                                                  |
 
-Secret `data` is not stored in observation — only metadata/identity and safe extracted fields.
+Secret `data` is not stored in observation — only metadata/identity and safe extracted fields. The annotation that `kubectl apply` writes, `kubectl.kubernetes.io/last-applied-configuration`, is dropped from the observation for the same reason: it is a copy of the whole object, and would carry Secret data and anything else that was applied into the inventory.
 
 ### Enriched tier
 
@@ -474,13 +501,15 @@ Pod `attachedTo` edges currently come from `spec.volumes` and `spec.containers[]
 
 Watch continuity (resourceVersion cursor) and persistence acknowledgement (acknowledged UID set) are held in memory per process/GVR generation and discarded when the indexer stops. Within one generation, LIST/resync deletes only previously acknowledged UIDs absent from the LIST, and clean watch disconnects resume from the cursor without LIST.
 
-After process restart that state is gone: a fresh indexer performs a full LIST per GVR against an empty acknowledged baseline (upsert-only), rebuilds in-memory edge state from scratch, and does not remove database-only rows left by an earlier process. Objects deleted while the indexer was down can remain until a future cleanup path or manual operation removes them. Existing inventory survives in the database, but the synchronization checkpoint is lost.
+After process restart that state is gone: a fresh indexer performs a full LIST per GVR against an empty acknowledged baseline (upsert-only) and rebuilds in-memory edge state from scratch. The writer therefore cannot remove database-only rows left by an earlier process: objects deleted while the indexer was down, or the objects of a cluster that was recreated under the same name.
 
-A platform-persisted checkpoint per GVR per target — last successfully processed resourceVersion plus an acknowledged membership baseline — could address both sides: resume or narrow WATCH without a full LIST, and prune cross-process absences. Clean in-process watch resume already avoids LIST on ordinary disconnects; this is about stop/restart and the correctness gap that upsert-only recovery leaves behind.
+The indexer run closes that gap without a checkpoint. It notes when it started. Once every informer has listed its resource, or has been refused it three times, the run removes, once, the cluster's objects that no report has written since that time. Existing inventory therefore survives a restart, and what is no longer on the cluster leaves after the first complete pass. Two limits remain: a cluster whose discovery fails, or a resource that can never be listed for a reason other than refusal, keeps its unconfirmed rows, because the run never settles; and an object that is listed but cannot be extracted loses the row an earlier process wrote.
+
+A platform-persisted checkpoint per GVR per target — last successfully processed resourceVersion plus an acknowledged membership baseline — could still improve on this: resume or narrow WATCH without a full LIST, and prune cross-process absences without waiting for a complete pass. Clean in-process watch resume already avoids LIST on ordinary disconnects; this is about stop/restart.
 
 ### CRD / GVR removal and target inventory cleanup
 
-When a GVR leaves the desired set, or when an indexer is stopped / a target is deleted, persisted inventory for that scope is not deleted. GVR removal drops in-memory state only. Target-scoped indexed inventory cleanup after target deletion is deferred. Restoring offline, owner-validated subtree cleanup (or an equivalent) remains open work.
+When a GVR leaves the desired set, persisted inventory for that GVR is not deleted by that event; GVR removal drops in-memory state only, and the rows leave with the next indexer run's removal of what it did not find again. When a target is deleted, the objects of its cluster are removed by the withdrawal that deleted it or, for any other path, by the addon's sweep for clusters that have neither a target nor an indexer. Stopping an indexer by itself removes nothing. Owner-validated subtree cleanup as part of target deletion itself, and not as a sweep after it, remains open work.
 
 ### Producer indexing handshake durability
 
@@ -489,14 +518,14 @@ Producers call `EnsureIndexer` before reporting `Delivered`, and a one-shot star
 What remains open are crash and signal windows around that handshake:
 
 - **Startup-replay miss**: a kubernetes target committed after the replay's final list scan stays unindexed until a later `EnsureIndexer` or process restart + replay. Replay is one-shot; it does not poll.
-- **Crash after Ensure, before terminal `ReportResult`**: the in-process indexer dies with the server. The Kind cluster may already exist, but delivery is not terminal, outputs are not committed, and startup replay has nothing to list. The workflow is still waiting for completion. Kind has no active-delivery recovery yet, so this window can stall until a recovery path lands.
-- **Non-atomic `ReportResult` commit vs workflow signal**: delivery state is persisted, then the fulfillment signal is sent in a separate step. If the process dies after committing `Delivered` but before the signal is observed, `ProcessDeliveryOutputs` (vault + target registration) may never run. Startup replay cannot start an indexer without those outputs. By contrast, once a completion signal is durably in workflow history, a failed or interrupted `ProcessDeliveryOutputs` activity is retried by the workflow — that case does not depend on startup replay.
+- **Crash after Ensure, before terminal `ReportResult`**: the in-process indexer dies with the server. The Kind cluster may already exist, but delivery is not terminal, outputs are not committed, and startup replay has nothing to list. The workflow is still waiting for completion. The kubernetes add-on's post-connect recovery re-dispatches non-terminal deliveries, best effort, which runs `Deliver` or `Remove` again — including the Kind indexer handshake — so the delivery can still reach a terminal state without waiting for another delivery signal.
+- **`ReportResult` commit and workflow signal**: delivery state and its structured outputs are committed together — secrets to the vault, inventory and target registration in the delivery-state transaction. A terminal report also records a completion obligation in that same transaction. The fulfillment signal is sent promptly after the commit and the obligation is cleared once the send succeeds; if the send fails, or the process stops between the commit and the send, the relay finds the surviving obligation and sends it again, so a workflow cannot miss a completion that was durably reported. Replaying the signal is safe: a workflow ignores completions for deliveries it is no longer waiting for. The non-terminal acknowledgement is not recorded this way; only terminal completions carry an obligation.
 
-Deferred target-scoped cleanup amplifies the worst windows: inventory written by a briefly running indexer can remain if teardown or handshake recovery never cleans it up.
+A briefly running indexer can still leave inventory behind in the worst windows, until the sweep for clusters without a target removes it.
 
 ### Kind same-generation token remint restarts the indexer
 
-On a same-generation Kind Deliver (cluster already owned; no recreate), `ensureCluster` still mints a new platform ServiceAccount token via TokenRequest. Producer `EnsureIndexer` then sees a fingerprint change because the runtime fingerprint digests raw credential bytes, and stop-and-replaces a healthy indexer. Options include reusing a resolvable vault-backed token on same-generation ensure, fingerprinting by secret-ref identity (with a clear credential-rotation story), or skipping `EnsureIndexer` when fingerprint-relevant inputs are unchanged. Any fix should stay consistent with vault-backed unexpected-exit restart.
+On a same-generation Kind Deliver (cluster already owned; no recreate), `ensureCluster` still mints a new platform ServiceAccount token via TokenRequest. Producer `EnsureIndexer` then sees a fingerprint change because the runtime fingerprint digests raw credential bytes, and stop-and-replaces a healthy indexer. Options include reusing a resolvable vault-backed token on same-generation ensure, fingerprinting by secret-ref identity (with a clear credential-rotation story), or skipping `EnsureIndexer` when fingerprint-relevant inputs are unchanged. Any fix should stay consistent with vault-backed unexpected-exit restart. The renewal of an enrolled cluster's credential restarts that cluster's indexer for the same reason.
 
 ### Logical object naming and incarnation
 
@@ -524,7 +553,7 @@ The implementation stores only the latest observation and current conditions per
 
 ### Annotation collection policy
 
-Annotation handling needs a deliberate decision. Today the base observation stores the object's annotations uncapped in metadata, while an unused schema opt-in can also store a size-capped, noise-stripped copy under `extracted`. That dual path should not stand. Options to choose among include: collect no annotations at all; or keep annotations with a size limit and always drop known-large noise such as `kubectl.kubernetes.io/last-applied-configuration`. Revisit storage cost, sensitivity, and query value before locking a policy.
+Annotation handling needs a deliberate decision. Today the base observation stores the object's annotations uncapped in metadata, apart from `kubectl.kubernetes.io/last-applied-configuration`, which is always dropped, while an unused schema opt-in can also store a size-capped, noise-stripped copy under `extracted`. That dual path should not stand. Options to choose among include: collect no annotations at all; or keep annotations with a size limit and a list of known-large or sensitive ones to drop. Revisit storage cost, sensitivity, and query value before locking a policy.
 
 ### Inventory write-path performance
 

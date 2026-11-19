@@ -18,6 +18,10 @@ type IndexConfig struct {
 	AllowList       []Resource
 	NamespaceFilter *NamespaceFilterConfig
 	BatchInterval   time.Duration
+	// SettleCheckInterval is how often a starting indexer looks whether
+	// it has read everything it can, after which it removes what it did
+	// not find again (see [StaleObjectPurger]). Zero means 5 seconds.
+	SettleCheckInterval time.Duration
 }
 
 // indexerDelegate holds indexing-specific state for one managed cluster.
@@ -50,6 +54,9 @@ func newIndexerDelegate(
 	if cfg.BatchInterval == 0 {
 		cfg.BatchInterval = 5 * time.Second
 	}
+	if cfg.SettleCheckInterval == 0 {
+		cfg.SettleCheckInterval = 5 * time.Second
+	}
 	if edgeSink == nil {
 		edgeSink = NoopEdgeSink{}
 	}
@@ -75,6 +82,7 @@ func newIndexerDelegate(
 // calls are made for this target after done closes.
 func (ic *indexerDelegate) start(ctx context.Context) {
 	defer close(ic.done)
+	startedAt := time.Now()
 
 	schemaMap := ic.cfg.Schema.Entries
 
@@ -111,9 +119,20 @@ func (ic *indexerDelegate) start(ctx context.Context) {
 		w.Run(writerCtx)
 	}()
 
+	// What this run does not find again is removed once it has read
+	// everything it can (see [StaleObjectPurger]). startedAt was taken
+	// before the writer and the informers existed, so every object this
+	// run reports is written after it.
+	purgeDone := make(chan struct{})
+	go func() {
+		defer close(purgeDone)
+		ic.purgeUnconfirmedObjects(ctx, mgr, startedAt)
+	}()
+
 	// RunContinuous blocks until ctx is cancelled, performing initial
 	// reconciliation and re-reconciling when CRDs change.
 	mgr.RunContinuous(ctx, ic.cfg.DenyList, ic.cfg.AllowList)
+	<-purgeDone
 
 	// Context is done; clean up informers and writer under one budget.
 	// StopAll does not emit RemoveGVR events, so shutdown does not treat
@@ -133,5 +152,39 @@ func (ic *indexerDelegate) start(ctx context.Context) {
 	case <-shutdownCtx.Done():
 		writerCancel()
 		<-writerDone
+	}
+}
+
+// purgeUnconfirmedObjects waits until the informers have a first
+// complete picture of the cluster, then removes, once, the cluster's
+// objects that nothing has written since startedAt. It returns when
+// that is done or ctx ends; a failed removal is retried.
+func (ic *indexerDelegate) purgeUnconfirmedObjects(ctx context.Context, mgr *InformerManager, startedAt time.Time) {
+	purger, ok := ic.reporter.(StaleObjectPurger)
+	if !ok {
+		return
+	}
+	ticker := time.NewTicker(ic.cfg.SettleCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if !mgr.Settled() {
+			continue
+		}
+		removed, err := purger.PurgeObjectsNotReportedSince(ctx, ic.clusterResourceName, startedAt)
+		if err != nil {
+			if ctx.Err() == nil {
+				ic.logger.Warn("could not remove indexed objects that no longer exist; will retry", "error", err)
+			}
+			continue
+		}
+		if removed > 0 {
+			ic.logger.Info("removed indexed objects that no longer exist in the cluster", "objects", removed)
+		}
+		return
 	}
 }

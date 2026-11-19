@@ -3,6 +3,7 @@ package domain
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -261,6 +262,16 @@ func (a *Attestation) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// ErrSignerEnrollmentMissing reports that a fulfillment's provenance
+// names a signer with no enrollment on record. The signer assertion an
+// attestation carries cannot be assembled, so any delivery or removal
+// that needs one has to pause until the fulfillment is resumed with a
+// signature by an enrolled signer. Deleting the fulfillment does not
+// lift that: the withdrawal of what reached a target carries the same
+// attestation. Enrolling a signer only records it; it does not restart
+// a paused fulfillment.
+var ErrSignerEnrollmentMissing = errors.New("signer enrollment missing")
+
 // AttestationAssembler resolves attestation evidence from the [Store]
 // using coordinates stored on a [Fulfillment]'s [AttestationRef]. It
 // centralizes the I/O that was previously scattered through the
@@ -280,8 +291,8 @@ func (AttestationAssembler) Resolve(ctx context.Context, tx Tx, f *Fulfillment) 
 		return nil, fmt.Errorf("list signer enrollments: %w", err)
 	}
 	if len(found) == 0 {
-		return nil, fmt.Errorf("no signer enrollment found for %s / %s",
-			f.Provenance().Sig.Signer.Subject, f.Provenance().Sig.Signer.Issuer)
+		return nil, fmt.Errorf("%w: no enrollment found for %s / %s",
+			ErrSignerEnrollmentMissing, f.Provenance().Sig.Signer.Subject, f.Provenance().Sig.Signer.Issuer)
 	}
 	enrollment := found[0]
 

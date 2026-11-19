@@ -20,4 +20,6 @@ export interface ClusterResource {
   pauseReason?: string;
   conditions?: Record<string, ClusterCondition>;
   observation?: Record<string, unknown>;
+  /** Labels of the record: for an enrolled cluster, its target's labels. */
+  localLabels?: Record<string, string>;
 }

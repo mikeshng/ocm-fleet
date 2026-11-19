@@ -1,7 +1,12 @@
 import {
   ClusterResource,
   createResourceApi,
+  enrolledClusterStatus,
   extractClusterId,
+  type FleetClusterRow,
+  fleetClusterTypeFilter,
+  mergeFleetClusters,
+  observedClusterStatus,
   ResourceResult,
 } from "@ocm-fleet/common";
 import { createContext, useContext, useEffect, useState } from "react";
@@ -168,14 +173,40 @@ export function toDashboardCluster(
   };
 }
 
-function mapClusters(
-  raw: ResourceResult<ClusterResource>[],
-): DashboardCluster[] {
+type FleetRow = FleetClusterRow<ResourceResult<ClusterResource>>;
+
+/** A cluster of any origin as the dashboard shows it. */
+export function rowToDashboardCluster(
+  row: FleetRow,
+  enrichment: EnrichmentData,
+): DashboardCluster {
+  const base = toDashboardCluster(row.result, enrichment);
+  if (row.origin === "created") return base;
+  const status =
+    row.origin === "enrolled"
+      ? enrolledClusterStatus(row.result)
+      : observedClusterStatus(row.result);
+  const version = row.result.resource.observation?.kubernetesVersion;
+  return {
+    ...base,
+    id: row.id,
+    name: row.id,
+    provider: row.origin,
+    status: status.healthy
+      ? "healthy"
+      : status.attention
+        ? "critical"
+        : "degraded",
+    version: typeof version === "string" && version ? version : "unknown",
+    state: status.text,
+  };
+}
+
+function mapClusters(rows: FleetRow[]): DashboardCluster[] {
   const store = loadEnrichmentStore();
-  const clusters = raw.map((c): DashboardCluster => {
-    const id = extractClusterId(c.name);
-    const enrichment = getOrCreateEnrichment(store, id);
-    return toDashboardCluster(c, enrichment);
+  const clusters = rows.map((row): DashboardCluster => {
+    const enrichment = getOrCreateEnrichment(store, row.id);
+    return rowToDashboardCluster(row, enrichment);
   });
   // prune stale entries
   const liveIds = new Set(clusters.map((c) => c.id));
@@ -196,10 +227,10 @@ export function useFleetData(): FleetData {
     async function load() {
       try {
         const raw = await clusterApi.searchAll({
-          filter: 'resourceType == "kind.open-cluster-management.io/Cluster"',
+          filter: fleetClusterTypeFilter(),
         });
         if (!cancelled) {
-          setClusters(mapClusters(raw));
+          setClusters(mapClusters(mergeFleetClusters(raw)));
           setError(null);
         }
       } catch (err) {

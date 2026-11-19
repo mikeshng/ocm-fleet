@@ -152,6 +152,13 @@ const CorePlugin = new FleetPlugin({
       resolve: { $codeRef: "K8sObjectSearchResult.resolveK8sObject" },
       icon: { $codeRef: "K8sObjectSearchResult.K8sObjectIcon" },
     }),
+    createSearchResultRenderer({
+      id: "enrolled-cluster-renderer",
+      label: "Cluster",
+      resourceType: "kubernetes.open-cluster-management.io/Cluster",
+      resolve: { $codeRef: "ClusterSearchResult.resolveEnrolledCluster" },
+      icon: { $codeRef: "ClusterSearchResult.EnrolledClusterIcon" },
+    }),
     createClusterDetailTab({
       id: "pods-tab",
       label: "Pods",
@@ -195,6 +202,9 @@ const CorePlugin = new FleetPlugin({
       NodesIcon: p("./src/plugins/core-plugin/NodesIcon.tsx"),
       K8sObjectSearchResult: p(
         "./src/plugins/core-plugin/K8sObjectSearchResult.tsx",
+      ),
+      ClusterSearchResult: p(
+        "./src/plugins/core-plugin/ClusterSearchResult.tsx",
       ),
       ClusterPodsTab: p("./src/plugins/core-plugin/ClusterPodsTab.tsx"),
       ClusterNamespacesTab: p(

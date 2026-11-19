@@ -7,6 +7,13 @@ import (
 )
 
 // TargetState indicates where a target is in its lifecycle.
+//
+// Placement and dispatch read the state in three groups. A target that
+// is [TargetStateReady] can be selected by any fulfillment. A target
+// that is [TargetStateTerminated] is leaving the fleet: it is selected
+// by nothing and nothing is dispatched to it, so what it holds stays
+// on it. A target in any other state is selected by nothing new, and
+// the fulfillments that already hold it keep it (see [PlacementPool]).
 type TargetState string
 
 const (
@@ -118,10 +125,77 @@ func ToPlacementTarget(t TargetInfo) PlacementTarget {
 func PlacementTargets(pool []TargetInfo) []PlacementTarget {
 	out := make([]PlacementTarget, 0, len(pool))
 	for _, t := range pool {
-		if t.state != TargetStateReady && t.state != "" {
+		if !t.ready() {
 			continue
 		}
 		out = append(out, ToPlacementTarget(t))
+	}
+	return out
+}
+
+// ready reports whether the target takes new placement.
+func (t TargetInfo) ready() bool {
+	return t.state == TargetStateReady || t.state == ""
+}
+
+// PlacementPool is the placement view of the registered targets for one
+// fulfillment.
+//
+// Readiness decides which targets take new work. It does not decide
+// which targets lose the work they hold. A target the fulfillment
+// already holds that is registered but not ready is retained: it stays
+// a candidate, so a static placement that names it still resolves, and
+// it stays placed whatever the strategy resolves, so no removal is
+// planned for a target that may be out of reach. Once it is ready
+// again the strategy alone decides. A [TargetStateTerminated] target is
+// neither a candidate nor retained.
+type PlacementPool struct {
+	// Candidates are the targets the placement strategy selects from:
+	// every ready target, then every retained one, in pool order.
+	Candidates []PlacementTarget
+	// Retained are the held targets that are registered and neither
+	// ready nor terminated.
+	Retained []PlacementTarget
+}
+
+// NewPlacementPool builds the placement view of pool for a fulfillment
+// whose materialized placement is held.
+func NewPlacementPool(pool []TargetInfo, held []TargetID) PlacementPool {
+	heldSet := make(map[TargetID]struct{}, len(held))
+	for _, id := range held {
+		heldSet[id] = struct{}{}
+	}
+	p := PlacementPool{Candidates: make([]PlacementTarget, 0, len(pool))}
+	for _, t := range pool {
+		if t.ready() {
+			p.Candidates = append(p.Candidates, ToPlacementTarget(t))
+			continue
+		}
+		if _, isHeld := heldSet[t.id]; !isHeld || t.state == TargetStateTerminated {
+			continue
+		}
+		retained := ToPlacementTarget(t)
+		p.Candidates = append(p.Candidates, retained)
+		p.Retained = append(p.Retained, retained)
+	}
+	return p
+}
+
+// Settle returns the placement a pass converges to: the targets the
+// strategy resolved, followed by the retained targets it left out.
+func (p PlacementPool) Settle(resolved []PlacementTarget) []PlacementTarget {
+	if len(p.Retained) == 0 {
+		return resolved
+	}
+	seen := make(map[TargetID]struct{}, len(resolved))
+	for _, t := range resolved {
+		seen[t.ID] = struct{}{}
+	}
+	out := slices.Clone(resolved)
+	for _, t := range p.Retained {
+		if _, ok := seen[t.ID]; !ok {
+			out = append(out, t)
+		}
 	}
 	return out
 }

@@ -345,7 +345,7 @@ func ObjectObservation(id KubernetesObjectIdentity, obj *unstructured.Unstructur
 			"generation":        obj.GetGeneration(),
 			"creationTimestamp": obj.GetCreationTimestamp(),
 			"deletionTimestamp": obj.GetDeletionTimestamp(),
-			"annotations":       obj.GetAnnotations(),
+			"annotations":       observedAnnotations(obj),
 			"ownerReferences":   obj.GetOwnerReferences(),
 		},
 		"extracted": extracted,
@@ -355,6 +355,27 @@ func ObjectObservation(id KubernetesObjectIdentity, obj *unstructured.Unstructur
 		return json.RawMessage(`{}`)
 	}
 	return raw
+}
+
+// lastAppliedAnnotation is where kubectl apply keeps a copy of the
+// whole object it applied.
+const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
+
+// observedAnnotations returns the object's annotations without
+// kubectl's copy of the applied object. That copy repeats the object's
+// content, which for a Secret is the secret itself: kept, it would put
+// the data of every Secret applied with kubectl into the inventory,
+// where anyone who may search can read it.
+func observedAnnotations(obj *unstructured.Unstructured) map[string]string {
+	annotations := obj.GetAnnotations()
+	if _, ok := annotations[lastAppliedAnnotation]; !ok {
+		return annotations
+	}
+	delete(annotations, lastAppliedAnnotation)
+	if len(annotations) == 0 {
+		return nil
+	}
+	return annotations
 }
 
 // RawCondition is one Kubernetes status.conditions entry as read from

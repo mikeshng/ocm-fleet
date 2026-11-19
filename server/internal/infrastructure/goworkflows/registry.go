@@ -104,7 +104,13 @@ func (r *Registry) timeout() time.Duration {
 }
 
 func (r *Registry) SignalFulfillmentEvent(ctx context.Context, fulfillmentID domain.FulfillmentID, event domain.FulfillmentEvent) error {
-	return r.Client.SignalWorkflow(ctx, string(fulfillmentID), domain.FulfillmentEventSignal.Name, event)
+	err := r.Client.SignalWorkflow(ctx, string(fulfillmentID), domain.FulfillmentEventSignal.Name, event)
+	if errors.Is(err, backend.ErrInstanceNotFound) {
+		// The workflow completed (or never started); no one can observe
+		// this signal.
+		return domain.ErrFulfillmentNotRunning
+	}
+	return err
 }
 
 func (r *Registry) SignalDeleteCleanupComplete(ctx context.Context, fulfillmentID domain.FulfillmentID, event domain.DeleteCleanupCompleteEvent) error {
@@ -122,10 +128,11 @@ func (r *Registry) RegisterOrchestration(spec *domain.OrchestrationWorkflowSpec)
 		func() error { return registerActivity(r.Worker, invokers, spec.GenerateManifests(), opts) },
 		func() error { return registerActivity(r.Worker, invokers, spec.DeliverToTarget(), opts) },
 		func() error { return registerActivity(r.Worker, invokers, spec.RemoveFromTarget(), opts) },
+		func() error { return registerActivity(r.Worker, invokers, spec.PendingWithdrawalTargets(), opts) },
+		func() error { return registerActivity(r.Worker, invokers, spec.DeliveryRetryDelay(), opts) },
 		func() error {
 			return registerActivity(r.Worker, invokers, spec.PersistAndCompleteReconciliation(), opts)
 		},
-		func() error { return registerActivity(r.Worker, invokers, spec.ProcessDeliveryOutputs(), opts) },
 		func() error { return registerActivity(r.Worker, invokers, spec.CheckGeneration(), opts) },
 		func() error { return registerActivity(r.Worker, invokers, spec.CleanupDeliveryData(), opts) },
 		func() error { return registerActivity(r.Worker, invokers, spec.ReleaseLock(), opts) },
@@ -448,7 +455,10 @@ func registerActivity[I, O any](
 
 	activityFn := func(ctx context.Context, in I) (O, error) {
 		out, err := activity.Run(ctx, in)
-		if err != nil && (domain.IsTerminal(err) || domain.IsAuthExpired(err)) {
+		// These fail the same way on every attempt with the same input,
+		// so the engine does not retry them in place. The workflow
+		// decides what follows: fail, pause, or wait and reload.
+		if err != nil && (domain.IsTerminal(err) || domain.IsAuthExpired(err) || domain.IsPlacementUnresolved(err)) {
 			return out, workflow.NewPermanentError(err)
 		}
 		return out, err
@@ -510,6 +520,9 @@ func (r *baseRecord) Run(activity domain.Activity[any, any], in any) (any, error
 	if err != nil && !workflow.CanRetry(err) {
 		if domain.IsAuthExpired(err) {
 			return out, fmt.Errorf("%w: %v", domain.ErrAuthExpired, err)
+		}
+		if domain.IsPlacementUnresolved(err) {
+			return out, fmt.Errorf("%w: %v", domain.ErrPlacementUnresolved, err)
 		}
 		return out, domain.TerminalError(err)
 	}
@@ -614,6 +627,12 @@ func (w *createDeploymentWorkflow) Start(ctx context.Context, input domain.Creat
 	instance, err := w.client.CreateWorkflowInstance(ctx, client.WorkflowInstanceOptions{
 		InstanceID: "create-" + string(input.Name),
 	}, w.wfName, input)
+	if errors.Is(err, backend.ErrInstanceAlreadyExists) {
+		// The instance ID is the deployment name: an instance already
+		// there means the deployment was created, so a second caller's
+		// create is a duplicate.
+		return nil, fmt.Errorf("%w: deployment %q", domain.ErrAlreadyExists, input.Name)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create workflow instance: %w", err)
 	}
@@ -786,6 +805,12 @@ func (w *createManagedResourceWorkflow) Start(ctx context.Context, input domain.
 	instance, err := w.client.CreateWorkflowInstance(ctx, client.WorkflowInstanceOptions{
 		InstanceID: instanceID,
 	}, w.wfName, input)
+	if errors.Is(err, backend.ErrInstanceAlreadyExists) {
+		// The instance ID is the resource's type and name: an instance
+		// already there means a create for the same resource is running,
+		// so a second caller's create is a duplicate.
+		return nil, fmt.Errorf("%w: %s %q", domain.ErrAlreadyExists, input.ResourceType, input.Name)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create workflow instance: %w", err)
 	}

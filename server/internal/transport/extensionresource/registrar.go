@@ -2,8 +2,10 @@ package extensionresource
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"buf.build/go/protovalidate"
@@ -20,6 +22,13 @@ import (
 	"github.com/stolostron/ocm-fleet/server/internal/application"
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 	"github.com/stolostron/ocm-fleet/server/internal/transport/dynamicapi"
+)
+
+// Extension resource pages use the same default and maximum as the query
+// surface.
+const (
+	defaultListPageSize = 50
+	maxListPageSize     = 500
 )
 
 // RegisteredService is a fully built dynamic gRPC service ready to be
@@ -186,6 +195,11 @@ func (h *dynamicHandler) doCreate(ctx context.Context, req proto.Message) (proto
 	if id == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "%s is required", idField.Name())
 	}
+	if h.cfg.Capabilities.Management != nil && h.cfg.Capabilities.Management.ValidateID != nil {
+		if err := h.cfg.Capabilities.Management.ValidateID(id); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%s: %v", idField.Name(), err)
+		}
+	}
 
 	// Field 2: {resource} message containing spec
 	resourceField := h.descs.CreateRequest.Fields().ByNumber(2)
@@ -297,6 +311,11 @@ func (h *dynamicHandler) doGet(ctx context.Context, req proto.Message) (proto.Me
 	if err != nil {
 		return nil, dynamicapi.ToStatusError(err)
 	}
+	if view.Resource.ResourceType() != h.cfg.ResourceType {
+		// The view lookup keys on the service, collection, and ID, not
+		// the type: a name must not read a record another type owns.
+		return nil, dynamicapi.ToStatusError(fmt.Errorf("%w: %s", domain.ErrNotFound, name))
+	}
 
 	return h.viewToResource(view)
 }
@@ -323,25 +342,99 @@ func (h *dynamicHandler) handleList(
 	return h.doList(ctx, req)
 }
 
-func (h *dynamicHandler) doList(ctx context.Context, _ proto.Message) (proto.Message, error) {
+func (h *dynamicHandler) doList(ctx context.Context, req proto.Message) (proto.Message, error) {
 	views, err := h.resources.List(ctx, h.cfg.ResourceType)
 	if err != nil {
 		return nil, dynamicapi.ToStatusError(err)
+	}
+
+	// Order by resource name, the order the page token walks. The
+	// repository's order (collection name, then resource ID) is not the
+	// name order when one type holds nested collections.
+	sort.Slice(views, func(i, j int) bool {
+		return views[i].Resource.Name() < views[j].Resource.Name()
+	})
+
+	// The token names the last resource of the page just read, so a
+	// resource deleted between calls does not shift the next page: it
+	// resumes after the name the token holds.
+	start := 0
+	if tok := dynamicString(req, h.descs.ListRequest, "page_token"); tok != "" {
+		last, err := decodeListPageToken(tok)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page_token: %v", err)
+		}
+		start = sort.Search(len(views), func(i int) bool { return views[i].Resource.Name() > last })
+	}
+
+	size := int(dynamicInt32(req, h.descs.ListRequest, "page_size"))
+	if size < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid page_size: must not be negative")
+	}
+	if size == 0 {
+		size = defaultListPageSize
+	}
+	if size > maxListPageSize {
+		size = maxListPageSize
+	}
+	end := start + size
+	if end > len(views) {
+		end = len(views)
 	}
 
 	resp := dynamicpb.NewMessage(h.descs.ListResponse)
 	resourcesField := h.descs.ListResponse.Fields().ByNumber(1)
 
 	list := resp.Mutable(resourcesField).List()
-	for _, v := range views {
+	for _, v := range views[start:end] {
 		resource, err := h.viewToResource(v)
 		if err != nil {
 			return nil, err
 		}
 		list.Append(protoreflect.ValueOfMessage(resource.ProtoReflect()))
 	}
+	if end < len(views) && end > start {
+		if field := h.descs.ListResponse.Fields().ByName("next_page_token"); field != nil {
+			resp.Set(field, protoreflect.ValueOfString(encodeListPageToken(views[end-1].Resource.Name())))
+		}
+	}
 
 	return resp, nil
+}
+
+// dynamicString reads a string field off a dynamic request message.
+func dynamicString(msg proto.Message, desc protoreflect.MessageDescriptor, name string) string {
+	field := desc.Fields().ByName(protoreflect.Name(name))
+	if field == nil {
+		return ""
+	}
+	return msg.ProtoReflect().Get(field).String()
+}
+
+// dynamicInt32 reads an int32 field off a dynamic request message.
+func dynamicInt32(msg proto.Message, desc protoreflect.MessageDescriptor, name string) int32 {
+	field := desc.Fields().ByName(protoreflect.Name(name))
+	if field == nil {
+		return 0
+	}
+	return int32(msg.ProtoReflect().Get(field).Int())
+}
+
+// encodeListPageToken encodes the last resource name of a page.
+func encodeListPageToken(name domain.ResourceName) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(name))
+}
+
+// decodeListPageToken reads a token written by [encodeListPageToken].
+func decodeListPageToken(token string) (domain.ResourceName, error) {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", fmt.Errorf("not a resource page token: %w", err)
+	}
+	if len(b) == 0 {
+		return "", fmt.Errorf("not a resource page token: empty name")
+	}
+	return domain.ResourceName(b), nil
 }
 
 func (h *dynamicHandler) handleDelete(
@@ -461,15 +554,27 @@ func (h *dynamicHandler) doResume(ctx context.Context, req proto.Message) (proto
 	return h.viewToResource(view)
 }
 
+// parseName resolves a Get name to the stored resource name. Two forms
+// are accepted: the flat relative name "collection/{id}" this service
+// documents, and, for a type whose records live under nested
+// collections, the full record name List returns (e.g.
+// "hubs/{hub}/managedClusters/{name}"). A full name must end in this
+// service's collection so that a Get cannot reach another type's
+// record through it.
 func (h *dynamicHandler) parseName(name string) (domain.ResourceName, error) {
-	id, ok := strings.CutPrefix(name, h.collection)
-	if !ok || id == "" {
-		return "", fmt.Errorf("name must have format %s{id}", h.collection)
+	if id, ok := strings.CutPrefix(name, h.collection); ok && id != "" {
+		return domain.NewResourceName(
+			domain.NewCollectionName(domain.CollectionID(h.cfg.CollectionID)),
+			domain.ResourceID(id),
+		)
 	}
-	return domain.NewResourceName(
-		domain.NewCollectionName(domain.CollectionID(h.cfg.CollectionID)),
-		domain.ResourceID(id),
-	)
+	parsed, err := domain.ParseResourceName(name)
+	if err != nil || parsed.CollectionID() != domain.CollectionID(h.cfg.CollectionID) {
+		return "", fmt.Errorf(
+			"name must have format %s{id} or be a full %s resource name",
+			h.collection, h.cfg.CollectionID)
+	}
+	return parsed, nil
 }
 
 // viewToResource converts a domain ExtensionResourceView into a dynamic

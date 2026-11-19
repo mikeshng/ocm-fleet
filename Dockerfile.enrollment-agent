@@ -1,0 +1,34 @@
+# The enrollment agent: the small program an enrollment places on a cluster.
+# It is its own image so that a cluster pulls a few megabytes, not the resource manager.
+FROM golang:1.26.10 AS ocm-fleet-agent-builder
+
+WORKDIR /src
+
+# Copy server module manifests to cache dependencies.
+COPY server/go.mod server/go.sum ./server/
+RUN --mount=type=cache,id=ocm-fleet-go-mod,target=/go/pkg/mod \
+    cd server && \
+    for attempt in 1 2 3 4 5; do \
+        if GODEBUG=http2client=0 go mod download; then exit 0; fi; \
+        sleep "$((attempt * 5))"; \
+    done; \
+    exit 1
+
+# Copy server source.
+COPY server/ ./server/
+
+# The agent uses the standard library only; the binary is static.
+RUN --mount=type=cache,id=ocm-fleet-go-mod,target=/go/pkg/mod \
+        --mount=type=cache,id=ocm-fleet-go-build,target=/root/.cache/go-build \
+    cd server && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /bin/enrollment-agent ./cmd/enrollment-agent
+
+FROM scratch
+
+# System roots, for a resource manager whose certificate a public CA signed.
+COPY --from=ocm-fleet-agent-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=ocm-fleet-agent-builder /bin/enrollment-agent /enrollment-agent
+
+# Any non-root user: the generated manifests require runAsNonRoot.
+USER 65532:65532
+
+ENTRYPOINT ["/enrollment-agent"]

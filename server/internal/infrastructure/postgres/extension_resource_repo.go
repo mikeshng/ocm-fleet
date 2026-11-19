@@ -1502,6 +1502,65 @@ func (r *ExtensionResourceRepo) deleteInventoryReplacements(ctx context.Context,
 	return nil
 }
 
+// ListCollections implements [domain.ExtensionResourceRepository.ListCollections].
+func (r *ExtensionResourceRepo) ListCollections(ctx context.Context, rt domain.ResourceType) ([]domain.CollectionName, error) {
+	rows, err := r.DB.QueryContext(ctx,
+		`SELECT DISTINCT collection_name FROM extension_resources
+		 WHERE service_name = $1 AND type_name = $2
+		 ORDER BY collection_name`,
+		string(rt.ServiceName()), rt.TypeName())
+	if err != nil {
+		return nil, fmt.Errorf("list collections: %w", err)
+	}
+	return collectRows(rows, func(s scanner) (domain.CollectionName, error) {
+		var name string
+		if err := s.Scan(&name); err != nil {
+			return "", err
+		}
+		return domain.CollectionName(name), nil
+	})
+}
+
+// DeleteByCollectionPrefix implements
+// [domain.ExtensionResourceRepository.DeleteByCollectionPrefix]. The
+// prefix is compared literally (left, not LIKE), so '%' and '_' in a
+// resource ID segment carry no wildcard meaning.
+func (r *ExtensionResourceRepo) DeleteByCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string) (int64, error) {
+	if prefix == "" {
+		return 0, fmt.Errorf("%w: collection prefix must not be empty", domain.ErrInvalidArgument)
+	}
+	targetEr := `SELECT er.uid
+		FROM extension_resources er
+		WHERE er.service_name = $1 AND er.type_name = $2
+		  AND left(er.collection_name, char_length($3::text)) = $3::text`
+	query := fmt.Sprintf(inventoryDeleteWithAliasCleanupSQLTemplate, targetEr)
+	var n int64
+	if err := r.DB.QueryRowContext(ctx, query, string(rt.ServiceName()), rt.TypeName(), prefix).Scan(&n); err != nil {
+		return 0, fmt.Errorf("delete extension resources by collection prefix: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteStaleByCollectionPrefix implements
+// [domain.ExtensionResourceRepository.DeleteStaleByCollectionPrefix].
+func (r *ExtensionResourceRepo) DeleteStaleByCollectionPrefix(ctx context.Context, rt domain.ResourceType, prefix string, notWrittenSince time.Time) (int64, error) {
+	if prefix == "" {
+		return 0, fmt.Errorf("%w: collection prefix must not be empty", domain.ErrInvalidArgument)
+	}
+	targetEr := `SELECT er.uid
+		FROM extension_resources er
+		WHERE er.service_name = $1 AND er.type_name = $2
+		  AND left(er.collection_name, char_length($3::text)) = $3::text
+		  AND NOT EXISTS (SELECT 1 FROM extension_resource_inventory inv
+			WHERE inv.extension_resource_uid = er.uid AND inv.updated_at >= $4::timestamptz)`
+	query := fmt.Sprintf(inventoryDeleteWithAliasCleanupSQLTemplate, targetEr)
+	var n int64
+	if err := r.DB.QueryRowContext(ctx, query, string(rt.ServiceName()), rt.TypeName(), prefix, notWrittenSince.UTC()).Scan(&n); err != nil {
+		return 0, fmt.Errorf("delete stale extension resources by collection prefix: %w", err)
+	}
+	return n, nil
+}
+
 func (r *ExtensionResourceRepo) ListObservations(ctx context.Context, uid domain.ExtensionResourceUID, limit int) ([]domain.Observation, error) {
 	rows, err := r.DB.QueryContext(ctx,
 		`SELECT id, extension_resource_uid, observation, observed_at, created_at

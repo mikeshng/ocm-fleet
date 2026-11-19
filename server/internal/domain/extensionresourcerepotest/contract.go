@@ -3519,6 +3519,207 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			}
 		})
 	})
+
+	// CollectionPrefix covers the two parent-scoped operations used to
+	// clean up everything reported under a parent that is gone:
+	// ListCollections (which parents still own rows) and
+	// DeleteByCollectionPrefix (remove one parent's rows).
+	t.Run("CollectionPrefix", func(t *testing.T) {
+		const objectType = domain.ResourceType("inv.open-cluster-management.io/Object")
+		const nodeType = domain.ResourceType("inv.open-cluster-management.io/Node")
+		seed := func(t *testing.T, repo domain.ExtensionResourceRepository, rt domain.ResourceType, names ...domain.ResourceName) {
+			t.Helper()
+			now := fixedTime.Add(time.Minute)
+			for _, name := range names {
+				if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
+					ResourceType: rt, Name: name, CandidateUID: domain.NewExtensionResourceUID(),
+					ObservedAt: now, ReceivedAt: now,
+				}}); err != nil {
+					t.Fatalf("seed ReplaceInventory(%s): %v", name, err)
+				}
+			}
+		}
+		setup := func(t *testing.T) domain.ExtensionResourceRepository {
+			t.Helper()
+			tx := factory(t)
+			t.Cleanup(tx.RollbackOnExit)
+			repo := tx.ExtensionResources()
+			for _, rt := range []domain.ResourceType{objectType, nodeType} {
+				if err := repo.CreateType(ctx, sampleInventoryType(rt)); err != nil {
+					t.Fatalf("CreateType(%s): %v", rt, err)
+				}
+			}
+			seed(t, repo, objectType,
+				"clusters/a/apiResources/pods/objects/u1",
+				"clusters/a/apiResources/pods/objects/u2",
+				"clusters/a/namespaces/ns1/apiResources/pods/objects/u3",
+				"clusters/ab/apiResources/pods/objects/u4",
+				"clusters/a_c/apiResources/pods/objects/u5",
+				"clusters/b/apiResources/pods/objects/u6",
+			)
+			seed(t, repo, nodeType, "clusters/a/nodes/n1")
+			return repo
+		}
+
+		t.Run("ListCollectionsIsDistinctAndTypeScoped", func(t *testing.T) {
+			repo := setup(t)
+			got, err := repo.ListCollections(ctx, objectType)
+			if err != nil {
+				t.Fatalf("ListCollections: %v", err)
+			}
+			want := []domain.CollectionName{
+				"clusters/a/apiResources/pods/objects",
+				"clusters/a/namespaces/ns1/apiResources/pods/objects",
+				"clusters/a_c/apiResources/pods/objects",
+				"clusters/ab/apiResources/pods/objects",
+				"clusters/b/apiResources/pods/objects",
+			}
+			if len(got) != len(want) {
+				t.Fatalf("ListCollections = %v, want %v", got, want)
+			}
+			seen := make(map[domain.CollectionName]bool, len(got))
+			for _, name := range got {
+				seen[name] = true
+			}
+			for _, name := range want {
+				if !seen[name] {
+					t.Errorf("ListCollections missing %q (got %v)", name, got)
+				}
+			}
+
+			empty, err := repo.ListCollections(ctx, "inv.open-cluster-management.io/Nothing")
+			if err != nil {
+				t.Fatalf("ListCollections (no rows): %v", err)
+			}
+			if len(empty) != 0 {
+				t.Errorf("ListCollections (no rows) = %v, want empty", empty)
+			}
+		})
+
+		t.Run("DeletesOnlyTheNamedParent", func(t *testing.T) {
+			repo := setup(t)
+			n, err := repo.DeleteByCollectionPrefix(ctx, objectType, "clusters/a/")
+			if err != nil {
+				t.Fatalf("DeleteByCollectionPrefix: %v", err)
+			}
+			assertEqual(t, "deleted rows", n, int64(3))
+
+			for _, gone := range []domain.ResourceName{
+				"clusters/a/apiResources/pods/objects/u1",
+				"clusters/a/apiResources/pods/objects/u2",
+				"clusters/a/namespaces/ns1/apiResources/pods/objects/u3",
+			} {
+				if _, err := repo.Get(ctx, domain.NewFullResourceName("inv.open-cluster-management.io", gone)); !errors.Is(err, domain.ErrNotFound) {
+					t.Errorf("Get(%s) after prefix delete: got %v, want ErrNotFound", gone, err)
+				}
+			}
+			// A sibling whose ID merely starts with the same characters,
+			// another parent, and another type under the same parent
+			// must all survive.
+			for _, kept := range []domain.ResourceName{
+				"clusters/ab/apiResources/pods/objects/u4",
+				"clusters/a_c/apiResources/pods/objects/u5",
+				"clusters/b/apiResources/pods/objects/u6",
+				"clusters/a/nodes/n1",
+			} {
+				if _, err := repo.Get(ctx, domain.NewFullResourceName("inv.open-cluster-management.io", kept)); err != nil {
+					t.Errorf("Get(%s) after prefix delete: %v (must not be touched)", kept, err)
+				}
+			}
+
+			again, err := repo.DeleteByCollectionPrefix(ctx, objectType, "clusters/a/")
+			if err != nil {
+				t.Fatalf("DeleteByCollectionPrefix (repeat): %v", err)
+			}
+			assertEqual(t, "deleted rows (repeat)", again, int64(0))
+		})
+
+		t.Run("PrefixIsLiteralNotAPattern", func(t *testing.T) {
+			repo := setup(t)
+			// '_' and '%' are LIKE wildcards; as a literal prefix neither
+			// matches "clusters/ab/" or "clusters/a_c/".
+			for _, prefix := range []string{"clusters/a_/", "clusters/a%/", "clusters/%"} {
+				n, err := repo.DeleteByCollectionPrefix(ctx, objectType, prefix)
+				if err != nil {
+					t.Fatalf("DeleteByCollectionPrefix(%q): %v", prefix, err)
+				}
+				assertEqual(t, "deleted rows for "+prefix, n, int64(0))
+			}
+			got, err := repo.ListCollections(ctx, objectType)
+			if err != nil {
+				t.Fatalf("ListCollections: %v", err)
+			}
+			assertEqual(t, "collections left", len(got), 5)
+		})
+
+		t.Run("RejectsEmptyPrefix", func(t *testing.T) {
+			repo := setup(t)
+			if _, err := repo.DeleteByCollectionPrefix(ctx, objectType, ""); !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Fatalf("DeleteByCollectionPrefix(\"\"): got %v, want ErrInvalidArgument", err)
+			}
+			if _, err := repo.DeleteStaleByCollectionPrefix(ctx, objectType, "", fixedTime); !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Fatalf("DeleteStaleByCollectionPrefix(\"\"): got %v, want ErrInvalidArgument", err)
+			}
+		})
+
+		// DeleteStaleByCollectionPrefix removes, under one parent, only
+		// what was last written before the given time.
+		t.Run("DeleteStaleKeepsWhatWasWrittenSince", func(t *testing.T) {
+			repo := setup(t) // every row written at fixedTime + 1 minute
+			since := fixedTime.Add(2 * time.Minute)
+			write := func(name domain.ResourceName, at time.Time) {
+				t.Helper()
+				if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
+					ResourceType: objectType, Name: name, CandidateUID: domain.NewExtensionResourceUID(),
+					ObservedAt: at, ReceivedAt: at,
+				}}); err != nil {
+					t.Fatalf("ReplaceInventory(%s): %v", name, err)
+				}
+			}
+			// Written again after the time, one of them a fraction of a
+			// second after it, one exactly at it; and one new row a
+			// fraction of a second before it.
+			write("clusters/a/apiResources/pods/objects/u1", since.Add(time.Hour))
+			write("clusters/a/namespaces/ns1/apiResources/pods/objects/u3", since.Add(250*time.Millisecond))
+			write("clusters/a/apiResources/pods/objects/u7", since)
+			write("clusters/a/apiResources/pods/objects/u8", since.Add(-250*time.Millisecond))
+
+			n, err := repo.DeleteStaleByCollectionPrefix(ctx, objectType, "clusters/a/", since)
+			if err != nil {
+				t.Fatalf("DeleteStaleByCollectionPrefix: %v", err)
+			}
+			assertEqual(t, "deleted rows", n, int64(2))
+			for _, gone := range []domain.ResourceName{
+				"clusters/a/apiResources/pods/objects/u2",
+				"clusters/a/apiResources/pods/objects/u8",
+			} {
+				if _, err := repo.Get(ctx, domain.NewFullResourceName("inv.open-cluster-management.io", gone)); !errors.Is(err, domain.ErrNotFound) {
+					t.Errorf("Get(%s) after stale delete: got %v, want ErrNotFound", gone, err)
+				}
+			}
+			// Written since; under another parent (however old); another
+			// type under the same parent.
+			for _, kept := range []domain.ResourceName{
+				"clusters/a/apiResources/pods/objects/u1",
+				"clusters/a/namespaces/ns1/apiResources/pods/objects/u3",
+				"clusters/a/apiResources/pods/objects/u7",
+				"clusters/ab/apiResources/pods/objects/u4",
+				"clusters/a_c/apiResources/pods/objects/u5",
+				"clusters/b/apiResources/pods/objects/u6",
+				"clusters/a/nodes/n1",
+			} {
+				if _, err := repo.Get(ctx, domain.NewFullResourceName("inv.open-cluster-management.io", kept)); err != nil {
+					t.Errorf("Get(%s) after stale delete: %v (must not be touched)", kept, err)
+				}
+			}
+
+			again, err := repo.DeleteStaleByCollectionPrefix(ctx, objectType, "clusters/a/", since)
+			if err != nil {
+				t.Fatalf("DeleteStaleByCollectionPrefix (repeat): %v", err)
+			}
+			assertEqual(t, "deleted rows (repeat)", again, int64(0))
+		})
+	})
 }
 
 func assertEqual[T comparable](t *testing.T, field string, got, want T) {

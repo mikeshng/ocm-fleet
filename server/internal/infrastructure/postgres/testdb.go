@@ -135,6 +135,21 @@ var (
 
 func OpenTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+	connStr := createTestDB(t)
+	db, err := Open(connStr)
+	if err != nil {
+		t.Fatalf("open test db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// createTestDB creates a fresh database on the shared test container
+// and returns its connection string. The database is dropped when the
+// test finishes. Unlike [OpenTestDB], it does not run the migrations,
+// so a test that drives goose itself can start from any version.
+func createTestDB(t *testing.T) string {
+	t.Helper()
 	containerOnce.Do(func() {
 		containerCtr, containerConn, containerErr = startContainer()
 	})
@@ -157,21 +172,14 @@ func OpenTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("create test database: %v", err)
 	}
 
-	testConnStr := replaceDBName(containerConn, dbName)
-	db, err := Open(testConnStr)
-	if err != nil {
-		t.Fatalf("open test db: %v", err)
-	}
-
 	t.Cleanup(func() {
-		db.Close()
 		cleanupDB, err := sql.Open("pgx", containerConn)
 		if err == nil {
 			cleanupDB.Exec("DROP DATABASE IF EXISTS " + dbName + " WITH (FORCE)")
 			cleanupDB.Close()
 		}
 	})
-	return db
+	return replaceDBName(containerConn, dbName)
 }
 
 // OpenStressDB starts a dedicated Postgres container tuned for

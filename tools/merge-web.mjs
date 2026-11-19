@@ -16,6 +16,7 @@ const webDir = resolve(root, "web");
 const pluginDistDirs = [
   resolve(root, "extensions/core/client/dist"),
   resolve(root, "extensions/kind/client/dist"),
+  resolve(root, "extensions/ocm/client/dist"),
 ];
 const guiDist = resolve(root, "client/web/dist");
 const incremental = process.argv.includes("--incremental");

@@ -2,6 +2,7 @@ package aioinit
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,56 @@ type ServeConfig struct {
 	WebDir             string
 	LogLevel           string
 	Addons             string
+	Enrollment         EnrollmentConfig
+}
+
+// EnrollmentConfig is where the access piece of an existing cluster presents
+// itself to this server, and the image of the agent that does it. Empty
+// fields are left to resource-manager serve (no enrollment manifests can be
+// generated without ServerURL and AgentImage).
+type EnrollmentConfig struct {
+	ServerURL      string
+	CAFile         string
+	ConnectAddress string
+	AgentImage     string
+}
+
+// ResolveEnrollment fills the enrollment endpoint. An explicit ServerURL is
+// taken as given, with its CA and connect address. Without one, and with a
+// container engine socket mounted (the local kind sandbox), the endpoint
+// defaults to the public origin, verified against the sandbox CA and dialed at
+// the kind network alias: the public host name does not resolve inside kind
+// clusters, and the gateway accepts no other name.
+func ResolveEnrollment(explicit EnrollmentConfig, sandboxCA string, engineSocket bool) EnrollmentConfig {
+	out := explicit
+	if out.ServerURL != "" || !engineSocket {
+		return out
+	}
+	out.ServerURL = FixedEndpoints.PublicOrigin
+	if out.CAFile == "" {
+		out.CAFile = sandboxCA
+	}
+	if out.ConnectAddress == "" {
+		out.ConnectAddress = net.JoinHostPort(loopbackForwardHost, gatewayPort)
+	}
+	return out
+}
+
+// EnrollmentFromEnv reads the explicit enrollment settings from the
+// OCM_RM_ENROLLMENT_* environment variables.
+func EnrollmentFromEnv() EnrollmentConfig {
+	return EnrollmentConfig{
+		ServerURL:      strings.TrimSpace(os.Getenv("OCM_RM_ENROLLMENT_SERVER_URL")),
+		CAFile:         strings.TrimSpace(os.Getenv("OCM_RM_ENROLLMENT_CA_FILE")),
+		ConnectAddress: strings.TrimSpace(os.Getenv("OCM_RM_ENROLLMENT_CONNECT_ADDRESS")),
+		AgentImage:     strings.TrimSpace(os.Getenv("OCM_RM_ENROLLMENT_AGENT_IMAGE")),
+	}
+}
+
+// ContainerEngineSocketPresent reports whether a container engine socket is
+// mounted, which is what makes this container a local kind sandbox.
+func ContainerEngineSocketPresent() bool {
+	return containerEngineSocketPresent()
 }
 
 // ApplyServeDefaults fills packaging defaults for omitted serve fields.
@@ -81,7 +132,7 @@ func ApplyServeDefaults(in ServeConfig) ServeConfig {
 		}
 	}
 	if in.Addons == "" {
-		in.Addons = "kind,kubernetes"
+		in.Addons = "kind,kubernetes,ocm"
 	}
 	if in.DBPath == "" {
 		in.DBPath = defaultServeDB
@@ -150,6 +201,18 @@ func ServeArgs(in ServeConfig) []string {
 	}
 	if in.Addons != "" {
 		args = append(args, "--addons", in.Addons)
+	}
+	if in.Enrollment.ServerURL != "" {
+		args = append(args, "--enrollment-server-url", in.Enrollment.ServerURL)
+	}
+	if in.Enrollment.CAFile != "" {
+		args = append(args, "--enrollment-ca-file", in.Enrollment.CAFile)
+	}
+	if in.Enrollment.ConnectAddress != "" {
+		args = append(args, "--enrollment-connect-address", in.Enrollment.ConnectAddress)
+	}
+	if in.Enrollment.AgentImage != "" {
+		args = append(args, "--enrollment-agent-image", in.Enrollment.AgentImage)
 	}
 	return args
 }

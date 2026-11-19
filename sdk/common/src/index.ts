@@ -51,6 +51,7 @@ export {
   slugify,
 } from "./navLayout.js";
 export * from "./objects/cluster.js";
+export * from "./objects/fleetCluster.js";
 export { orderByIds } from "./orderByIds.js";
 export {
   getCachedPfIcon,

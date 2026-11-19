@@ -380,6 +380,22 @@ func TestVerifyAttestation_GenerationMismatch(t *testing.T) {
 	}
 }
 
+// A removal is authorized by the signed content, not by a signed
+// generation. Deleting a deployment advances the fulfillment generation
+// without a new signed intent (no API accepts a signature for a delete),
+// so the stored expected_generation necessarily lags the removal's
+// delivery generation. The signed name check still binds what may be
+// removed, and the delivery cycle identity fences stale removals.
+func TestVerifyAttestation_RemoveSkipsGenerationEquality(t *testing.T) {
+	h := setupHarness(t)
+	att := h.buildValidAttestation(t)
+	att.Output = &domain.RemoveByDeploymentName{Name: "deployments/dep-1"}
+
+	if err := h.verifier.Verify(context.Background(), att, 2); err != nil {
+		t.Fatalf("expected a removal to verify at a later delivery generation, got: %v", err)
+	}
+}
+
 func TestVerifyAttestation_GenerationZero_SkipsCheck(t *testing.T) {
 	h := setupHarness(t)
 	att := h.buildValidAttestation(t)

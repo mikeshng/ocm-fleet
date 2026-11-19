@@ -19,6 +19,8 @@ const booleanFlags = [
   "sign",
   "debug",
   "retry",
+  "grant-platform-delivery",
+  "remove-access-with-addon",
 ];
 
 export function parseArgs(argv: string[]): ParsedArgs {

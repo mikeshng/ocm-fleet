@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -428,5 +429,75 @@ func TestFulfillment_ApplyReconciliationResult(t *testing.T) {
 	}
 	if f.generation != 3 {
 		t.Error("Generation changed; should be untouched by ApplyReconciliationResult")
+	}
+}
+
+func TestFulfillment_ApplySupersededReconciliationResult_KeepsTheMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		result ReconciliationResult
+	}{
+		{
+			name: "a pass that converged to active",
+			result: ReconciliationResult{
+				FulfillmentID:   "f1",
+				State:           FulfillmentStateActive,
+				ResolvedTargets: []TargetID{"t1", "t2"},
+				Auth:            DeliveryAuth{Token: "old-token"},
+			},
+		},
+		{
+			name: "a pass that failed",
+			result: ReconciliationResult{
+				FulfillmentID:   "f1",
+				State:           FulfillmentStateFailed,
+				StatusReason:    "generate manifests: boom",
+				ResolvedTargets: []TargetID{"t1", "t2"},
+				Auth:            DeliveryAuth{Token: "old-token"},
+			},
+		},
+		{
+			name: "a pass that paused on its credentials",
+			result: ReconciliationResult{
+				FulfillmentID:   "f1",
+				PauseReason:     "delivery auth failed: caller token is expired",
+				ResolvedTargets: []TargetID{"t1", "t2"},
+				Auth:            DeliveryAuth{Token: "old-token"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The pass loaded generation 3; a delete with fresh
+			// credentials was committed while it ran.
+			f := FulfillmentFromSnapshot(FulfillmentSnapshot{
+				ID:         "f1",
+				Generation: 3,
+				State:      FulfillmentStateActive,
+				Auth:       DeliveryAuth{Token: "old-token"},
+			})
+			f.TransitionToDeleting(DeliveryAuth{Token: "fresh-token"})
+
+			f.ApplySupersededReconciliationResult(tt.result)
+
+			if f.state != FulfillmentStateDeleting {
+				t.Errorf("State = %q, want %q: the pass must not undo the delete", f.state, FulfillmentStateDeleting)
+			}
+			if f.Paused() {
+				t.Errorf("pauseReason = %q, want empty: the pause belongs to the credentials the delete replaced", f.pauseReason)
+			}
+			if f.statusReason != "" {
+				t.Errorf("statusReason = %q, want empty", f.statusReason)
+			}
+			if f.auth.Token != "fresh-token" {
+				t.Errorf("Auth.Token = %q, want the delete's fresh-token", f.auth.Token)
+			}
+			if !slices.Equal(f.resolvedTargets, []TargetID{"t1", "t2"}) {
+				t.Errorf("ResolvedTargets = %v, want [t1 t2]: what the pass reached is recorded", f.resolvedTargets)
+			}
+			if f.generation != 4 {
+				t.Errorf("Generation = %d, want 4", f.generation)
+			}
+		})
 	}
 }

@@ -89,6 +89,8 @@ type Delivery struct {
 	generation    Generation // fulfillment generation at dispatch; used for stale-delivery fencing
 	state         DeliveryState
 	operation     DeliveryOperation
+	message       string // outcome message of the last failed attempt; empty otherwise
+	attempts      int    // failed attempts in the current cycle; reset when a new one starts
 	createdAt     time.Time
 	updatedAt     time.Time
 }
@@ -141,22 +143,61 @@ func (d *Delivery) TransitionTo(state DeliveryState, now time.Time) error {
 	return nil
 }
 
-// Redispatch resets the delivery for a new put cycle at an advanced
-// generation. The manifests are replaced and the lifecycle restarts
-// from [DeliveryStatePending]. This is the only legal way to move a
-// delivery backward in its state machine for a put operation.
+// ApplyResult records the outcome of a delivery attempt reported by the
+// addon. It transitions to the result's state (rejecting illegal
+// transitions) and, when that transition is accepted, records the
+// failure details the API surfaces to the user: the message of a
+// failed, partial, or auth-failed attempt is kept and the attempt is
+// counted; a delivered attempt clears the message. A report repeating
+// the current state is a no-op, so duplicate reports do not inflate the
+// attempt count.
+func (d *Delivery) ApplyResult(result DeliveryResult, now time.Time) error {
+	previous := d.state
+	if err := d.TransitionTo(result.State, now); err != nil {
+		return err
+	}
+	if d.state == previous {
+		return nil
+	}
+	switch d.state {
+	case DeliveryStateFailed, DeliveryStatePartial, DeliveryStateAuthFailed:
+		d.message = result.Message
+		d.attempts++
+	case DeliveryStateDelivered:
+		d.message = ""
+	}
+	return nil
+}
+
+// Redispatch resets the delivery for a new put cycle. The manifests are
+// replaced, the lifecycle restarts from [DeliveryStatePending], and the
+// failure details of the previous cycle are cleared.
 //
-// Returns [ErrIllegalStateTransition] if generation does not advance
-// past the delivery's current generation.
+// The cycle identity is the generation and the operation. The new put
+// cycle either advances the generation, or — at the same generation —
+// turns a record that was removing the target back into a delivery
+// because the target re-entered placement. A record that is already a
+// put cycle at the same generation is not redispatched this way; its
+// in-flight attempt is handled by [Delivery.Retry] or
+// [Delivery.ResetForRetry].
+//
+// Returns [ErrIllegalStateTransition] if generation moves backwards or
+// the delivery is already a put cycle at that generation.
 func (d *Delivery) Redispatch(manifests []Manifest, generation Generation, now time.Time) error {
-	if generation <= d.generation {
+	if generation < d.generation {
 		return fmt.Errorf("%w: cannot redispatch at generation %d (current %d)",
 			ErrIllegalStateTransition, generation, d.generation)
+	}
+	if generation == d.generation && d.operation == DeliveryOperationDeliver {
+		return fmt.Errorf("%w: delivery at generation %d is already a put cycle",
+			ErrIllegalStateTransition, generation)
 	}
 	d.manifests = manifests
 	d.generation = generation
 	d.state = DeliveryStatePending
 	d.operation = DeliveryOperationDeliver
+	d.message = ""
+	d.attempts = 0
 	d.updatedAt = now
 	return nil
 }
@@ -169,13 +210,21 @@ func (d *Delivery) Redispatch(manifests []Manifest, generation Generation, now t
 // target is withdrawn when it leaves placement (e.g. label change,
 // pool mutation, fulfillment deletion).
 //
+// A removal attempt that fails is retried at the same generation; the
+// failure reason and attempt count are preserved then, so the API keeps
+// reporting why the removal is not done and the retry waits longer. Any
+// other record — a new generation, a put cycle, or a put cycle that
+// only now becomes a removal — starts a fresh removal cycle with no
+// failure history to carry.
+//
 // Returns (true, nil) when the delivery was modified (reset to
-// [DeliveryStatePending]) — either from a terminal state or by
-// advancing the generation past a non-terminal state. Returns
-// (false, nil) when no modification is needed: the delivery is
-// already non-terminal at the same generation, meaning it is either
-// pending (a retry, handled by [Delivery.Retry]) or already being
-// processed by the addon.
+// [DeliveryStatePending] with [DeliveryOperationRemove]). Returns
+// (false, nil) when no modification is needed: the delivery is already
+// in a removal cycle at the same generation and did not fail. That is a
+// pending removal (a retry, handled by [Delivery.Retry]), one already
+// in progress (acked, completion signal queued), or a terminal removal
+// (completed, partial, or auth-failed), which is never re-dispatched at
+// the same generation.
 //
 // Returns an error if the given generation would move backwards.
 //
@@ -188,32 +237,51 @@ func (d *Delivery) Withdraw(generation Generation, now time.Time) (bool, error) 
 			ErrIllegalStateTransition, generation, d.generation)
 	}
 
-	// Same generation and not terminal: either already Pending (retry case
-	// handled by Retry) or already in progress (acked, signal queued).
-	if generation == d.generation && !d.state.IsTerminal() {
+	// Already removing at this generation without a failed attempt: pending
+	// (retry case handled by Retry), in progress (acked, signal queued), or
+	// terminal. A terminal removal completed its work and is not resurrected
+	// while the rest of the delete pipeline retries — that would dispatch a
+	// duplicate removal and report a finished target as outstanding. Only a
+	// failed removal falls through to the same-generation retry below.
+	if generation == d.generation && d.operation == DeliveryOperationRemove && d.state != DeliveryStateFailed {
 		return false, nil
 	}
 
+	// A same-generation reset of a removal is the removal path's retry
+	// after a failed attempt: like [Delivery.ResetForRetry] for the put
+	// path, the reason and attempt count stay so the API keeps explaining
+	// the failure and the retry backoff keeps growing. Anything else is a
+	// fresh cycle — a new generation, or a put-cycle record turning into a
+	// removal because the target left placement mid-retry — and starts
+	// with no failure history to carry.
+	retry := generation == d.generation && d.operation == DeliveryOperationRemove
 	d.state = DeliveryStatePending
 	d.generation = generation
 	d.operation = DeliveryOperationRemove
+	if !retry {
+		d.message = ""
+		d.attempts = 0
+	}
 	d.updatedAt = now
 	return true, nil
 }
 
-// ResetForRetry resets a terminal delivery back to
-// [DeliveryStatePending] for at-least-once re-dispatch. This is the
-// put-path counterpart to [Delivery.Withdraw]: after a workflow
-// ContinueAsNew restart, the delivery may have already reached a
-// terminal state during the previous execution. Addons are idempotent,
-// so resetting to Pending is safe.
+// ResetForRetry resets a failed delivery back to
+// [DeliveryStatePending] for at-least-once re-dispatch after a workflow
+// ContinueAsNew restart. Only a failed attempt is retryable: delivered,
+// partial, and auth_failed are terminal observations of the cycle and
+// are never re-dispatched at the same generation — a new generation
+// starts a fresh cycle instead, and auth_failed pauses the fulfillment
+// for fresh credentials. The failure message and attempt count are
+// preserved: the API keeps reporting why the last attempt failed while
+// the next one runs, and the retry backoff keeps growing.
 //
-// Returns [ErrIllegalStateTransition] if the delivery is not in a
-// terminal state.
+// Returns [ErrIllegalStateTransition] if the delivery is not in
+// [DeliveryStateFailed].
 func (d *Delivery) ResetForRetry(now time.Time) error {
-	if !d.state.IsTerminal() {
+	if d.state != DeliveryStateFailed {
 		return fmt.Errorf(
-			"%w: delivery %s is in non-terminal state %q, cannot reset for retry",
+			"%w: delivery %s is in state %q, only a failed delivery can be reset for retry",
 			ErrIllegalStateTransition, d.id, d.state)
 	}
 	d.state = DeliveryStatePending
@@ -267,6 +335,30 @@ func (d *Delivery) UpdatedAt() time.Time { return d.updatedAt }
 // Operation returns the current delivery operation (deliver or remove).
 func (d *Delivery) Operation() DeliveryOperation { return d.operation }
 
+// NeedsWithdrawal reports whether a deletion must dispatch a removal
+// for the delivery's target. A completed removal — Delivered, or
+// Partial for one that finished with objects left in place — needs
+// nothing more; every other record describes work that may still stand
+// on the target — a put that may have applied, or a removal that did not
+// finish — and the target must be withdrawn before the record is
+// discarded.
+func (d *Delivery) NeedsWithdrawal() bool {
+	return d.operation != DeliveryOperationRemove ||
+		(d.state != DeliveryStateDelivered && d.state != DeliveryStatePartial)
+}
+
+// Message returns the outcome message of the last failed attempt. It is
+// empty while no attempt has failed, and is cleared once an attempt
+// delivers.
+func (d *Delivery) Message() string { return d.message }
+
+// Attempts returns the number of failed attempts recorded at the
+// delivery's current generation and operation cycle. It drives the retry
+// backoff and is reset when a new cycle starts: a re-dispatch at an
+// advanced generation, a withdrawal at a new generation, or a withdrawal
+// that turns a put cycle into a removal at the same generation.
+func (d *Delivery) Attempts() int { return d.attempts }
+
 // ActiveDelivery is the enriched view of a [Delivery] returned by
 // [DeliveryReporter.ListActiveDeliveries]. It bundles the delivery
 // record with the full context an addon needs to resume work after a
@@ -291,10 +383,19 @@ type ActiveDelivery struct {
 
 // DeliveryResult is the outcome of a single delivery attempt.
 // Agents may include structured outputs (provisioned targets, produced
-// secrets) that the platform processes after delivery completion.
+// secrets) that the platform processes with the report itself.
+//
+// Operation identifies the cycle the report belongs to. The cycle
+// identity of a delivery is (generation, operation): the same delivery
+// ID carries both put and remove work over its lifetime, and a target
+// can leave and re-enter placement at a single generation. A report
+// whose operation does not match the delivery's current operation is
+// stale work from the other operation and is discarded, so an in-flight
+// put cannot report a removal delivered (or the reverse).
 type DeliveryResult struct {
 	State              DeliveryState
 	Message            string
+	Operation          DeliveryOperation
 	ProvisionedTargets []ProvisionedTarget
 	ProducedSecrets    []ProducedSecret
 }

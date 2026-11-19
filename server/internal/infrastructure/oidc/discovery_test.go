@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stolostron/ocm-fleet/server/internal/domain"
 	"github.com/stolostron/ocm-fleet/server/internal/infrastructure/oidc"
@@ -100,6 +101,46 @@ func TestDiscoveryClient_RejectsIncompleteMetadata(t *testing.T) {
 				t.Fatalf("FetchMetadata() = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestDiscoveryClient_FetchTimeoutBoundsStalledIssuer(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	dc := oidc.NewDiscoveryClient(srv.Client())
+	dc.FetchTimeout = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err := dc.FetchMetadata(context.Background(), domain.IssuerURL(srv.URL))
+	if err == nil {
+		t.Fatal("FetchMetadata returned success although the issuer never answered")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("FetchMetadata took %v, want it bounded by the fetch timeout", elapsed)
+	}
+}
+
+func TestDiscoveryClient_RejectsOversizedDocument(t *testing.T) {
+	var issuer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":"https://example/auth","token_endpoint":"https://example/token","jwks_uri":"https://example/keys","padding":%q}`,
+			issuer, strings.Repeat("a", 2<<20))
+	}))
+	t.Cleanup(srv.Close)
+	issuer = srv.URL
+
+	dc := oidc.NewDiscoveryClient(srv.Client())
+	_, err := dc.FetchMetadata(context.Background(), domain.IssuerURL(issuer))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("FetchMetadata() = %v, want an oversized-document refusal", err)
 	}
 }
 

@@ -6,6 +6,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const distDirs = [
   resolve(root, "extensions/core/client/dist"),
   resolve(root, "extensions/kind/client/dist"),
+  resolve(root, "extensions/ocm/client/dist"),
 ];
 const outputDir = process.argv[2] ? resolve(process.argv[2]) : distDirs[0];
 
@@ -18,6 +19,7 @@ const pluginMeta = [
   },
   { name: "core-plugin", key: "core", label: "Core Plugin", persona: "ops" },
   { name: "kind-plugin", key: "kind", label: "Kind", persona: "ops" },
+  { name: "ocm-plugin", key: "ocm", label: "OCM Hubs", persona: "ops" },
   {
     name: "signing-plugin",
     key: "signing",

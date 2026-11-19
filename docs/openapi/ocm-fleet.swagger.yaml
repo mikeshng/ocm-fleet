@@ -188,8 +188,8 @@ paths:
             The ID to use for the deployment, which becomes the final component
             of the deployment's resource name.
 
-            This value should be 4-63 characters, and valid characters
-            are /[a-z][0-9]-/.
+            This value should be 1-63 characters, and must match the regular
+            expression /[a-z0-9]([-a-z0-9]*[a-z0-9])?/.
           in: query
           required: true
           type: string
@@ -378,6 +378,20 @@ definitions:
     description: |-
       Request message for
       [DeploymentService.ResumeDeployment][ocm.v1alpha.DeploymentService.ResumeDeployment].
+  TargetDeliveryStatusOperation:
+    type: string
+    enum:
+      - OPERATION_UNSPECIFIED
+      - OPERATION_DELIVER
+      - OPERATION_REMOVE
+    default: OPERATION_UNSPECIFIED
+    description: |-
+      The kind of work a status describes.
+
+       - OPERATION_UNSPECIFIED: Default value. Not used.
+       - OPERATION_DELIVER: The manifests are being, or have been, applied to the target.
+       - OPERATION_REMOVE: The manifests are being, or have been, removed from the target;
+      STATE_DELIVERED then means the removal completed.
   protobufAny:
     type: object
     properties:
@@ -396,9 +410,9 @@ definitions:
       the null value for the `Value` type union.
 
       A field of type `NullValue` with any value other than `0` is considered
-      invalid. Most ProtoJSON serializers will emit a Value with a `null_value` set
-      as a JSON `null` regardless of the integer value, and so will round trip to
-      a `0` value.
+      invalid. Most ProtoJSON serializers will emit a `Value` with a `null_value`
+      set as a JSON `null` regardless of the integer value, and so will round trip
+      to a `0` value.
 
        - NULL_VALUE: Null value.
   rpcStatus:
@@ -536,6 +550,17 @@ definitions:
           Non-empty when reconciliation is paused (e.g. expired delivery
           credentials). Contains the reason for the pause. The lifecycle
           state is preserved independently.
+        readOnly: true
+      targetStatuses:
+        type: array
+        items:
+          type: object
+          $ref: "#/definitions/v1alphaTargetDeliveryStatus"
+        description: |-
+          Delivery state per target, ordered by target ID. There is one entry
+          for every target the fulfillment has recorded work for, including a
+          target whose work is being removed or was removed; `operation` says
+          which. When a target's last attempt failed, its message says why.
         readOnly: true
     description: |-
       Deployment is the composition of manifest, placement, and rollout strategies.
@@ -863,6 +888,72 @@ definitions:
       SignerEnrollment records that a user enrolled their signing identity
       with the platform. The external key registry (identified by
       registry_id) is the authority for the user's public keys.
+  v1alphaTargetDeliveryStatus:
+    type: object
+    properties:
+      targetId:
+        type: string
+        description: Target the status refers to.
+        readOnly: true
+      state:
+        $ref: "#/definitions/v1alphaTargetDeliveryStatusState"
+        description: Current delivery state on the target.
+        readOnly: true
+      message:
+        type: string
+        description: |-
+          Reason the last delivery attempt failed. Empty while no attempt has
+          failed, and cleared once an attempt delivers.
+        readOnly: true
+      attempts:
+        type: integer
+        format: int32
+        description: |-
+          Failed delivery attempts in the current generation and operation
+          cycle. Reset when a new cycle starts — a new generation, or a record
+          whose operation switches at the same generation; preserved when the
+          orchestration retries the same cycle.
+        readOnly: true
+      updateTime:
+        type: string
+        format: date-time
+        description: When this status last changed.
+        readOnly: true
+      operation:
+        $ref: "#/definitions/TargetDeliveryStatusOperation"
+        description: |-
+          Whether the recorded work applies the manifests to the target or
+          removes them from it.
+        readOnly: true
+    description: |-
+      TargetDeliveryStatus reports a deployment's state on one target: what
+      work the record describes (`operation`), where that work stands
+      (`state`), and, when an attempt failed, why (`message`).
+  v1alphaTargetDeliveryStatusState:
+    type: string
+    enum:
+      - STATE_UNSPECIFIED
+      - STATE_PENDING
+      - STATE_ACCEPTED
+      - STATE_PROGRESSING
+      - STATE_DELIVERED
+      - STATE_FAILED
+      - STATE_PARTIAL
+      - STATE_AUTH_FAILED
+    default: STATE_UNSPECIFIED
+    description: |-
+      Delivery lifecycle state of one target.
+
+       - STATE_UNSPECIFIED: Default value. Not used.
+       - STATE_PENDING: Dispatch is pending; the addon has not received the work.
+       - STATE_ACCEPTED: The addon accepted the work.
+       - STATE_PROGRESSING: The addon is performing the work.
+       - STATE_DELIVERED: The work is done on the target: applied for OPERATION_DELIVER,
+      removed for OPERATION_REMOVE.
+       - STATE_FAILED: The last attempt failed. Retried when the orchestration allows.
+       - STATE_PARTIAL: The work was done only in part. A removal that finishes with
+      objects left in place reports this state.
+       - STATE_AUTH_FAILED: The addon could not authenticate to the target.
   v1alphaTargetSelector:
     type: object
     properties:

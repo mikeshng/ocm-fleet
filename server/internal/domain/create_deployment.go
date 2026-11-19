@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -52,6 +53,20 @@ func (s *CreateDeploymentWorkflowSpec) PersistDeployment() Activity[CreateDeploy
 		}
 		defer tx.RollbackOnExit()
 
+		// An activity may run more than once. If an earlier attempt
+		// committed and its result was not recorded, the deployment
+		// already exists: that stored pair is this activity's result, and
+		// creating another would duplicate it. A create the caller must
+		// reject as a duplicate name never reaches this workflow: the
+		// API checks the name first, and the workflow instance ID is
+		// derived from it.
+		switch view, err := tx.Deployments().GetView(ctx, in.Name); {
+		case err == nil:
+			return view, nil
+		case !errors.Is(err, ErrNotFound):
+			return DeploymentView{}, fmt.Errorf("look up existing deployment: %w", err)
+		}
+
 		now := s.now()
 		uid := NewDeploymentUID()
 		fID := FulfillmentID(uuid.New().String())
@@ -78,10 +93,15 @@ func (s *CreateDeploymentWorkflowSpec) PersistDeployment() Activity[CreateDeploy
 
 // StartOrchestration returns an activity that durably starts the
 // orchestration workflow for a fulfillment. The start is wrapped in
-// an activity so it survives replay without re-executing.
+// an activity so it survives replay without re-executing. Idempotent:
+// treats [ErrAlreadyRunning] as success so an activity replay after
+// the orchestration already started does not fail the workflow.
 func (s *CreateDeploymentWorkflowSpec) StartOrchestration() Activity[FulfillmentID, struct{}] {
 	return NewActivity("start-orchestration", func(ctx context.Context, id FulfillmentID) (struct{}, error) {
 		_, err := s.Orchestration.Start(ctx, id)
+		if err != nil && errors.Is(err, ErrAlreadyRunning) {
+			return struct{}{}, nil
+		}
 		return struct{}{}, err
 	})
 }

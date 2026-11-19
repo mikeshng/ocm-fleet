@@ -154,6 +154,48 @@ func TestVerifier_RegisterJWKSFailsFastWhenJWKSUnavailable(t *testing.T) {
 	}
 }
 
+func TestVerifier_RegisterJWKSFetchIsBoundedWhenTheProviderHangs(t *testing.T) {
+	// A provider that accepts the connection and never answers, with an
+	// HTTP client that has no timeout of its own and a caller with no
+	// deadline: the fetch timeout must end the registration anyway.
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		proxy.Close()
+	})
+
+	verifier, err := oidc.NewVerifier(context.Background(),
+		oidc.WithHTTPClient(&http.Client{}),
+		oidc.WithKeyFetchTimeout(200*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	start := time.Now()
+	err = verifier.RegisterJWKS(context.Background(), domain.EndpointURL(proxy.URL+"/jwks"))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected RegisterJWKS to fail when the provider never answers")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("RegisterJWKS took %v with a 200ms fetch timeout; the caller had no deadline", elapsed)
+	}
+	select {
+	case <-entered:
+	default:
+		t.Fatal("the registration never reached the provider")
+	}
+}
+
 func TestVerifier_RegisterJWKSDoesNotBlockOtherURIs(t *testing.T) {
 	// A slow/hung registration for URI A must not delay registration for URI B.
 	// Before the fix, v.mu was held across Fetch, serializing all URIs.
@@ -356,5 +398,125 @@ func TestVerifier_WrongAudience(t *testing.T) {
 	_, err = verifier.Verify(ctx, config, rawToken)
 	if err == nil {
 		t.Fatal("Verify: expected error for wrong audience, got nil")
+	}
+}
+
+func TestVerifier_RefetchesJWKSAfterSigningKeyRotation(t *testing.T) {
+	// An identity provider replaces its signing key on its own schedule. A
+	// token naming a key the verifier has not seen causes one fresh JWKS
+	// fetch and a retry, not a refusal until the background cache happens to
+	// refresh.
+	ctx := context.Background()
+	idp := oidctest.Start(t, oidctest.WithAudience("test-audience"))
+
+	verifier, err := oidc.NewVerifier(ctx, oidc.WithHTTPClient(idp.HTTPClient()))
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	// The first verification registers the key set as it is at boot.
+	first := idp.IssueToken(t, oidctest.TokenClaims{Subject: "before"})
+	if _, err := verifier.Verify(ctx, idp.OIDCConfig(), first); err != nil {
+		t.Fatalf("Verify before rotation: %v", err)
+	}
+
+	idp.RotateSigningKey(t)
+	rotated := idp.IssueToken(t, oidctest.TokenClaims{Subject: "after"})
+
+	claims, err := verifier.Verify(ctx, idp.OIDCConfig(), rotated)
+	if err != nil {
+		t.Fatalf("Verify after the signing key rotated: %v (an unknown key ID must cause one JWKS fetch and a retry)", err)
+	}
+	if claims.Subject != "after" {
+		t.Errorf("Subject: got %q, want %q", claims.Subject, "after")
+	}
+}
+
+func TestVerifier_UnknownKeyIDRefetchesAtMostOncePerInterval(t *testing.T) {
+	// A caller can make up a key ID. Each such token must not turn into a
+	// JWKS fetch: after one fetch, the next unknown key ID has to wait for
+	// the interval to pass before it may fetch again.
+	ctx := context.Background()
+	idp := oidctest.Start(t, oidctest.WithAudience("test-audience"))
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	verifier, err := oidc.NewVerifier(ctx, oidc.WithHTTPClient(idp.HTTPClient()),
+		oidc.WithKeyRefetchInterval(time.Minute),
+		oidc.WithKeyRefetchClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	first := idp.IssueToken(t, oidctest.TokenClaims{Subject: "before"})
+	if _, err := verifier.Verify(ctx, idp.OIDCConfig(), first); err != nil {
+		t.Fatalf("Verify before rotation: %v", err)
+	}
+	base := idp.JWKSFetchCount()
+
+	idp.RotateSigningKey(t)
+	rotated := idp.IssueToken(t, oidctest.TokenClaims{Subject: "first rotation"})
+	if _, err := verifier.Verify(ctx, idp.OIDCConfig(), rotated); err != nil {
+		t.Fatalf("Verify after the first rotation: %v", err)
+	}
+	if got := idp.JWKSFetchCount() - base; got != 1 {
+		t.Fatalf("JWKS fetches after the first unknown key ID: got %d, want 1", got)
+	}
+
+	idp.RotateSigningKey(t)
+	rotatedAgain := idp.IssueToken(t, oidctest.TokenClaims{Subject: "second rotation"})
+	if _, err := verifier.Verify(ctx, idp.OIDCConfig(), rotatedAgain); err == nil {
+		t.Fatal("Verify with a second unknown key ID inside the interval: expected a refusal, got nil")
+	}
+	if got := idp.JWKSFetchCount() - base; got != 1 {
+		t.Fatalf("JWKS fetches inside the interval: got %d, want still 1", got)
+	}
+
+	now = now.Add(61 * time.Second)
+	if _, err := verifier.Verify(ctx, idp.OIDCConfig(), rotatedAgain); err != nil {
+		t.Fatalf("Verify after the interval passed: %v", err)
+	}
+	if got := idp.JWKSFetchCount() - base; got != 2 {
+		t.Fatalf("JWKS fetches after the interval passed: got %d, want 2", got)
+	}
+}
+
+func TestVerifier_ConcurrentUnknownKeyIDsFetchJWKSOnce(t *testing.T) {
+	// Requests arriving together right after a rotation must share one fetch,
+	// not drive one each.
+	ctx := context.Background()
+	idp := oidctest.Start(t, oidctest.WithAudience("test-audience"))
+
+	verifier, err := oidc.NewVerifier(ctx, oidc.WithHTTPClient(idp.HTTPClient()))
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	first := idp.IssueToken(t, oidctest.TokenClaims{Subject: "before"})
+	if _, err := verifier.Verify(ctx, idp.OIDCConfig(), first); err != nil {
+		t.Fatalf("Verify before rotation: %v", err)
+	}
+	idp.RotateSigningKey(t)
+	rotated := idp.IssueToken(t, oidctest.TokenClaims{Subject: "after"})
+	base := idp.JWKSFetchCount()
+
+	const callers = 8
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = verifier.Verify(ctx, idp.OIDCConfig(), rotated)
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Verify %d: %v", i, err)
+		}
+	}
+	if got := idp.JWKSFetchCount() - base; got != 1 {
+		t.Errorf("JWKS fetches for %d concurrent unknown key IDs: got %d, want 1", callers, got)
 	}
 }

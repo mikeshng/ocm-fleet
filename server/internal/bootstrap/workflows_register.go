@@ -19,6 +19,7 @@ type registeredWorkflows struct {
 	createMRWf    domain.CreateManagedResourceWorkflow
 	deleteMRWf    domain.DeleteManagedResourceWorkflow
 	resumeMRWf    domain.ResumeManagedResourceWorkflow
+	orchWf        domain.OrchestrationWorkflow
 	authMethodSvc *application.AuthMethodService
 	provenanceSvc *domain.ProvenanceService
 }
@@ -48,6 +49,7 @@ func registerWorkflows(
 	if err != nil {
 		return out, fmt.Errorf("register orchestration: %w", err)
 	}
+	out.orchWf = orchWf
 
 	out.createWf, err = reg.RegisterCreateDeployment(&domain.CreateDeploymentWorkflowSpec{
 		Store: store, Orchestration: orchWf,

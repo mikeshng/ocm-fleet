@@ -1,0 +1,91 @@
+# The read-only account that a hub's administrator creates for OCM Fleet. It may read the
+# hub's managed clusters and cluster sets, read the namespace kube-system (its UID tells
+# hubs apart), and request a token for itself. It may change nothing.
+# OCM Fleet prints the same manifest: fleetctl hub access-manifest
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/part-of: ocm-fleet-hub-connection
+  name: ocm-fleet-hub-connection
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/part-of: ocm-fleet-hub-connection
+  name: ocm-fleet-hub-reader
+  namespace: ocm-fleet-hub-connection
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/part-of: ocm-fleet-hub-connection
+  name: ocm-fleet-hub-reader
+rules:
+  - apiGroups:
+      - cluster.open-cluster-management.io
+    resources:
+      - managedclusters
+      - managedclustersets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resourceNames:
+      - kube-system
+    resources:
+      - namespaces
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/part-of: ocm-fleet-hub-connection
+  name: ocm-fleet-hub-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ocm-fleet-hub-reader
+subjects:
+  - kind: ServiceAccount
+    name: ocm-fleet-hub-reader
+    namespace: ocm-fleet-hub-connection
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/part-of: ocm-fleet-hub-connection
+  name: ocm-fleet-hub-reader-token
+  namespace: ocm-fleet-hub-connection
+rules:
+  - apiGroups:
+      - ""
+    resourceNames:
+      - ocm-fleet-hub-reader
+    resources:
+      - serviceaccounts/token
+    verbs:
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/part-of: ocm-fleet-hub-connection
+  name: ocm-fleet-hub-reader-token
+  namespace: ocm-fleet-hub-connection
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ocm-fleet-hub-reader-token
+subjects:
+  - kind: ServiceAccount
+    name: ocm-fleet-hub-reader
+    namespace: ocm-fleet-hub-connection
